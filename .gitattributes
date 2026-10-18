@@ -1,0 +1,12 @@
+# Keep source and generated notices consistent across Windows, Linux and cloud.
+* text=auto eol=lf
+*.png binary
+*.webp binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.wasm binary
+*.woff2 binary
+*.vsix binary
+*.zip binary

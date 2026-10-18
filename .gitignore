@@ -1,0 +1,47 @@
+node_modules/
+dist/
+*.vsix
+.DS_Store
+.backup/
+
+# Local handoff notes, agent sessions and test artifacts.
+DEV.md
+.dev/
+.zcode/
+coverage/
+test-results/
+
+# Local credentials; examples can be tracked when needed.
+.env
+.env.*
+!.env.example
+
+# Editor and agent state must stay outside source distributions.
+.vscode/
+.cursor/
+.codex/
+AGENTS.md
+agent.md
+*.log
+
+# Private credentials and local database copies.
+.npmrc
+credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# Source transfers and editor backup files.
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.bak
+*.orig

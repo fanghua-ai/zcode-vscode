@@ -1,0 +1,573 @@
+{
+  "name": "zcode-desktop-chat",
+  "displayName": "ZCode Chat",
+  "description": "在 VS Code 右侧边栏里和 ZCode 智能体对话，复用桌面端的登录、模型和会话。Chat with the ZCode agent in the VS Code secondary side bar using the desktop app's account, models, and sessions.",
+  "version": "1.4.10",
+  "publisher": "fanghua",
+  "author": "fanghua",
+  "license": "MIT",
+  "icon": "media/icon-zcode-vscode.png",
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "zcode",
+    "ai",
+    "chat",
+    "glm",
+    "agent"
+  ],
+  "activationEvents": [
+    "onView:zcode.chatView"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "zcode-sidebar",
+          "title": "ZCode",
+          "icon": "media/icon-zcode-vscode.png"
+        }
+      ]
+    },
+    "views": {
+      "zcode-sidebar": [
+        {
+          "type": "webview",
+          "id": "zcode.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "zcode.openChat",
+        "title": "ZCode: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "zcode.newSession",
+        "title": "ZCode: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "zcode.switchSession",
+        "title": "ZCode: Switch Session",
+        "icon": "$(history)"
+      },
+      {
+        "command": "zcode.selectModel",
+        "title": "ZCode: Select Model",
+        "icon": "$(symbol-misc)"
+      },
+      {
+        "command": "zcode.stopGeneration",
+        "title": "ZCode: Stop Generation",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "zcode.showLog",
+        "title": "ZCode: Show Log"
+      },
+      {
+        "command": "zcode.sendSelection",
+        "title": "ZCode: 把选区加入对话"
+      },
+      {
+        "command": "zcode.sendCurrentFile",
+        "title": "ZCode: 把当前文件加入对话"
+      },
+      {
+        "command": "zcode.showChromeSettings",
+        "title": "%command.showChromeSettings.title%"
+      },
+      {
+        "command": "zcode.setQuotaApiKey",
+        "title": "%command.setQuotaApiKey.title%"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "zcode.sendSelection",
+          "when": "editorHasSelection",
+          "group": "zcode@1"
+        },
+        {
+          "command": "zcode.sendCurrentFile",
+          "group": "zcode@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ZCode",
+      "properties": {
+        "zcode.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the ZCode app-server entry point (zcode.cjs). Empty = auto-detect common install locations."
+        },
+        "zcode.nodePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Node.js executable. Empty uses the VS Code runtime to launch zcode.cjs. Set this only if that runtime cannot start the app-server."
+        },
+        "zcode.workspacePath": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace path for ZCode agent (defaults to first workspace folder)"
+        },
+        "zcode.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model override as providerId/modelId (e.g. 'builtin:bigmodel-coding-plan/GLM-5.3-Flash'). Empty = reuse ZCode desktop default."
+        },
+        "zcode.quotaAdapters": {
+          "type": "array",
+          "default": [],
+          "description": "%config.quotaAdapters.description%",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "providerId",
+              "displayName",
+              "fields"
+            ],
+            "properties": {
+              "schemaVersion": {
+                "type": "integer",
+                "enum": [
+                  1
+                ],
+                "description": "%quotaAdapter.schemaVersion.description%"
+              },
+              "id": {
+                "type": "string",
+                "description": "%quotaAdapter.id.description%"
+              },
+              "providerId": {
+                "type": "string",
+                "description": "%quotaAdapter.providerId.description%"
+              },
+              "providerTemplateId": {
+                "type": "string",
+                "description": "%quotaAdapter.providerTemplateId.description%"
+              },
+              "providerBaseURL": {
+                "type": "string",
+                "description": "%quotaAdapter.providerBaseURL.description%"
+              },
+              "displayName": {
+                "type": "string",
+                "description": "%quotaAdapter.displayName.description%"
+              },
+              "endpoint": {
+                "type": "string",
+                "description": "%quotaAdapter.endpoint.description%"
+              },
+              "requests": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "description": "%quotaAdapter.requests.description%",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "id",
+                    "endpoint"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "%quotaAdapter.request.id.description%"
+                    },
+                    "endpoint": {
+                      "type": "string",
+                      "description": "%quotaAdapter.endpoint.description%"
+                    },
+                    "method": {
+                      "type": "string",
+                      "enum": [
+                        "GET",
+                        "POST"
+                      ],
+                      "description": "%quotaAdapter.method.description%"
+                    },
+                    "requestHeaders": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "%quotaAdapter.requestHeaders.description%"
+                    },
+                    "body": {
+                      "type": "object",
+                      "description": "%quotaAdapter.body.description%"
+                    }
+                  }
+                }
+              },
+              "method": {
+                "type": "string",
+                "enum": [
+                  "GET",
+                  "POST"
+                ],
+                "default": "GET",
+                "description": "%quotaAdapter.method.description%"
+              },
+              "auth": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "bearer",
+                  "header"
+                ],
+                "default": "bearer",
+                "description": "%quotaAdapter.auth.description%"
+              },
+              "apiKeySource": {
+                "type": "string",
+                "enum": [
+                  "secretStorage",
+                  "zcode"
+                ],
+                "default": "secretStorage",
+                "description": "%quotaAdapter.apiKeySource.description%"
+              },
+              "authHeaderName": {
+                "type": "string",
+                "default": "x-api-key",
+                "description": "%quotaAdapter.authHeaderName.description%"
+              },
+              "authHeaderPrefix": {
+                "type": "string",
+                "maxLength": 40,
+                "description": "%quotaAdapter.authHeaderPrefix.description%"
+              },
+              "requestHeaders": {
+                "type": "object",
+                "default": {},
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "%quotaAdapter.requestHeaders.description%"
+              },
+              "body": {
+                "type": "object",
+                "description": "%quotaAdapter.body.description%"
+              },
+              "itemsPath": {
+                "type": "string",
+                "description": "%quotaAdapter.itemsPath.description%"
+              },
+              "percentScale": {
+                "type": "string",
+                "enum": [
+                  "0-1",
+                  "0-100"
+                ],
+                "default": "0-100",
+                "description": "%quotaAdapter.percentScale.description%"
+              },
+              "allowedCurrencies": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Z]{3}$"
+                },
+                "description": "%quotaAdapter.allowedCurrencies.description%"
+              },
+              "fields": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "description": "%quotaAdapter.fields.description%",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "label": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.label.description%"
+                    },
+                    "labelPath": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.labelPath.description%"
+                    },
+                    "remainingPercentPath": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.remainingPercentPath.description%"
+                    },
+                    "usedPercentPath": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.usedPercentPath.description%"
+                    },
+                    "remainingCountPath": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.remainingCountPath.description%"
+                    },
+                    "nextResetTimePath": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.nextResetTimePath.description%"
+                    },
+                    "resetTimeFormat": {
+                      "type": "string",
+                      "enum": [
+                        "auto",
+                        "unix-seconds",
+                        "unix-milliseconds",
+                        "iso"
+                      ],
+                      "default": "auto",
+                      "description": "%quotaAdapter.field.resetTimeFormat.description%"
+                    },
+                    "remainingAmountPath": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.remainingAmountPath.description%"
+                    },
+                    "currency": {
+                      "type": "string",
+                      "pattern": "^[A-Z]{3}$",
+                      "description": "%quotaAdapter.field.currency.description%"
+                    },
+                    "currencyPath": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.currencyPath.description%"
+                    },
+                    "grantedAmountPath": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.grantedAmountPath.description%"
+                    },
+                    "toppedUpAmountPath": {
+                      "type": "string",
+                      "description": "%quotaAdapter.field.toppedUpAmountPath.description%"
+                    },
+                    "amountDivisor": {
+                      "type": "number",
+                      "exclusiveMinimum": 0,
+                      "description": "%quotaAdapter.field.amountDivisor.description%"
+                    },
+                    "countDivisor": {
+                      "type": "number",
+                      "exclusiveMinimum": 0,
+                      "description": "%quotaAdapter.field.countDivisor.description%"
+                    },
+                    "quotaCalculation": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "limitPath",
+                        "usedPath"
+                      ],
+                      "description": "%quotaAdapter.field.quotaCalculation.description%",
+                      "properties": {
+                        "limitPath": {
+                          "type": "string",
+                          "description": "%quotaAdapter.field.quotaLimitPath.description%"
+                        },
+                        "usedPath": {
+                          "type": "string",
+                          "description": "%quotaAdapter.field.quotaUsedPath.description%"
+                        },
+                        "limitDivisor": {
+                          "type": "number",
+                          "exclusiveMinimum": 0,
+                          "description": "%quotaAdapter.field.quotaLimitDivisor.description%"
+                        },
+                        "usedDivisor": {
+                          "type": "number",
+                          "exclusiveMinimum": 0,
+                          "description": "%quotaAdapter.field.quotaUsedDivisor.description%"
+                        }
+                      }
+                    },
+                    "metrics": {
+                      "type": "array",
+                      "maxItems": 20,
+                      "description": "%quotaAdapter.field.metrics.description%",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "label"
+                        ],
+                        "properties": {
+                          "label": {
+                            "type": "string",
+                            "description": "%quotaAdapter.metric.label.description%"
+                          },
+                          "valuePath": {
+                            "type": "string",
+                            "description": "%quotaAdapter.metric.valuePath.description%"
+                          },
+                          "valueDivisor": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                            "description": "%quotaAdapter.metric.valueDivisor.description%"
+                          },
+                          "calculation": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "operation",
+                              "paths"
+                            ],
+                            "description": "%quotaAdapter.metric.calculation.description%",
+                            "properties": {
+                              "operation": {
+                                "type": "string",
+                                "enum": [
+                                  "sum",
+                                  "subtract",
+                                  "multiply",
+                                  "divide",
+                                  "min",
+                                  "max"
+                                ],
+                                "description": "%quotaAdapter.metric.calculationOperation.description%"
+                              },
+                              "paths": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 20,
+                                "items": {
+                                  "type": "string"
+                                },
+                                "description": "%quotaAdapter.metric.calculationPaths.description%"
+                              },
+                              "divisor": {
+                                "type": "number",
+                                "exclusiveMinimum": 0,
+                                "description": "%quotaAdapter.metric.calculationDivisor.description%"
+                              }
+                            }
+                          },
+                          "format": {
+                            "type": "string",
+                            "enum": [
+                              "number",
+                              "currency"
+                            ],
+                            "default": "number",
+                            "description": "%quotaAdapter.metric.format.description%"
+                          },
+                          "currency": {
+                            "type": "string",
+                            "pattern": "^[A-Z]{3}$",
+                            "description": "%quotaAdapter.metric.currency.description%"
+                          },
+                          "currencyPath": {
+                            "type": "string",
+                            "description": "%quotaAdapter.metric.currencyPath.description%"
+                          },
+                          "unit": {
+                            "type": "string",
+                            "description": "%quotaAdapter.metric.unit.description%"
+                          },
+                          "period": {
+                            "type": "string",
+                            "description": "%quotaAdapter.metric.period.description%"
+                          },
+                          "periodPath": {
+                            "type": "string",
+                            "description": "%quotaAdapter.metric.periodPath.description%"
+                          }
+                        }
+                      }
+                    },
+                    "budgetCalculation": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "limitPath",
+                        "usedPath"
+                      ],
+                      "description": "%quotaAdapter.field.budgetCalculation.description%",
+                      "properties": {
+                        "limitPath": {
+                          "type": "string",
+                          "description": "%quotaAdapter.field.budgetLimitPath.description%"
+                        },
+                        "usedPath": {
+                          "type": "string",
+                          "description": "%quotaAdapter.field.budgetUsedPath.description%"
+                        },
+                        "limitDivisor": {
+                          "type": "number",
+                          "exclusiveMinimum": 0,
+                          "description": "%quotaAdapter.field.budgetLimitDivisor.description%"
+                        },
+                        "usedDivisor": {
+                          "type": "number",
+                          "exclusiveMinimum": 0,
+                          "description": "%quotaAdapter.field.budgetUsedDivisor.description%"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "zcode.language": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "zh-CN",
+            "zh-TW",
+            "en"
+          ],
+          "enumDescriptions": [
+            "Follow the VS Code display language. Unsupported languages fall back to English.",
+            "简体中文",
+            "繁體中文",
+            "English"
+          ],
+          "default": "auto",
+          "scope": "application",
+          "description": "Interface language. Chat messages and model output are not translated."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run verify",
+    "check": "tsc --noEmit && tsc -p tsconfig.webview.json --noEmit",
+    "test": "node scripts/test.mjs",
+    "test:browser": "npm run build && node scripts/browser-smoke.mjs && node scripts/browser-drafts-reload.mjs && node scripts/browser-image-policy.mjs && node scripts/browser-attachments.mjs",
+    "build": "node esbuild.mjs --production",
+    "watch": "node esbuild.mjs --watch",
+    "package": "node scripts/package.mjs",
+    "test:themes": "npm run build && node scripts/browser-theme-audit.mjs",
+    "test:desktop-attachments": "node scripts/desktop-attachments-smoke.mjs",
+    "test:desktop-sessions": "node scripts/desktop-session-smoke.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "verify": "npm run check && npm test && npm run build && npm run check:package"
+  },
+  "devDependencies": {
+    "@types/katex": "^0.16.8",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.16",
+    "highlight.js": "^11.11.1",
+    "katex": "^0.19.0",
+    "marked": "^17.0.4",
+    "node-sqlite3-wasm": "^0.8.60"
+  }
+}

@@ -1,0 +1,17 @@
+# Only runtime assets and user-facing documentation belong in a VSIX.
+**
+!package.json
+!package.nls*.json
+!README.md
+!CHANGELOG.md
+!docs/quota-adapters.md
+!LICENSE
+!THIRD-PARTY-NOTICES.txt
+!media/icon-zcode-vscode.png
+!dist/extension.js
+!dist/webview.js
+!dist/node-sqlite3-wasm.js
+!dist/node-sqlite3-wasm.wasm
+!dist/math/katex.min.css
+!dist/math/LICENSE
+!dist/math/fonts/*.woff2
