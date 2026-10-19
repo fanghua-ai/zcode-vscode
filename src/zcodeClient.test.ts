@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import * as fs from "fs";
 import * as path from "path";
 import { ZCodeClient, type ZCodeEvent, type HistoryItem, type PermissionRequest, type UserInputRequest, type SessionControls } from "./zcodeClient";
@@ -60,12 +60,17 @@ function fixture(
   return { client, state, events };
 }
 
-test("an explicitly disabled session model cannot fall back to a stale CLI provider key", async t => {
+function isolatedHome(t: TestContext): string {
   const os = require("os") as typeof import("os");
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-disabled-provider-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-client-test-"));
   const originalHome = os.homedir;
   os.homedir = () => root;
   t.after(() => { os.homedir = originalHome; fs.rmSync(root, { recursive: true, force: true }); });
+  return root;
+}
+
+test("an explicitly disabled session model cannot fall back to a stale CLI provider key", async t => {
+  const root = isolatedHome(t);
   const configDir = path.join(root, ".zcode", "v2");
   fs.mkdirSync(configDir, { recursive: true });
   fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ provider: {
@@ -236,38 +241,56 @@ test("a late provider adapter result cannot overwrite quota after switching mode
   client.dispose();
 });
 
-test("cached provider quota is hidden immediately after switching providers", async () => {
-  const pending = deferred<Array<{ label: string; remainingAmount: number; currency: "CNY" | "USD" }> | null>();
-  const planQuota = [{ label: "ZCode Plan", remainingPercent: 70, usedPercent: 30 }];
-  const events: ZCodeEvent[] = [];
-  const client = new ZCodeClient({
-    binaryPath: "/unused",
-    workspacePath: "/test",
-    readQuotaPlan: () => ({ family: "bigmodel", kind: "individual-coding-plan", providerId: "builtin:bigmodel-coding-plan" }),
-    fetchProviderQuota: providerId => providerId === "deepseek" ? pending.promise : Promise.resolve(null),
-    fetchPlanQuota: async () => planQuota,
-    onEvent: event => events.push(event),
-  });
-  const state = client as unknown as Internals;
-  state.sessionId = "A";
-  state.sessionModel = { providerId: "deepseek", modelId: "deepseek-chat" };
-  state.lastQuota = [{ label: "DeepSeek", remainingAmount: 12, currency: "CNY" }];
-  state.lastQuotaProviderId = "deepseek";
-  state.lastPlanQuota = planQuota;
+test("cached provider quota is hidden immediately after switching providers", async t => {
+  for (const hasModelContext of [false, true]) {
+    await t.test(hasModelContext ? "with model context metadata" : "without model context metadata", async t => {
+      const root = isolatedHome(t);
+      const configDir = path.join(root, ".zcode", "v2");
+      fs.mkdirSync(configDir, { recursive: true });
+      const targetModel = { providerId: "moonshot-kimi", modelId: "quota-test-model" };
+      fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ provider: {
+        [targetModel.providerId]: { models: {
+          [targetModel.modelId]: hasModelContext ? { limit: { context: 64000 } } : {},
+        } },
+      } }));
+      const pending = deferred<Array<{ label: string; remainingAmount: number; currency: "CNY" | "USD" }> | null>();
+      const planQuota = [{ label: "ZCode Plan", remainingPercent: 70, usedPercent: 30 }];
+      const events: ZCodeEvent[] = [];
+      const client = new ZCodeClient({
+        binaryPath: "/unused",
+        workspacePath: "/test",
+        readQuotaPlan: () => ({ family: "bigmodel", kind: "individual-coding-plan", providerId: "builtin:bigmodel-coding-plan" }),
+        fetchProviderQuota: providerId => providerId === "deepseek" ? pending.promise : Promise.resolve(null),
+        fetchPlanQuota: async () => planQuota,
+        onEvent: event => events.push(event),
+      });
+      const state = client as unknown as Internals;
+      t.after(() => client.dispose());
+      state.sessionId = "A";
+      state.sessionModel = { providerId: "deepseek", modelId: "deepseek-chat" };
+      state.lastQuota = [{ label: "DeepSeek", remainingAmount: 12, currency: "CNY" }];
+      state.lastQuotaProviderId = "deepseek";
+      state.lastPlanQuota = planQuota;
 
-  const oldRequest = state.refreshPlanQuota();
-  await state.alignAndEmitModel({ providerId: "moonshot-kimi", modelId: "kimi-k2.5" });
-  assert.deepEqual((events.at(-1)?.data as { quota: unknown[] }).quota, planQuota,
-    "switch published DeepSeek's cached balance for Kimi");
+      const oldRequest = state.refreshPlanQuota();
+      await state.alignAndEmitModel(targetModel);
+      const usage = () => events.filter(event => event.type === "context_usage").at(-1)?.data as {
+        quota: unknown[]; max?: number;
+      } | undefined;
+      assert.deepEqual(usage()?.quota, planQuota,
+        "switch published DeepSeek's cached balance for Kimi");
+      assert.ok(events.some(event => event.type === "model_info"));
+      if (hasModelContext) assert.equal(usage()?.max, 64000);
 
-  state.applySnapshotSettings(undefined);
-  assert.deepEqual((events.at(-1)?.data as { quota: unknown[] }).quota, planQuota,
-    "a later usage snapshot republished the previous provider's quota");
-  pending.resolve([{ label: "Late DeepSeek", remainingAmount: 999, currency: "USD" }]);
-  await oldRequest;
-  assert.deepEqual((events.at(-1)?.data as { quota: unknown[] }).quota, planQuota,
-    "an old provider request overwrote the ZCode fallback after switching");
-  client.dispose();
+      state.applySnapshotSettings(undefined);
+      assert.deepEqual(usage()?.quota, planQuota,
+        "a later usage snapshot republished the previous provider's quota");
+      pending.resolve([{ label: "Late DeepSeek", remainingAmount: 999, currency: "USD" }]);
+      await oldRequest;
+      assert.deepEqual(usage()?.quota, planQuota,
+        "an old provider request overwrote the ZCode fallback after switching");
+    });
+  }
 });
 
 test("configured provider quota is used by exact provider id and falls back to ZCode quota", async () => {
@@ -872,12 +895,7 @@ test("sanitized backend snapshot hides runtime inputs so they cannot split a wor
 });
 
 test("session_ready carries the snapshot's builtin and custom slash commands", async () => {
-  const events: ZCodeEvent[] = [];
-  const { client } = ((): { client: ZCodeClient } => {
-    return { client: new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", onEvent: e => events.push(e) }) };
-  })();
-  const state = client as unknown as Internals;
-  state.sessionId = "A";
+  const { client, state, events } = fixture();
   state.sendRequest = async (method: string) => {
     if (method === "session/create") { state.sessionId = "NEW"; return {}; }
     if (method === "v4/conversation/subscribe") {
@@ -886,7 +904,7 @@ test("session_ready carries the snapshot's builtin and custom slash commands", a
       return { ack: { subscriptionId: "conv" } };
     }
     if (method === "session/subscribe") {
-      return { snapshot: { slashCommands: [
+      return { snapshot: { session: { model: { providerId: "test-provider", modelId: "test-model" } }, slashCommands: [
         { name: "goal", description: "Show or set the current session goal.", inputHint: "/goal [objective]", source: "builtin" },
         { name: "my-report", description: "Custom user command.", inputHint: "/my-report [args]", source: "user" },
         { name: 7, description: "invalid entry is dropped" },
@@ -897,6 +915,7 @@ test("session_ready carries the snapshot's builtin and custom slash commands", a
   try {
     await client.start({ createNew: true });
     const ready = events.find(event => event.type === "session_ready");
+    assert.deepEqual(client.confirmedModel(), { providerId: "test-provider", modelId: "test-model" });
     assert.deepEqual((ready?.data as { slashCommands?: unknown }).slashCommands, [
       { name: "goal", description: "Show or set the current session goal.", inputHint: "/goal [objective]" },
       { name: "my-report", description: "Custom user command.", inputHint: "/my-report [args]" },

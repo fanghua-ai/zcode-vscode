@@ -14,7 +14,7 @@
 
 ## 排查材料与隐私
 
-当前问题入口是 [Marketplace Q&A](https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna)。附上系统、VS Code／扩展／桌面端版本、操作步骤和脱敏日志。不要公开凭据文件、令牌、API Key、带签名的图片地址、私有源码或完整会话库；诊断信息也需自行检查后再分享。
+问题与功能建议请提交到 [GitHub Issues](https://github.com/fanghua-ai/zcode-vscode/issues)，也可使用 [Marketplace Q&A](https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna)。附上系统、VS Code／扩展／桌面端版本、操作步骤和脱敏日志。不要公开凭据文件、令牌、API Key、带签名的图片地址、私有源码或完整会话库；诊断信息也需自行检查后再分享。
 
 项目代码使用 [MIT 许可证](LICENSE)，Lucide 图标的第三方许可见同一文件。发布包另含 [第三方声明](THIRD-PARTY-NOTICES.txt)，附上实际打包依赖的许可原文；公式资源仍保留其许可证。ZCode 桌面端、运行时、账号和商标不属于本仓库，不随开源一并授权或分发。
 

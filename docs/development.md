@@ -11,6 +11,8 @@ npm run verify
 
 `verify` 依次检查宿主及 webview 类型、运行单元测试、生产构建，并审计待打包文件。普通构建不需要桌面登录。真实聊天需要安装、登录 ZCode 桌面端；兼容范围和运行时设置见 [README](../README.md)。
 
+`npm test` 为测试子进程设置临时 HOME、USERPROFILE、AppData 和 XDG 目录，并移除继承的 `ZCODE_CREDENTIAL_SECRET`，结束后清理临时文件，不修改调用者环境。涉及桌面配置、凭据、默认模型和会话库的用例必须显式创建隔离夹具或提供模拟状态；协议用例应在模拟快照中提供所需模型。检查事件时按目标类型筛选，避免无关事件的有无或顺序影响断言。
+
 `npm test` 同时执行 CHANGELOG 门禁（`src/changelogGuard.ts`），因此 `verify` 和打包都会自动检查最新段落：中文与 English 分组各出现一次且都有条目，不能包含明确的测试覆盖、测试数量、本地测试包约定或作者实测过程。允许“测试连接按钮”等用户功能描述。日常开发允许首段使用 `未发布 / Unreleased`；已标明版本的段落必须与 `package.json` 一致，并使用有效的 `YYYY-MM-DD` 日期。`npm run package` 会额外要求首段为正式的版本与日期，拒绝尚未整理的 Unreleased。历史段落不追溯检查，中英文是否准确对应仍由人工评审；报错附带条目行号和原因。
 
 `npm run watch` 持续构建；`npm run package` 按 `package.json` 的版本生成 VSIX，不修改源码或自动推进版本。VS Code 使用 “Install from VSIX” 安装，完成后由使用者 Reload Window。打包与发布见 [发布说明](releasing.md)。
@@ -76,6 +78,6 @@ npm run verify
 
 模型日志中的整次请求 `durationMs` 不能当作首字时间；持久化 part 的创建时间可能早于实际收到文字，也不能这样使用。用同一会话／轮次把扩展日志与 CLI 的 `turn.started`、`model.request.started` 对齐，再判断准备、后端等待、宿主阻塞或页面绘制的主要耗时。不要为性能采样向真实账号自动发送请求。
 
-## Codex 云端与无桌面环境
+## 无桌面环境与自动化验证
 
-使用 Node.js 22.13+，执行 `npm ci` 和 `npm run verify`。这两步不需要账号、API Key 或 ZCode 桌面端。仓库不附带桌面运行时；没有 Chrome／VS Code 主题资源时不运行对应浏览器／主题检查，没有桌面运行时则不运行原生集成检查，并在交付中说明未覆盖范围。不要把个人凭据、会话数据库或桌面配置上传到仓库来补齐测试环境。
+容器、持续集成（CI）和远程开发环境均使用 Node.js 22.13+，执行 `npm ci` 和 `npm run verify`。这两步不需要账号、API Key 或 ZCode 桌面端。仓库不附带桌面运行时；没有 Chrome／VS Code 主题资源时不运行对应浏览器／主题检查，没有桌面运行时则不运行原生集成检查，并在交付中说明未覆盖范围。不要把个人凭据、会话数据库或桌面配置上传到仓库来补齐测试环境。

@@ -1,5 +1,19 @@
 # 更新日志 / Changelog
 
+## 2.0.0 — 2026-10-19
+
+### 中文
+
+- 发布首个开源版本，提供 MIT 许可证下的插件源码，以及开发、架构、贡献和发布说明。
+- 启用蓝色折叠 Z 图标，新会话欢迎页背景同步使用同一图形的线稿。
+- 恢复 README 中的中英文输入区图片，配合分区说明介绍排队消息、问题导航、模型设置和额度面板。
+
+### English
+
+- Introduce the first open-source release, with plugin source code under the MIT license and documentation for development, architecture, contributing, and releases.
+- Adopt the blue folded Z icon and use a matching outline on the new-chat welcome screen.
+- Restore Chinese and English composer illustrations in the README, with section guides for queued messages, question navigation, model settings, and the quota panel.
+
 ## 1.4.10 — 2026-10-18
 
 ### 中文

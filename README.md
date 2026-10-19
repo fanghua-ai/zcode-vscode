@@ -1,6 +1,6 @@
 # ZCode Chat
 
-[中文](#中文) · [English](#english) · [更新日志 / Changelog](CHANGELOG.md) · [许可证 / License](LICENSE) · [第三方声明 / Third-party notices](THIRD-PARTY-NOTICES.txt)
+[中文](#中文) · [English](#english) · [更新日志 / Changelog](CHANGELOG.md) · [许可证 / License](LICENSE) · [第三方声明 / Third-party notices](THIRD-PARTY-NOTICES.txt) · [源码 / Source](https://github.com/fanghua-ai/zcode-vscode) · [问题反馈 / Issues](https://github.com/fanghua-ai/zcode-vscode/issues)
 
 ## 中文
 
@@ -17,23 +17,7 @@
 
 ### 输入区示意
 
-```text
-┌─ 排队消息 ─────────────────────────────────── 操作 ─┐
-│  ⋮⋮  消息内容                             ↑  ✎  × │
-└───────────────────────────────────────────────────┘
-┌─ 历史问题跳转 ── ──────────────────────────────── ☰ ┐
-│  1   2   3   4   5   6   7   …                    │
-├───────────────────────────────────────────────────┤
-│ 附件／引用                                   已连接 ●│
-│                                                   │
-│ 输入问题  ·  @ 引用文件或会话  ·  / 选择能力           │
-│                                                   │
-├───────────────────────────────────────────────────┤
-│ 模型  ·  权限  ·  推理强度               使用状态 ↑   │
-├───────────────────────────────────────────────────┤
-│ 上下文额度 ━━   5 小时额度 ━━━  每周额度 ━━           │
-└───────────────────────────────────────────────────┘
-```
+![输入区示意](https://raw.githubusercontent.com/fanghua-ai/zcode-vscode/main/media/composer-guide.png)
 
 | 位置 | 用途 |
 |------|------|
@@ -80,10 +64,10 @@
 
 也可以使用 VSIX 安装：
 
-命令面板：**Extensions: Install from VSIX…** → 选择下载的 `zcode-desktop-chat-1.4.10.vsix` → **Developer: Reload Window**。
+命令面板：**Extensions: Install from VSIX…** → 选择下载的 `zcode-desktop-chat-2.0.0.vsix` → **Developer: Reload Window**。
 
 ```bash
-code --install-extension zcode-desktop-chat-1.4.10.vsix --force
+code --install-extension zcode-desktop-chat-2.0.0.vsix --force
 ```
 
 ### 使用
@@ -286,23 +270,7 @@ Chat with the ZCode agent from the VS Code secondary side bar (the right-hand ch
 
 ### Composer layout
 
-```text
-┌─ Queued messages ───────────────────────── Actions ─┐
-│  ⋮⋮  Message                               ↑  ✎  × │
-└─────────────────────────────────────────────────────┘
-┌─ Question navigation ──────────────────────────── ☰ ┐
-│  1   2   3   4   5   6   7   …                      │
-├─────────────────────────────────────────────────────┤
-│ Attachments / references                 Connected ●│
-│                                                     │
-│ Write a prompt · @ reference · / choose a capability│
-│                                                     │
-├─────────────────────────────────────────────────────┤
-│ Model · Permission · Reasoning effort       Status ↑│
-├─────────────────────────────────────────────────────┤
-│ Context ━━━   5-hour quota ━━━   Weekly quota ━━    │
-└─────────────────────────────────────────────────────┘
-```
+![Composer layout](https://raw.githubusercontent.com/fanghua-ai/zcode-vscode/main/media/composer-guide.en.png)
 
 | Location | Purpose |
 |----------|---------|
@@ -349,10 +317,10 @@ Search for **ZCode Chat** by **fanghua** in the VS Code Extensions Marketplace, 
 
 Alternatively, install a VSIX:
 
-Command Palette: **Extensions: Install from VSIX…** → choose the downloaded `zcode-desktop-chat-1.4.10.vsix` → **Developer: Reload Window**.
+Command Palette: **Extensions: Install from VSIX…** → choose the downloaded `zcode-desktop-chat-2.0.0.vsix` → **Developer: Reload Window**.
 
 ```bash
-code --install-extension zcode-desktop-chat-1.4.10.vsix --force
+code --install-extension zcode-desktop-chat-2.0.0.vsix --force
 ```
 
 ### Usage
