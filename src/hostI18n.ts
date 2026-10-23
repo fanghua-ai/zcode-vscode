@@ -1,3 +1,4 @@
+import { redactSecrets } from "./redact";
 import * as vscode from "vscode";
 import { resolveUiLanguage, translate, LocalizedError } from "./i18n";
 
@@ -8,8 +9,14 @@ export function hostT(key: string, values?: Record<string, unknown>): string {
 }
 
 export function userFacingError(error: unknown): string {
-  if (error instanceof LocalizedError) return hostT(error.key, error.values);
-  let message = error instanceof Error ? error.message : String(error);
-  message = message.replace(/^ZCode error -?\d+:\s*/, "");
-  return hostT(message);
+  // Both kinds become readable text first, then go through the same redaction: raw errors may echo request
+  // headers or stderr, and localized errors interpolate paths, commands or stderr into their template.
+  let text: string;
+  if (error instanceof LocalizedError) {
+    text = hostT(error.key, error.values);
+  } else {
+    const message = error instanceof Error ? error.message : String(error);
+    text = hostT(message.replace(/^ZCode error -?\d+:\s*/, ""));
+  }
+  return redactSecrets(text);
 }

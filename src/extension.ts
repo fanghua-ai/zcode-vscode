@@ -1,5 +1,6 @@
 import { rankWorkspaceFiles, workspaceSearchPatterns } from "./fileSearch";
 import { existingWorkspaceFile, previewFileKind, previewFilesForReply } from "./filePreview";
+import { resolveFileTarget } from "./workspaceFiles";
 import { prepareFileContext } from "./fileContext";
 import { decodeImage, imageMime } from "./imageAttachments";
 import { readImageAttachments, IMAGE_MAX_BYTES, type ImageAttachment } from "./attachmentTypes";
@@ -34,7 +35,9 @@ import {
   syncCliConfig,
   type ResolveResult,
 } from "./desktop";
-import { getLog, logError, logInfo, logWarn } from "./log";
+import { disposeLog, getLog, logDebug, logError, logInfo, logWarn } from "./log";
+import { redactSecrets } from "./redact";
+import { parseWebviewMessage } from "./webviewMessages";
 import { StartupTiming } from "./startupTiming";
 import { SendTiming } from "./sendTiming";
 import { locateAppServer } from "./serverPath";
@@ -53,6 +56,9 @@ import {
   setTaskDeleted,
   upsertDesktopTask,
   listSessionQuestions,
+  nativeSqliteAvailable,
+  disposeSqliteSnapshots,
+  cleanupOrphanedSqliteSnapshots,
   type SessionQuestion,
 } from "./taskIndex";
 
@@ -138,6 +144,9 @@ export function mergeAvailablePickerModels(
 
 export function activate(context: vscode.ExtensionContext) {
   getLog();
+  context.subscriptions.push({ dispose: disposeLog });
+  context.subscriptions.push({ dispose: disposeSqliteSnapshots });
+  void cleanupOrphanedSqliteSnapshots().catch(() => undefined);
   logInfo("ZCode extension activating");
 
   const provider = new ZCodeViewProvider(context);
@@ -258,6 +267,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private client: ZCodeClient | null = null;
   private view?: vscode.WebviewView;
   private viewVisibilityListener?: vscode.Disposable;
+  private viewMessageListener?: vscode.Disposable;
+  private viewDisposeListener?: vscode.Disposable;
   private starting: Promise<void> | null = null;
   private timing: StartupTiming | null = null;
   private readonly sendTiming = new SendTiming(data => logInfo("send timing", data));
@@ -444,9 +455,24 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     upsertDesktopTask(task);
   }
 
-  resolveWebviewView(webviewView: vscode.WebviewView) {
-    this.view = webviewView;
+  private releaseViewListeners(): void {
     this.viewVisibilityListener?.dispose();
+    this.viewMessageListener?.dispose();
+    this.viewDisposeListener?.dispose();
+    this.viewVisibilityListener = this.viewMessageListener = this.viewDisposeListener = undefined;
+  }
+
+  resolveWebviewView(webviewView: vscode.WebviewView) {
+    this.releaseViewListeners();
+    this.view = webviewView;
+    // The view is destroyed when the user closes or moves it; drop it so nothing posts into a disposed webview.
+    this.viewDisposeListener = webviewView.onDidDispose?.(() => {
+      if (this.view !== webviewView) return;
+      this.releaseViewListeners();
+      this.view = undefined;
+      this.client?.setViewVisible(false);
+      this.setRunningPollVisibility(false);
+    });
     this.viewVisibilityListener = webviewView.onDidChangeVisibility?.(() => {
       if (this.view !== webviewView) return;
       const visible = webviewView.visible === true;
@@ -472,7 +498,13 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.composerChrome()
     );
 
-    webviewView.webview.onDidReceiveMessage((msg: WebviewIn) => {
+    this.viewMessageListener = webviewView.webview.onDidReceiveMessage((raw: unknown) => {
+      const parsed = parseWebviewMessage(raw);
+      if (!parsed.ok) {
+        logDebug("Dropped webview message", parsed.rejection);
+        return;
+      }
+      const msg = parsed.message;
       const isCurrent = this.viewScope();
       if (msg.type === "stop") {
         if (!msg.sessionId || msg.sessionId !== this.client?.currentSessionId) return;
@@ -609,7 +641,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       recentIssues: this.recentIssues,
       // Deliberately omit raw errors, messages, session IDs, settings and credentials.
     };
-    await vscode.env.clipboard.writeText(JSON.stringify(report, null, 2));
+    await vscode.env.clipboard.writeText(redactSecrets(JSON.stringify(report, null, 2)));
     this.post({type: "toast", text: t("诊断信息已复制（不含聊天内容或登录凭据）。")});
   }
 
@@ -1258,17 +1290,27 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     else this.pendingChip = chip;
   }
 
-  private resolveWorkspacePath(filePath: string): string {
-    if (path.isAbsolute(filePath)) return filePath;
-    const root =
-      this.workspacePath ||
-      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ||
-      "";
-    return root ? path.join(root, filePath) : filePath;
+  private workspaceRoots(): string[] {
+    return [this.workspacePath, ...(vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.fsPath)].filter(Boolean);
+  }
+
+  /** Resolve a webview path; files outside the workspace need an explicit modal confirmation. */
+  private async confirmedFileTarget(filePath: string): Promise<string | undefined> {
+    const target = resolveFileTarget(this.workspaceRoots(), filePath);
+    if (!target) {
+      vscode.window.showErrorMessage(t("无法打开此文件：路径无效。"));
+      return undefined;
+    }
+    if (target.insideWorkspace) return target.absolute;
+    const open = t("仍然打开");
+    const choice = await vscode.window.showWarningMessage(
+      t("{0} 不在当前工作区内，确定要打开吗？", { 0: target.absolute }), { modal: true }, open);
+    return choice === open ? target.absolute : undefined;
   }
 
   private async openWorkspaceFile(filePath: string): Promise<void> {
-    const abs = this.resolveWorkspacePath(filePath);
+    const abs = await this.confirmedFileTarget(filePath);
+    if (!abs) return;
     const uri = vscode.Uri.file(abs);
     try {
       await vscode.window.showTextDocument(uri, { preview: true });
@@ -1298,10 +1340,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     patches: StructuredPatch[],
     reverted: boolean
   ): Promise<void> {
-    const abs = this.resolveWorkspacePath(filePath);
     const name = path.basename(filePath);
     let disk: string | null = null;
     if (!reverted) {
+      // Reverted diffs are rebuilt from the patches alone; only a disk read needs the boundary check.
+      const abs = await this.confirmedFileTarget(filePath);
+      if (!abs) return;
       try {
         if (fs.existsSync(abs)) {
           const buf = fs.readFileSync(abs);
@@ -1324,16 +1368,18 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async openFileDiff(change: FileChange): Promise<void> {
-    const abs = this.resolveWorkspacePath(change.path);
     const name = path.basename(change.path);
     const before = change.before ?? "";
     const snippetDiff =
       change.kind === "edit" && typeof change.after === "string";
+    // Snippet diffs stay virtual; opening the real file on the right needs the boundary check.
+    const abs = snippetDiff ? undefined : await this.confirmedFileTarget(change.path);
+    if (!snippetDiff && !abs) return;
     const beforeUri = this.diffDocs.uri("before", change.path, before);
     // Prefer the real workspace file on the right when this is a live write;
     // snippet edits and missing files stay on the virtual readonly scheme.
     const afterUri =
-      !snippetDiff && fs.existsSync(abs)
+      abs && fs.existsSync(abs)
         ? vscode.Uri.file(abs)
         : this.diffDocs.uri("after", change.path, change.after ?? "");
     await vscode.commands.executeCommand(
@@ -2378,7 +2424,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     // Catch up immediately after reopening the panel, then resume the regular
     // poll. Hidden panels do not need to keep background badges current.
     this.client.pollBackgroundRuns();
-    this.runningPoll = setInterval(() => this.client?.pollBackgroundRuns(), 1500);
+    // Without node:sqlite each poll may rebuild a WASM snapshot; poll less often as a fallback.
+    this.runningPoll = setInterval(() => this.client?.pollBackgroundRuns(), nativeSqliteAvailable() ? 1500 : 15000);
   }
 
   private pendingOpenSettings = false;
@@ -2479,12 +2526,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   dispose(): void {
     this.fileSearchCancellation?.cancel();this.fileSearchCancellation?.dispose();
-    this.viewVisibilityListener?.dispose();
+    this.releaseViewListeners();
     this.disposeClient();
   }
 }
 
-type WebviewIn = {
+export type WebviewIn = {
   timingId?: string;
   frameWaitMs?: number;
   historySyncMs?: number;

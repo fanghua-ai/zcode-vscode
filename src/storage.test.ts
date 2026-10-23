@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { readConfiguredDefaultModel, readCliDefaultModel, syncCliConfig, type ResolvedRuntime } from "./desktop";
-import { listWorkspacePathVariants, loadOverriddenTitles, upsertDesktopTask, loadTaskFlags, setTaskDeleted, setTaskArchived } from "./taskIndex";
+import { cleanupOrphanedSqliteSnapshots, disposeSqliteSnapshots, listWorkspacePathVariants, loadOverriddenTitles, upsertDesktopTask, loadTaskFlags, setTaskDeleted, setTaskArchived } from "./taskIndex";
 import { ZCodeClient } from "./zcodeClient";
 import { activate, ZCodeViewProvider } from "./extension";
 import { setTestConfirmation, getRegisteredProvider } from "./testSupport/vscode";
@@ -84,6 +84,29 @@ test("WASM snapshot includes committed WAL records and refuses writes to snapsho
   });
   assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='wal-only'").get().archived, 1);
   assert.equal(db.prepare("SELECT deleted FROM tasks WHERE task_id='wal-only'").get().deleted, 0);
+});
+
+test("WASM snapshot is reused until the database or WAL changes, and removed on dispose", (t) => {
+  const { db } = fixture(t);
+  disposeSqliteSnapshots();
+  t.after(disposeSqliteSnapshots);
+  const snapshots = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith(`zcode-sqlite-${process.pid}-`));
+  db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)");
+  db.prepare("INSERT INTO tasks(workspace_key,task_id,archived) VALUES(?,?,1)").run("/project", "first");
+  withoutNative(() => {
+    assert.deepEqual(loadTaskFlags("/project"), { archived: ["first"], deleted: [] });
+    const [built] = snapshots();
+    assert.ok(built, "no snapshot was cached");
+    assert.deepEqual(loadTaskFlags("/project"), { archived: ["first"], deleted: [] });
+    assert.deepEqual(snapshots(), [built], "an unchanged database rebuilt its snapshot");
+    db.prepare("INSERT INTO tasks(workspace_key,task_id,deleted) VALUES(?,?,1)").run("/project", "second");
+    assert.deepEqual(loadTaskFlags("/project"), { archived: ["first"], deleted: ["second"] }, "a WAL change served a stale snapshot");
+    const rebuilt = snapshots();
+    assert.equal(rebuilt.length, 1, "the previous snapshot was not removed");
+    assert.notEqual(rebuilt[0], built);
+  });
+  disposeSqliteSnapshots();
+  assert.deepEqual(snapshots(), []);
 });
 
 test("native WAL writes remain durable", (t) => {
@@ -489,4 +512,25 @@ test("fresh install without CLI default resolves the active account registry pro
  assert.deepEqual(readConfiguredDefaultModel(runtime),{providerId:"account:bigmodel-team-coding-plan",modelId:"GLM-5.3-Flash"});
  assert.deepEqual(readConfiguredDefaultModel({...runtime,modelId:"obsolete-login-default"}),{providerId:"account:bigmodel-team-coding-plan",modelId:"GLM-5.3-Flash"});
  fs.unlinkSync(path.join(v2,"credentials.json"));assert.equal(readConfiguredDefaultModel(runtime),undefined);
+});
+
+test("snapshots left by dead processes are removed on startup, everything else is kept", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-orphans-"));
+  try {
+    const dead = "zcode-sqlite-41-1700000000000-ab12.sqlite";
+    const deadJournal = "zcode-sqlite-41-1700000000000-ab12.sqlite-journal";
+    const live = "zcode-sqlite-42-1700000000000-cd34.sqlite";
+    const mine = `zcode-sqlite-${process.pid}-1700000000000-ef56.sqlite`;
+    const unrelated = ["zcode-sqlite-notes.txt", "other-41.sqlite", "zcode-sqlite-41-1-zz.sqlite"];
+    for (const name of [dead, deadJournal, live, mine, ...unrelated]) fs.writeFileSync(path.join(dir, name), "x");
+    fs.mkdirSync(path.join(dir, "zcode-sqlite-43-1700000000000-aa.sqlite"));
+    fs.symlinkSync(path.join(dir, live), path.join(dir, "zcode-sqlite-44-1700000000000-bb.sqlite"));
+    const removed = await cleanupOrphanedSqliteSnapshots(dir, pid => pid === 42);
+    assert.equal(removed, 2);
+    const left = fs.readdirSync(dir).sort();
+    assert.deepEqual(left, [live, mine, "zcode-sqlite-43-1700000000000-aa.sqlite", "zcode-sqlite-44-1700000000000-bb.sqlite", ...unrelated].sort());
+    assert.equal(await cleanupOrphanedSqliteSnapshots(path.join(dir, "missing")), 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

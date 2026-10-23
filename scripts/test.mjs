@@ -37,7 +37,7 @@ try {
         builder.onResolve({ filter: /^vscode$/ }, () => ({ path: path.resolve("src/testSupport/vscode.ts") }));
         builder.onResolve({ filter: /^\.\/log$/ }, () => ({ path: "log", namespace: "test" }));
         builder.onLoad({ filter: /.*/, namespace: "test" }, () => ({
-          contents: "export const logInfo=()=>{}, logWarn=()=>{}, logError=()=>{}, logDebug=()=>{}, getLog=()=>({show(){}});",
+          contents: "export const logInfo=()=>{}, logWarn=()=>{}, logError=()=>{}, logDebug=()=>{}, getLog=()=>({show(){}}), disposeLog=()=>{};",
         }));
         builder.onResolve({ filter: /^node-sqlite3-wasm$/ }, () => ({
           path: require.resolve("node-sqlite3-wasm"), external: true,

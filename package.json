@@ -2,7 +2,7 @@
   "name": "zcode-desktop-chat",
   "displayName": "ZCode Chat",
   "description": "在 VS Code 右侧边栏里和 ZCode 智能体对话，复用桌面端的登录、模型和会话。Chat with the ZCode agent in the VS Code secondary side bar using the desktop app's account, models, and sessions.",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "publisher": "fanghua",
   "author": "fanghua",
   "license": "MIT",
@@ -14,9 +14,16 @@
   "bugs": {
     "url": "https://github.com/fanghua-ai/zcode-vscode/issues"
   },
+  "qna": "marketplace",
   "icon": "media/icon-zcode-vscode.png",
   "engines": {
     "vscode": "^1.106.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "%capabilities.untrustedWorkspaces.description%"
+    }
   },
   "categories": [
     "Machine Learning",
@@ -118,11 +125,13 @@
       "properties": {
         "zcode.binaryPath": {
           "type": "string",
+          "scope": "machine",
           "default": "",
           "description": "Path to the ZCode app-server entry point (zcode.cjs). Empty = auto-detect common install locations."
         },
         "zcode.nodePath": {
           "type": "string",
+          "scope": "machine",
           "default": "",
           "description": "Optional Node.js executable. Empty uses the VS Code runtime to launch zcode.cjs. Set this only if that runtime cannot start the app-server."
         },
@@ -566,7 +575,7 @@
   "devDependencies": {
     "@types/katex": "^0.16.8",
     "@types/node": "^20.11.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "~1.106.0",
     "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.28.2",
     "typescript": "^5.3.0"

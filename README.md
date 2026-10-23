@@ -33,7 +33,7 @@
 
 对话时不必开着桌面窗口。切换项目、重新登录或登录状态过期后，请先在桌面端完成相应操作，再在扩展里选择「重新读取登录」。
 
-这是个人维护的扩展。使用中遇到问题，可以到插件市场 Q&A 提问：<https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna>
+这是个人维护的扩展。使用中遇到问题，可以到[插件市场 Q&A](https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna)提问，也可以在 [GitHub Issues](https://github.com/fanghua-ai/zcode-vscode/issues) 反馈。
 
 开发与贡献请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。本项目为独立扩展，与 ZCode、Z.ai 和 Microsoft 无隶属或官方背书关系。
 
@@ -43,9 +43,11 @@
 
 本版本已在 **ZCode 桌面端 3.12.3 和 3.14.4** 上验证；3.14.4 已完成真实会话切换与停止回归。更早的桌面版本不支持，未列出的版本仍需验证兼容性。
 
+2.0.1 修复了桌面端 **3.16.2** 的会话列表兼容问题；该版本的套餐登录、自定义供应商等其他功能仍需进一步验证。
+
 桌面端更新后协议可能变化，建议确认扩展兼容性后再更新。
 
-遇到适配问题，建议先把这份 **README** 交给本机的智能体，结合操作系统、扩展与桌面端版本、实际现象及日志，按下方「排查」说明检查安装路径、运行时和会话工作区。macOS 用户也可以按此方式先排查。仍无法解决时，可到[插件市场 Q&A](https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna) 提问。
+遇到适配问题，建议先把这份 **README** 交给本机的智能体，结合操作系统、扩展与桌面端版本、实际现象及日志，按下方「排查」说明检查安装路径、运行时和会话工作区。macOS 用户也可以按此方式先排查。仍无法解决时，可到[插件市场 Q&A](https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna)提问，或在 [GitHub Issues](https://github.com/fanghua-ai/zcode-vscode/issues) 反馈。
 
 ### 开始使用
 
@@ -64,10 +66,10 @@
 
 也可以使用 VSIX 安装：
 
-命令面板：**Extensions: Install from VSIX…** → 选择下载的 `zcode-desktop-chat-2.0.0.vsix` → **Developer: Reload Window**。
+命令面板：**Extensions: Install from VSIX…** → 选择下载的 `zcode-desktop-chat-2.0.1.vsix` → **Developer: Reload Window**。
 
 ```bash
-code --install-extension zcode-desktop-chat-2.0.0.vsix --force
+code --install-extension zcode-desktop-chat-2.0.1.vsix --force
 ```
 
 ### 使用
@@ -286,7 +288,7 @@ For desktop CLI compatibility, provider API keys are synchronized to `~/.zcode/c
 
 You can keep the desktop window closed while chatting. If you switch projects, sign in again, or your sign-in expires, complete the required action in the desktop app, then choose “重新读取登录” (Reload sign-in) in the extension.
 
-This extension is maintained as a personal project. If you run into a problem, ask in the Marketplace Q&A: <https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna>
+This extension is maintained as a personal project. If you run into a problem, ask in the [Marketplace Q&A](https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna) or report it in [GitHub Issues](https://github.com/fanghua-ai/zcode-vscode/issues).
 
 For development and contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). This independent extension is not affiliated with or endorsed by ZCode, Z.ai, or Microsoft.
 
@@ -296,9 +298,11 @@ For development and contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). This 
 
 This version has been verified with **ZCode desktop 3.12.3 and 3.14.4**, including real session-switching and stop-behavior regression checks on 3.14.4. Earlier desktop versions are unsupported; unlisted versions still require compatibility testing.
 
+Version 2.0.1 fixes session listing with desktop **3.16.2**. Coding-plan sign-in, custom providers, and other features on that desktop version still require further verification.
+
 Desktop updates may change the protocol. Check extension compatibility before updating.
 
-If you encounter compatibility issues, first give this **README** to an AI agent on your machine, along with your operating system, extension and desktop versions, symptoms, and logs. Ask it to follow the troubleshooting steps below and check installation paths, the runtime, and the session workspace. This also applies to macOS. If the issue remains unresolved, ask in the [Marketplace Q&A](https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna).
+If you encounter compatibility issues, first give this **README** to an AI agent on your machine, along with your operating system, extension and desktop versions, symptoms, and logs. Ask it to follow the troubleshooting steps below and check installation paths, the runtime, and the session workspace. This also applies to macOS. If the issue remains unresolved, ask in the [Marketplace Q&A](https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna) or open a [GitHub issue](https://github.com/fanghua-ai/zcode-vscode/issues).
 
 ### Getting started
 
@@ -317,10 +321,10 @@ Search for **ZCode Chat** by **fanghua** in the VS Code Extensions Marketplace, 
 
 Alternatively, install a VSIX:
 
-Command Palette: **Extensions: Install from VSIX…** → choose the downloaded `zcode-desktop-chat-2.0.0.vsix` → **Developer: Reload Window**.
+Command Palette: **Extensions: Install from VSIX…** → choose the downloaded `zcode-desktop-chat-2.0.1.vsix` → **Developer: Reload Window**.
 
 ```bash
-code --install-extension zcode-desktop-chat-2.0.0.vsix --force
+code --install-extension zcode-desktop-chat-2.0.1.vsix --force
 ```
 
 ### Usage

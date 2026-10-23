@@ -1,5 +1,27 @@
 # 更新日志 / Changelog
 
+## 2.0.1 — 2026-10-23
+
+### 中文
+
+- 修复 ZCode 桌面端 3.16.2 拒绝旧会话列表参数、导致历史会话无法显示的问题，同时保留旧版桌面端的参数支持。
+- `zcode.binaryPath` 和 `zcode.nodePath` 改为只读取用户级（本机）设置，写在工作区 `.vscode/settings.json` 里的这两项将不再生效；如之前在工作区里配置过，请移到用户设置。
+- 插件声明不支持受限模式：在未受信任的工作区中不会启用，因为它需要启动本地 ZCode 进程。
+- webview 的 nonce 改用密码学安全随机数生成；`@types/vscode` 锁定到与最低支持版本一致的 1.106。
+- 从对话里打开文件或查看改动时，如果文件不在当前工作区内（包括通过符号链接指向外部），会先弹窗确认；无效路径和 URL 不再打开。在 Windows 上，指向工作区外网络共享（`\\服务器\共享`）的路径和链接会直接拒绝、不会访问共享；但链接指向映射成盘符的网络驱动器（如 `Z:\`）时仍会访问该驱动器。
+- 输出日志、错误提示和复制的诊断信息会自动隐藏 API Key、Bearer Token 等凭据。
+- 在没有内置 SQLite 的 VS Code 上，会话记录的临时副本改为按需重建：数据库没有变化时不再每次读取都复制整个数据库，后台状态检查也会放慢，减少界面卡顿。ZCode 持续写入时副本仍会重建，届时仍可能短暂卡顿。
+
+### English
+
+- Restore history listing on ZCode desktop 3.16.2 when it rejects the legacy session-list parameter, while retaining support for older desktop versions.
+- `zcode.binaryPath` and `zcode.nodePath` are now read only from user (machine) settings; values in a workspace `.vscode/settings.json` are ignored. Move any workspace-level values to your user settings.
+- The extension now declares that it does not support Restricted Mode and stays disabled in untrusted workspaces, because it starts a local ZCode process.
+- Webview nonces now come from a cryptographically secure random source, and `@types/vscode` is pinned to 1.106 to match the minimum supported VS Code version.
+- Opening a file or a change from the chat now asks for confirmation when the file is outside the current workspace, including through symlinks; invalid paths and URLs are no longer opened. On Windows, paths and links that lead to a network share (`\\server\share`) outside the workspace are refused without contacting the share; a link to a mapped network drive such as `Z:\` is still followed and reaches that drive.
+- API keys, bearer tokens and similar credentials are now masked in the output log, error notifications and copied diagnostics.
+- On VS Code builds without built-in SQLite, the temporary copy of the chat database is rebuilt only when the database changes instead of on every read, and background status checks run less often, which reduces editor stalls. While ZCode keeps writing to the database the copy is still rebuilt, so short stalls remain possible.
+
 ## 2.0.0 — 2026-10-19
 
 ### 中文

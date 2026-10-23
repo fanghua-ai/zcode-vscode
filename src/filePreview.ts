@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { realpathAllowMissing, resolveFileTarget } from "./workspaceFiles";
 
 export type PreviewFile = { path: string; name: string; kind: string; extension: string };
 
@@ -10,17 +11,23 @@ const previewExtensions: Record<string, string> = {
   opus: "audio", flac: "audio", weba: "audio",
 };
 
-/** Resolve model-provided paths only inside the active workspace, after symlinks. */
-export function existingWorkspaceFile(root: string, filePath: string): { absolute: string; relative: string } | null {
-  if (!root || !filePath || filePath.includes("\0") || filePath.startsWith("//") ||
-      (/^[a-z][a-z\d+.-]*:/i.test(filePath) && !/^[a-z]:[\\/]/i.test(filePath))) return null;
+/**
+ * Resolve model-provided paths only inside the active workspace, after symlinks. The boundary rules are the
+ * shared ones in workspaceFiles.ts (plain paths only, UNC and link-to-share checks on Windows); unlike the
+ * open-file commands there is no "open anyway" prompt, so anything outside the workspace is simply null.
+ */
+export function existingWorkspaceFile(
+  root: string,
+  filePath: string,
+  platform: NodeJS.Platform = process.platform
+): { absolute: string; relative: string } | null {
+  if (!root) return null;
+  const target = resolveFileTarget([root], filePath, platform);
+  if (!target?.insideWorkspace) return null;
   try {
-    const realRoot = fs.realpathSync(root);
-    const absolute = fs.realpathSync(path.resolve(root, filePath));
-    const relative = path.relative(realRoot, absolute);
-    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) ||
-        !fs.statSync(absolute).isFile()) return null;
-    return { absolute, relative };
+    const relative = path.relative(realpathAllowMissing(root), target.absolute);
+    if (!relative || !fs.statSync(target.absolute).isFile()) return null;
+    return { absolute: target.absolute, relative };
   } catch { return null; }
 }
 

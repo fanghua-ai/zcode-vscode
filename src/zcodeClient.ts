@@ -404,6 +404,7 @@ export class ZCodeClient {
   private readonly historyVersions = new WeakMap<readonly unknown[], HistoryDelivery>();
   private startupLoginConsumed = false;
   private startupSessions: SessionSummary[] | undefined;
+  private sessionListSupportsArchived = true;
   private stderrLines: string[] = [];
   private liveModelReady = false;
   private lastRevision = 0;
@@ -832,16 +833,27 @@ export class ZCodeClient {
     const started = Date.now();
     try {
       const paths = listWorkspacePathVariants(this.opts.workspacePath);
-      const results = await Promise.all(paths.map(async workspacePath =>
-        await this.sendRequest("session/list", {
-          workspace: workspaceObject(workspacePath), includeArchived, limit: 80,
-        }, 20000) as { sessions?: unknown[] }
-      ));
+      const results = await Promise.all(paths.map(async workspacePath => {
+        const params = { workspace: workspaceObject(workspacePath), limit: 80 };
+        try {
+          return await this.sendRequest("session/list", {
+            ...params, ...(this.sessionListSupportsArchived ? { includeArchived } : {}),
+          }, 20000) as { sessions?: unknown[] };
+        } catch (error) {
+          // Desktop 3.16.2 removed this optional field from its strict schema.
+          const message = error instanceof Error ? error.message : "";
+          if (!/ZCode error -32602:/.test(message) ||
+              !/Unrecognized key[^\n]*["']includeArchived["']/i.test(message)) throw error;
+          this.sessionListSupportsArchived = false;
+          return await this.sendRequest("session/list", params, 20000) as { sessions?: unknown[] };
+        }
+      }));
       const byId = new Map<string, SessionSummary>();
       for (const result of results) {
         for (const raw of result?.sessions ?? []) {
           const session = this.normalizeSession(raw);
           if (!session?.sessionId || (session.workspacePath && !sameWorkspacePath(session.workspacePath, this.opts.workspacePath))) continue;
+          if (!includeArchived && session.archivedAt) continue;
           const previous = byId.get(session.sessionId);
           if (!previous || (session.updatedAt ?? 0) > (previous.updatedAt ?? 0)) byId.set(session.sessionId, session);
         }

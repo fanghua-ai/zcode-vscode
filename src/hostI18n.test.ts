@@ -34,6 +34,9 @@ test("owned database errors translate while external diagnostics and interpolate
     assert.equal(userFacingError(new LocalizedError("已设置的 zcode.binaryPath 不存在：{0}", { 0: "/路径/文件 $&" })),
       "The configured zcode.binaryPath does not exist: /路径/文件 $&");
     assert.equal(userFacingError(cause), cause.message);
+    const leaked = userFacingError(new LocalizedError("已设置的 zcode.binaryPath 不存在：{0}", { 0: "/opt/sk-abcdefghijklmnop/zcode Authorization: Bearer abcdefghijkl" }));
+    assert.doesNotMatch(leaked, /sk-abcdefghijklmnop|abcdefghijkl/);
+    assert.match(leaked, /^The configured zcode\.binaryPath does not exist: \/opt\/\[REDACTED\]\/zcode Authorization: \[REDACTED\]$/);
     setTestLanguage("auto", "zh-CN");
     assert.equal(
       userFacingError(new Error("ZCode error -32010: Cannot manage goals while a prompt is running")),

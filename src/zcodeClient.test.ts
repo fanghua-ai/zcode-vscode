@@ -1694,6 +1694,52 @@ test("Linux session listing makes one scoped request and excludes other workspac
   assert.equal(calls, 1);
 });
 
+test("session listing retries without includeArchived on Desktop 3.16.2 and remembers the capability", async () => {
+  const { client, state } = fixture();
+  const requests: unknown[] = [];
+  state.sendRequest = async (method, params) => {
+    assert.equal(method, "session/list");
+    requests.push(params);
+    if (Object.hasOwn(params as object, "includeArchived")) {
+      throw new Error('ZCode error -32602: Invalid params — (root): Unrecognized key: "includeArchived"');
+    }
+    return { sessions: [
+      { sessionId: "active", workspace: { workspacePath: "/test" } },
+      { sessionId: "archived", archivedAt: 10, workspace: { workspacePath: "/test" } },
+      { sessionId: "other", workspace: { workspacePath: "/other" } },
+    ] };
+  };
+  assert.deepEqual((await client.listSessions(true)).map(s => s.sessionId), ["active", "archived"]);
+  assert.deepEqual((await client.listSessions()).map(s => s.sessionId), ["active"]);
+  assert.equal(requests.length, 3);
+  assert.equal(Object.hasOwn(requests[0] as object, "includeArchived"), true);
+  for (const params of requests.slice(1)) {
+    assert.deepEqual(params, { workspace: { workspaceKey: "/test", workspacePath: "/test" }, limit: 80 });
+  }
+});
+
+test("session listing does not retry unrelated failures or hide a failed fallback", async () => {
+  for (const message of [
+    'ZCode error -32602: Invalid params — Unrecognized key: "limit"',
+    "ZCode error 401: Unauthorized",
+    "Request session/list timed out after 20000ms",
+  ]) {
+    const { client, state } = fixture();
+    let calls = 0;
+    state.sendRequest = async () => { calls++; throw new Error(message); };
+    await assert.rejects(client.listSessions(true), error => (error as Error).message === message);
+    assert.equal(calls, 1);
+  }
+  const { client, state } = fixture();
+  let calls = 0;
+  state.sendRequest = async () => {
+    if (++calls === 1) throw new Error('ZCode error -32602: Unrecognized key: "includeArchived"');
+    throw new Error("fallback failed");
+  };
+  await assert.rejects(client.listSessions(true), /fallback failed/);
+  assert.equal(calls, 2);
+});
+
 test("image-only send uses desktop v4 metadata and keeps the original session", async () => {
   const {client,state}=fixture(); state.ensureSessionModel=async()=>{};
   const requests:Array<{method:string;params:any}>=[];

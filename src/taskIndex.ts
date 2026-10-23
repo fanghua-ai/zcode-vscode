@@ -374,6 +374,118 @@ function openWasm(dbPath: string): SqliteApi {
   }
 }
 
+let nativeSqlite: boolean | undefined;
+/** Whether this runtime ships node:sqlite; without it every read goes through the WASM snapshot path. */
+export function nativeSqliteAvailable(): boolean {
+  if (nativeSqlite === undefined) {
+    try {
+      nativeSqlite = typeof require("node:sqlite").DatabaseSync === "function";
+    } catch {
+      nativeSqlite = false;
+    }
+  }
+  return nativeSqlite;
+}
+
+/**
+ * WASM SQLite cannot read WAL databases, so it reads a rollback-journal snapshot. Building one copies the
+ * whole database (about a second for a 150 MB store), so keep the latest snapshot per database and rebuild it
+ * only when the main file or its WAL changes size or modification time.
+ */
+const snapshots = new Map<string, { key: string; tempPath: string }>();
+let exitCleanupRegistered = false;
+
+function snapshotKey(dbPath: string): string {
+  const stat = (file: string) => {
+    try {
+      const s = fs.statSync(file, { bigint: true });
+      return `${s.size}:${s.mtimeNs}:${s.ino}`;
+    } catch {
+      return "-";
+    }
+  };
+  return `${stat(dbPath)}|${stat(dbPath + "-wal")}`;
+}
+
+function dropSnapshot(dbPath: string): void {
+  const cached = snapshots.get(dbPath);
+  snapshots.delete(dbPath);
+  if (!cached) return;
+  try {
+    fs.unlinkSync(cached.tempPath);
+  } catch {
+    /* ignore */
+  }
+}
+
+function snapshotFor(dbPath: string): { tempPath: string; reused: boolean } {
+  const key = snapshotKey(dbPath);
+  const cached = snapshots.get(dbPath);
+  if (cached?.key === key && fs.existsSync(cached.tempPath)) return { tempPath: cached.tempPath, reused: true };
+  dropSnapshot(dbPath);
+  const tempPath = materializeRollbackCopy(dbPath);
+  snapshots.set(dbPath, { key, tempPath });
+  // Snapshots hold a full copy of the user's chats; remove them even if deactivate never runs.
+  if (!exitCleanupRegistered) {
+    exitCleanupRegistered = true;
+    process.once("exit", disposeSqliteSnapshots);
+  }
+  return { tempPath, reused: false };
+}
+
+const SNAPSHOT_NAME = /^zcode-sqlite-(\d+)-\d+-[0-9a-f]*\.sqlite(?:-journal|-wal|-shm)?$/;
+
+/** kill(pid, 0) probes without signalling: ESRCH means gone, EPERM means alive under another user. */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * A crash or kill -9 skips both deactivate and the exit hook, leaving full chat copies in the temp directory.
+ * On startup, delete snapshots whose owning process no longer exists. Only regular files we own that match our
+ * own naming are touched; files of live processes (including a reused pid) are left alone.
+ */
+export async function cleanupOrphanedSqliteSnapshots(
+  dir: string = os.tmpdir(),
+  isAlive: (pid: number) => boolean = processAlive
+): Promise<number> {
+  let names: string[];
+  try {
+    names = await fs.promises.readdir(dir);
+  } catch {
+    return 0;
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  let removed = 0;
+  for (const name of names) {
+    const match = SNAPSHOT_NAME.exec(name);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (pid === process.pid || isAlive(pid)) continue;
+    const file = path.join(dir, name);
+    try {
+      const stat = await fs.promises.lstat(file);
+      if (!stat.isFile() || (uid !== undefined && stat.uid !== uid)) continue;
+      await fs.promises.unlink(file);
+      removed++;
+    } catch {
+      /* raced with another window or already gone */
+    }
+  }
+  if (removed) logDebug("Removed orphaned SQLite snapshots", removed);
+  return removed;
+}
+
+/** Delete cached snapshots; registered for extension deactivation. */
+export function disposeSqliteSnapshots(): void {
+  for (const dbPath of [...snapshots.keys()]) dropSnapshot(dbPath);
+}
+
 function openSqlite(dbPath: string, writable = false): { db: SqliteApi; tempPath?: string } {
   const native = tryNativeSqlite(dbPath);
   if (native) return { db: native };
@@ -384,20 +496,14 @@ function openSqlite(dbPath: string, writable = false): { db: SqliteApi; tempPath
     if (writable) {
       throw new LocalizedError("无法安全写入 WAL 数据库：当前运行时不支持原生 SQLite。请升级 VS Code 后重试。", {}, { cause: directErr });
     }
-    let tempPath: string | undefined;
     try {
-      tempPath = materializeRollbackCopy(dbPath);
-      const db = openWasm(tempPath);
-      logDebug("Opened WAL snapshot for", dbPath);
-      return { db, tempPath };
+      // The cached snapshot outlives this call; withDb must not delete it, so no tempPath is returned.
+      const snapshot = snapshotFor(dbPath);
+      const db = openWasm(snapshot.tempPath);
+      if (!snapshot.reused) logDebug("Opened WAL snapshot for", dbPath);
+      return { db };
     } catch (snapErr) {
-      if (tempPath) {
-        try {
-          fs.unlinkSync(tempPath);
-        } catch {
-          /* ignore */
-        }
-      }
+      dropSnapshot(dbPath);
       logWarn("WASM SQLite could not open", dbPath, directErr);
       throw snapErr;
     }

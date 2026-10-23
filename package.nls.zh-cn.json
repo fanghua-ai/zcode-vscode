@@ -59,5 +59,6 @@
   "quotaAdapter.field.budgetLimitPath.description": "总预算的 JSON Pointer。多请求时以请求 ID 开头，例如 /plan/limit。",
   "quotaAdapter.field.budgetLimitDivisor.description": "上限金额可选的正数除数，例如用 100 将分换算为元。",
   "quotaAdapter.field.budgetUsedPath.description": "已用金额的 JSON Pointer。多请求时以请求 ID 开头，例如 /usage/total。",
-  "quotaAdapter.field.budgetUsedDivisor.description": "相减前用于缩放已用金额的除数；例如额度单位为元、接口按分返回时填写 100。"
+  "quotaAdapter.field.budgetUsedDivisor.description": "相减前用于缩放已用金额的除数；例如额度单位为元、接口按分返回时填写 100。",
+  "capabilities.untrustedWorkspaces.description": "ZCode Chat 需要启动本地 ZCode 进程，因此仅在受信任的工作区中运行。"
 }

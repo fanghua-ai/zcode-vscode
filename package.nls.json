@@ -59,5 +59,6 @@
   "quotaAdapter.field.budgetLimitPath.description": "JSON Pointer to the total budget. For multiple requests, start with the request id, for example /plan/limit.",
   "quotaAdapter.field.budgetLimitDivisor.description": "Optional positive divisor for the limit amount, for example 100 to convert cents to currency units.",
   "quotaAdapter.field.budgetUsedPath.description": "JSON Pointer to the used amount. For multiple requests, start with the request id, for example /usage/total.",
-  "quotaAdapter.field.budgetUsedDivisor.description": "Divide the used amount by this value before subtraction, for example 100 when the API reports cents and the limit is in dollars."
+  "quotaAdapter.field.budgetUsedDivisor.description": "Divide the used amount by this value before subtraction, for example 100 when the API reports cents and the limit is in dollars.",
+  "capabilities.untrustedWorkspaces.description": "ZCode Chat starts a local ZCode process, so it only runs in trusted workspaces."
 }

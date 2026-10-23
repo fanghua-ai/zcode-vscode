@@ -37,3 +37,19 @@ test("PDF and Office files can be previewed without a file-change summary", () =
       .map(card => [card.name, card.kind]), [["sheet.xlsx", "spreadsheet"], ["report.pdf", "pdf"]]);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test("workspace preview paths use the shared boundary rules", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-preview-bounds-"));
+  try {
+    fs.mkdirSync(path.join(root, "docs"));
+    fs.writeFileSync(path.join(root, "docs", "plan.md"), "plan");
+    assert.equal(existingWorkspaceFile(root, "docs/plan.md")?.relative, path.join("docs", "plan.md"));
+    assert.equal(existingWorkspaceFile(root, path.join(root, "docs", "plan.md"))?.relative, path.join("docs", "plan.md"));
+    for (const bad of ["", "a\0b", "docs", "missing.md", "file:///etc/passwd", "https://x/y.md", "//server/share/a.md", "\\\\server\\share\\a.md"]) {
+      assert.equal(existingWorkspaceFile(root, bad), null, bad);
+    }
+    assert.equal(existingWorkspaceFile("", "docs/plan.md"), null);
+    // Windows UNC paths outside the workspace are refused on strings alone (the host does not exist).
+    assert.equal(existingWorkspaceFile("C:\\work", "\\\\attacker\\share\\a.md", "win32"), null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

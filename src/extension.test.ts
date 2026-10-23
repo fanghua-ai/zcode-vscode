@@ -54,16 +54,20 @@ function fixture() {
   state.indexCurrentSession = () => {};
   let handler!: (message: unknown) => void;
   let onVisibilityChange = () => {};
+  let onViewDispose = () => {};
+  const releasedListeners: string[] = [];
   const view = {
     visible: true,
-    onDidChangeVisibility: (callback: () => void) => { onVisibilityChange = callback; return { dispose() {} }; },
-    webview: { cspSource: "file:", asWebviewUri: (uri: unknown) => uri, onDidReceiveMessage: (callback: typeof handler) => { handler = callback; } },
+    onDidChangeVisibility: (callback: () => void) => { onVisibilityChange = callback; return { dispose() { releasedListeners.push("visibility"); } }; },
+    onDidDispose: (callback: () => void) => { onViewDispose = callback; return { dispose() { releasedListeners.push("dispose"); } }; },
+    webview: { cspSource: "file:", asWebviewUri: (uri: unknown) => uri, onDidReceiveMessage: (callback: typeof handler) => { handler = callback; return { dispose() { releasedListeners.push("message"); } }; } },
   };
   provider.resolveWebviewView(view as unknown as vscode.WebviewView);
   fixtureDisposals.add(() => provider.dispose());
   const switchToB = () => { state.client.currentSessionId = "B"; state.switchTicket++; };
   const setVisible = (visible: boolean) => { view.visible = visible; onVisibilityChange(); };
-  return { state, posted, response, handler, switchToB, setVisible, visibility, pollState, backgroundPolls: () => backgroundPolls, dispose: () => provider.dispose() };
+  const disposeView = () => onViewDispose();
+  return { state, posted, response, handler, switchToB, setVisible, disposeView, releasedListeners, provider, view, visibility, pollState, backgroundPolls: () => backgroundPolls, dispose: () => provider.dispose() };
 }
 
 test("Markdown file links open workspace images and reject stale or escaping paths", async () => {
@@ -328,6 +332,26 @@ test("panel visibility pauses background SQLite polling and immediately catches 
   assert.equal(f.backgroundPolls(), 2, "showing the panel did not immediately refresh background status");
   assert.deepEqual(f.visibility, [true, false, true]);
   f.setVisible(false);
+});
+
+test("a disposed webview view is dropped and its listeners are released", () => {
+  const f = fixture();
+  const viewState = f.provider as unknown as { view?: unknown };
+  f.state.startRunningPoll();
+  assert.ok(f.pollState.runningPoll);
+  f.disposeView();
+  assert.equal(viewState.view, undefined, "disposed view was kept");
+  assert.equal(f.pollState.runningPoll, undefined, "disposed view kept the background poll timer");
+  assert.deepEqual([...f.releasedListeners].sort(), ["dispose", "message", "visibility"]);
+  assert.equal(f.visibility.at(-1), false);
+  f.setVisible(true);
+  assert.equal(f.pollState.runningPoll, undefined, "a stale visibility event revived the poll");
+});
+
+test("resolving a new view releases the previous view's listeners first", () => {
+  const f = fixture();
+  f.provider.resolveWebviewView(f.view as unknown as vscode.WebviewView);
+  assert.deepEqual([...f.releasedListeners].sort(), ["dispose", "message", "visibility"]);
 });
 
 test("every page load receives the session state, even without a new resolveWebviewView", async () => {
