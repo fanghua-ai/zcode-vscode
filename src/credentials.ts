@@ -320,6 +320,7 @@ interface Organization {
 interface Project {
   projectId: string;
   projectName?: string;
+  projectType?: number | string;
 }
 
 interface ApiKey {
@@ -560,13 +561,117 @@ export async function readStoredPlanApiKeyWithRetry(accountProviderId: string): 
   try { return readStoredPlanApiKey(accountProviderId, await readCredentialsWithRetry()); } catch { return null; }
 }
 
+/** PAT-based Coding Plan authentication shipped in the public 3.15.1 source. */
+export function usesProjectTokens(version?: string | null): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version ?? "");
+  if (!match) return false;
+  const [major, minor, patch] = match.slice(1).map(Number);
+  return major > 3 || (major === 3 && (minor > 15 || (minor === 15 && patch >= 1)));
+}
+
+export interface PlanAuth {
+  apiKey: string;
+  /** Present only for short-lived project tokens; never persist these credentials. */
+  apiKeyId?: string;
+  accountScope?: string;
+}
+
+type CachedPlanToken = {
+  scope: string;
+  value?: PlanAuth;
+  refreshAt?: number;
+  pending?: Promise<PlanAuth>;
+};
+// One active account/project per family. Scope includes the OAuth credential so
+// switching accounts or signing in again cannot reuse the previous token.
+const planTokens = new Map<PlanFamily, CachedPlanToken>();
+
+async function resolveProjectToken(
+  family: PlanFamily, oauth: string, version: string, prefer?: OrgProject,
+  rejectedFingerprint?: string
+): Promise<PlanAuth> {
+  const scope = crypto.createHash("sha256").update(JSON.stringify([
+    zcodeDir(), family, oauth, prefer?.organizationId, prefer?.projectId, version,
+  ])).digest("hex");
+  let entry = planTokens.get(family);
+  if (!entry || entry.scope !== scope) {
+    entry = { scope };
+    planTokens.set(family, entry);
+  }
+  if (rejectedFingerprint && entry.value &&
+      crypto.createHash("sha256").update(entry.value.apiKey).digest("hex") === rejectedFingerprint) {
+    entry.value = undefined;
+  }
+  if (entry.value && Date.now() < entry.refreshAt!) return entry.value;
+  if (entry.pending) return entry.pending;
+  const current = entry;
+  current.pending = (async () => {
+    const login = (family === "zai" ? await resolveZaiBizToken(oauth) : oauth)
+      .trim().replace(/^Bearer\s+/i, "");
+    const info = await httpGetJson(`${PLAN_HOST[family]}/api/biz/customer/getCustomerInfo`, { Authorization: login });
+    const data = projectTokenData(info) as { organizations?: Organization[] };
+    // Team projects do not identify a personal Coding Plan.
+    const personal = prefer ? data : { organizations: data.organizations?.map(org => ({
+      ...org, projects: org.projects?.filter(project => String(project.projectType) !== "2"),
+    })).filter(org => org.projects?.length) };
+    const location = pickOrgAndProject(personal, prefer);
+    if (!location || (prefer && !data.organizations?.some(org =>
+      org.organizationId === prefer.organizationId && org.projects?.some(project => project.projectId === prefer.projectId)
+    ))) throw new Error("project_token_project_unavailable");
+    const url = `${PLAN_HOST[family]}/api/biz/v1/organization/${encodeURIComponent(location.organizationId)}/projects/${encodeURIComponent(location.projectId)}/api_keys`;
+    const headers = bizHeaders(!prefer && family === "zai" ? `Bearer ${login}` : login, prefer);
+    const keys = projectTokenData(await httpGetJson(url, headers));
+    if (!Array.isArray(keys)) throw new Error("project_token_invalid_response");
+    const name = prefer ? ZCODE_TEAM_API_KEY_NAME : ZCODE_API_KEY_NAME;
+    const candidate = keys.find(key => key && typeof key === "object" &&
+      "name" in key && key.name === name && (!prefer || ("keyType" in key && key.keyType === TEAM_PLAN_KEY_TYPE)));
+    const key = candidate ?? projectTokenData(await httpPostJson(url, headers, {
+      name, ...(prefer ? { keyType: TEAM_PLAN_KEY_TYPE } : {}), usageScene: 1,
+    }));
+    if (!key || typeof key !== "object" || !("apiKey" in key) ||
+        typeof key.apiKey !== "string" || !key.apiKey.trim() ||
+        (prefer && (!("name" in key) || key.name !== name || !("keyType" in key) || key.keyType !== TEAM_PLAN_KEY_TYPE))) throw new Error("project_token_key_unavailable");
+    const apiKeyId = key.apiKey.trim();
+    const started = Date.now();
+    const token = projectTokenData(await httpPostJson(`${url}/${encodeURIComponent(apiKeyId)}/access_tokens`,
+      { Authorization: `Bearer ${login}` }, { clientType: "zcode", clientVersion: version })) as {
+        enable?: boolean; accessToken?: string; tokenType?: string; expiresAt?: number; expiresIn?: number;
+      };
+    if (token.enable === false) throw new Error("project_token_disabled");
+    if ((token.enable !== undefined && token.enable !== true) || token.tokenType !== "Bearer" ||
+        typeof token.accessToken !== "string" || !token.accessToken.trim() ||
+        typeof token.expiresAt !== "number" || !Number.isFinite(token.expiresAt) ||
+        typeof token.expiresIn !== "number" || !Number.isFinite(token.expiresIn) || token.expiresIn <= 0) {
+      throw new Error("project_token_invalid_response");
+    }
+    const expiresAt = Math.min(token.expiresAt * 1000, started + token.expiresIn * 1000);
+    if (expiresAt <= Date.now()) throw new Error("project_token_expired");
+    const latest = await readCredentialsWithRetry();
+    if (planTokens.get(family) !== current ||
+        latest[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] !== oauth) {
+      throw new Error("project_token_account_changed");
+    }
+    current.value = { apiKey: token.accessToken.trim(), apiKeyId, accountScope: scope };
+    current.refreshAt = expiresAt - Math.min(120_000, (expiresAt - started) / 5);
+    return current.value;
+  })();
+  try { return await current.pending; }
+  finally { current.pending = undefined; }
+}
+
+function projectTokenData(response: { code: number; data: unknown }): unknown {
+  if (![0, 200, "0", "200"].includes(response.code) || !response.data || typeof response.data !== "object") {
+    throw new Error("project_token_invalid_response");
+  }
+  return response.data;
+}
+
 export async function tryPlanOAuth(
   family: PlanFamily,
-  prefer?: OrgProject
-): Promise<{
-  apiKey: string;
-  activeProvider: string | null;
-} | null> {
+  prefer?: OrgProject,
+  appVersion?: string | null,
+  rejectedFingerprint?: string
+): Promise<(PlanAuth & { activeProvider: string | null }) | null> {
   let stage = "read_credentials";
   try {
     const creds = await readCredentialsWithRetry();
@@ -578,13 +683,18 @@ export async function tryPlanOAuth(
       logWarn("Desktop OAuth token is unavailable", { family });
       return null;
     }
+    if (usesProjectTokens(appVersion)) {
+      stage = "exchange_project_token";
+      const auth = await resolveProjectToken(family, accessToken, appVersion!, prefer, rejectedFingerprint);
+      return { ...auth, activeProvider: activeProvider ?? family };
+    }
     stage = "exchange_api_key";
     const authorization =
       family === "zai" ? `Bearer ${await resolveZaiBizToken(accessToken)}` : accessToken;
     const apiKey = await resolveApiKey(family, authorization, prefer);
     return { apiKey, activeProvider: activeProvider ?? family };
   } catch (e) {
-    logWarn("Plan API key exchange failed", { family, team: !!prefer, stage, code: (e as NodeJS.ErrnoException).code ?? (e as Error).name, status: /\b(?:401|403|429|5\d\d)\b/.exec((e as Error).message ?? "")?.[0] });
+    logWarn("Plan API key exchange failed", { family, team: !!prefer, stage, reason: /^project_token_[a-z_]+$/.test((e as Error).message) ? (e as Error).message : undefined, code: (e as NodeJS.ErrnoException).code ?? (e as Error).name, status: /\b(?:401|403|429|5\d\d)\b/.exec((e as Error).message ?? "")?.[0] });
     return null;
   }
 }
@@ -633,11 +743,11 @@ export async function fetchPlanQuota(plan: {
   // Personal Coding Plans use the desktop-stored account key when there is
   // exactly one, so a multi-org account is not assigned by display name.
   let apiKey = "";
-  if (!plan.team) {
+  if (!plan.team && !usesProjectTokens(appVersion)) {
     apiKey = readStoredPlanApiKey(`account:${plan.family}-${plan.kind}`) ?? "";
   }
   if (!apiKey) {
-    apiKey = (await tryPlanOAuth(plan.family, plan.team))?.apiKey?.trim() ?? "";
+    apiKey = (await tryPlanOAuth(plan.family, plan.team, appVersion))?.apiKey?.trim() ?? "";
   }
   if (!apiKey) return [];
   const host = PLAN_HOST[plan.family];

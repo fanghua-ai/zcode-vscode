@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { uploadImage, readUploadedImage } from "./imageAttachments";
 import { withRuntimeCompileCache } from "./runtimeCache";
 import { readImageAttachments, type ImageAttachment } from "./attachmentTypes";
@@ -23,7 +24,7 @@ import {
   listStoredProviderModels,
   workspaceObject,
 } from "./desktop";
-import { fetchPlanQuota, type PlanQuotaLimit, type QuotaLine } from "./credentials";
+import { fetchPlanQuota, type PlanQuotaLimit, type QuotaLine, type PlanAuth } from "./credentials";
 import { desktopVersion } from "./diagnostics";
 import { appServerLaunch, startupExitMessage } from "./serverPath";
 import { StartupTiming } from "./startupTiming";
@@ -2997,25 +2998,33 @@ export class ZCodeClient {
     const timing = this.activeTiming;
     const started = performance.now();
     timing?.addCount("runtimeHeadersRequests");
-    const p = (params ?? {}) as { providerId?: string };
+    const p = (params ?? {}) as { providerId?: string; rejectedProjectTokenFingerprint?: string; expectedAccountScope?: string };
     const providerId = p.providerId?.trim() || "";
     try {
       await this.awaitStartupLogin();
       if (this.disposed) return;
-      const held = this.reusableRuntime({ providerId });
+      const cached = this.reusableRuntime({ providerId });
+      const held = cached?.apiKeyId ? null : cached;
       timing?.addCount(held ? "runtimeHeadersCacheHits" : "runtimeHeadersCacheMisses");
-      const auth = held
-        ? { apiKey: held.apiKey }
+      const stale = this.loginStale ? [this.sessionRuntime, this.defaultRuntime].find(
+        runtime => runtime?.apiKeyId && sameDesktopLogin(runtime, providerId)
+      ) : undefined;
+      const rejectedFingerprint = p.rejectedProjectTokenFingerprint ?? (stale
+        ? createHash("sha256").update(stale.apiKey).digest("hex") : undefined);
+      const auth: PlanAuth | null = held
+        ? { apiKey: held.apiKey, apiKeyId: held.apiKeyId }
         : providerId
-          ? await (this.opts.resolveProviderAuth ?? resolveProviderRequestAuth)(providerId)
+          ? await (this.opts.resolveProviderAuth ?? resolveProviderRequestAuth)(providerId, this.desktopAppVersion, rejectedFingerprint)
           : null;
       if (this.disposed) return;
-      if (!auth?.apiKey) {
+      if (!auth?.apiKey || (p.expectedAccountScope && p.expectedAccountScope !== auth.accountScope)) {
         this.write({
           id,
           result: {
             headersApplied: false,
-            errorMessage: "No ZCode desktop login is available for this plan",
+            errorMessage: p.expectedAccountScope && auth?.apiKey
+              ? "The desktop account or plan changed during this request"
+              : "No ZCode desktop login is available for this plan",
           },
         });
         return;
@@ -3024,7 +3033,7 @@ export class ZCodeClient {
       for (const field of ["sessionRuntime", "defaultRuntime"] as const) {
         const runtime = this[field];
         if (runtime && sameDesktopLogin(runtime, providerId)) {
-          this[field] = { ...runtime, apiKey: auth.apiKey };
+          this[field] = { ...runtime, apiKey: auth.apiKey, apiKeyId: auth.apiKeyId };
           this.loginStale = false;
         }
       }
@@ -3032,7 +3041,7 @@ export class ZCodeClient {
         id,
         result: {
           headersApplied: true,
-          requestAuth: { apiKey: auth.apiKey },
+          requestAuth: { apiKey: auth.apiKey, ...(auth.apiKeyId ? { apiKeyId: auth.apiKeyId, accountScope: auth.accountScope } : {}) },
         },
       });
     } catch (e) {

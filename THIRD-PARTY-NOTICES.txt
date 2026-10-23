@@ -10,7 +10,7 @@ The LICENSE file covers this project and the Lucide icon attribution written the
 已安装版本 / Installed versions
 -------------------------------
 
-- dompurify 3.4.16
+- dompurify 3.4.17
 - highlight.js 11.12.0
 - marked 17.0.6
 - katex 0.19.0
@@ -19,7 +19,7 @@ The LICENSE file covers this project and the Lucide icon attribution written the
 包含方式 / How each work is included
 ------------------------------------
 
-- DOMPurify 3.4.16 (https://github.com/cure53/DOMPurify)
+- DOMPurify 3.4.17 (https://github.com/cure53/DOMPurify)
   打包进 dist/webview.js，用于 HTML 净化。许可是 MPL-2.0 OR Apache-2.0。本项目不选择其中之一；两份全文都附在下面，接收方可以任选。
   Bundled into dist/webview.js for HTML sanitization. License: MPL-2.0 OR Apache-2.0. This project does not elect either DOMPurify license. Both full texts are included below, and a recipient may choose either.
 

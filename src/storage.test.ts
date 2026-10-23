@@ -3,7 +3,7 @@ import test, { type TestContext } from "node:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { readConfiguredDefaultModel, readCliDefaultModel, syncCliConfig, type ResolvedRuntime } from "./desktop";
+import { runtimeEnv, readConfiguredDefaultModel, readCliDefaultModel, syncCliConfig, type ResolvedRuntime } from "./desktop";
 import { cleanupOrphanedSqliteSnapshots, disposeSqliteSnapshots, listWorkspacePathVariants, loadOverriddenTitles, upsertDesktopTask, loadTaskFlags, setTaskDeleted, setTaskArchived } from "./taskIndex";
 import { ZCodeClient } from "./zcodeClient";
 import { activate, ZCodeViewProvider } from "./extension";
@@ -532,5 +532,23 @@ test("snapshots left by dead processes are removed on startup, everything else i
     assert.equal(await cleanupOrphanedSqliteSnapshots(path.join(dir, "missing")), 0);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test("short-lived plan tokens never enter CLI config or the app-server environment", t => {
+  fixture(t);
+  for (const providerId of ["builtin:zai-coding-plan", "account:zai-individual-coding-plan"]) {
+    const runtime: ResolvedRuntime = {
+      providerId, providerName: "Test", modelId: "test", models: {}, kind: "anthropic",
+      baseURL: "https://example.invalid", apiKey: "TEST-SHORT-LIVED-TOKEN", apiKeyId: "TEST-KEY-ID",
+      source: "desktop-personal-oauth",
+    };
+    const file = syncCliConfig({ ...runtime, apiKeyId: undefined }, { provider: {} });
+    syncCliConfig(runtime, { provider: { [providerId]: { options: { apiKey: "TEST-STALE-KEY" } } } });
+    const config = fs.readFileSync(file, "utf8");
+    assert.equal(config.includes("TEST-SHORT-LIVED-TOKEN"), false);
+    assert.equal(config.includes("TEST-STALE-KEY"), false);
+    assert.deepEqual(runtimeEnv(runtime), {});
   }
 });

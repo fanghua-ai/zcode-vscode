@@ -81,3 +81,5 @@ npm run verify
 ## 无桌面环境与自动化验证
 
 容器、持续集成（CI）和远程开发环境均使用 Node.js 22.13+，执行 `npm ci` 和 `npm run verify`。这两步不需要账号、API Key 或 ZCode 桌面端。仓库不附带桌面运行时；没有 Chrome／VS Code 主题资源时不运行对应浏览器／主题检查，没有桌面运行时则不运行原生集成检查，并在交付中说明未覆盖范围。不要把个人凭据、会话数据库或桌面配置上传到仓库来补齐测试环境。
+
+使用 `ZCODE_TEST_PROVIDER_CONFIG_ONLY=1 npm run test:desktop-sessions` 可验证仅新版 `provider_config.json` 保存供应商、旧配置不含 Key 的场景。测试仍只使用隔离目录和本机模拟模型。

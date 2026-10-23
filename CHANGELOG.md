@@ -1,5 +1,21 @@
 # 更新日志 / Changelog
 
+## 2.0.2 — 2026-10-23
+
+### 中文
+
+- 更新 DOMPurify 至 3.4.17，修复上游安全告警。
+- 修复新版桌面端自定义 API 供应商无法聊天、或继续使用旧 Key 与旧地址的问题；统一读取当前 Key、API 地址和协议，并保留旧配置兼容。
+- 为新版 ZCode 桌面端的 Coding Plan 接入短期项目 Token 鉴权，保留旧版登录兼容；修正 Z.AI 不同接口的认证头格式。
+- 套餐 Token 在请求时检查并按需刷新，只保留在内存中；换证失败时不再回退到旧密钥。
+
+### English
+
+- Update DOMPurify to 3.4.17 to address upstream security advisories.
+- Fix custom API providers failing to start or using stale keys and endpoints on newer desktops. Read the current key, endpoint, and protocol together while retaining legacy configuration support.
+- Support short-lived project tokens for Coding Plans on newer ZCode desktops while retaining legacy login support, and use the correct Z.AI authentication headers for each endpoint.
+- Check and refresh plan tokens at request time, keep them in memory, and fail explicitly instead of falling back to old keys when token exchange fails.
+
 ## 2.0.1 — 2026-10-23
 
 ### 中文

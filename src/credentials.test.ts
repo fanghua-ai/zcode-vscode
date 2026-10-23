@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { fetchPlanQuota, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey } from "./credentials";
+import { type V2Provider, usesProjectTokens, tryPlanOAuth, fetchPlanQuota, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey } from "./credentials";
 import { readDesktopJsonWithRetry } from "./desktopJson";
-import { resolveRuntime, resolveRuntimeForSession } from "./desktop";
+import { mergeDesktopApiProviders, syncCliConfig, resolveProviderRequestAuth, resolveRuntime, resolveRuntimeForSession } from "./desktop";
 
 const os = require("os") as typeof import("os");
 const writableFs = require("fs") as typeof import("fs");
@@ -370,7 +370,7 @@ for (const transient of [true, false]) {
   });
 }
 
-function mockPlanQuotaApi(t: TestContext) {
+function mockPlanQuotaApi(t: TestContext, issueToken?: () => unknown, listedKeys?: unknown[]) {
   const https = require("https") as typeof import("https");
   const { EventEmitter } = require("events") as typeof import("events");
   const originalGet = https.get;
@@ -386,6 +386,11 @@ function mockPlanQuotaApi(t: TestContext) {
     } else if (requestPath.endsWith("/api_keys")) {
       const isTeam = headers["bigmodel-organization"] === "org-current";
       payload = { code: 200, data: [{ name: isTeam ? "zcode-team-api-key" : "zcode-api-key", keyType: isTeam ? 2 : 1, apiKey: isTeam ? "TEST-TEAM-KEY-ID" : "TEST-PERSONAL-KEY-ID" }] };
+      if (listedKeys) payload = { code: 200, data: method === "GET" ? listedKeys : {
+        ...JSON.parse(body), apiKey: "TEST-CREATED-KEY-ID",
+      } };
+    } else if (requestPath.endsWith("/access_tokens") && issueToken) {
+      payload = issueToken();
     } else if (requestPath.includes("/copy/")) {
       payload = { code: 200, data: { secretKey: "TEST-ONLY-SECRET" } };
     } else if (requestPath.startsWith("/api/monitor/usage/quota/limit")) {
@@ -521,3 +526,232 @@ for (const family of ["bigmodel", "zai"] as const) {
     }]);
   });
 }
+
+
+test("Coding Plan authentication preserves legacy desktops and recognizes PAT releases", () => {
+  for (const version of [null, "", "invalid", "3.12.3", "3.14.4", "3.15.0"]) assert.equal(usesProjectTokens(version), false);
+  for (const version of ["3.15.1", "3.16.2", "4.0.0"]) {
+    assert.equal(usesProjectTokens(version), true);
+  }
+});
+
+for (const family of ["bigmodel", "zai"] as const) {
+  for (const teamPlan of [false, true]) {
+    test(`${family} ${teamPlan ? "team" : "personal"} PAT uses endpoint-specific headers, shares refresh, and never copies secrets`, async t => {
+      const dir = fixture(t);
+      const credentials = { [`oauth:${family}:access_token`]: "TEST-OAUTH" };
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify(credentials));
+      let issued = 0;
+      const requests = mockPlanQuotaApi(t, () => ({ code: "200", data: {
+        accessToken: `TEST-PAT-${++issued}`, tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
+      } }));
+      const team = teamPlan ? { organizationId: "org-current", projectId: "project-current" } : undefined;
+      const resolve = () => tryPlanOAuth(family, team, "3.16.2");
+      const [first, shared] = await Promise.all([resolve(), resolve()]);
+      assert.equal(first?.apiKey, "TEST-PAT-1");
+      assert.deepEqual(shared, first);
+      assert.equal(issued, 1);
+      assert.equal((await resolve())?.apiKey, "TEST-PAT-1");
+      const login = family === "zai" ? "TEST-ZAI-BIZ-TOKEN" : "TEST-OAUTH";
+      assert.equal(requests.find(r => r.path.endsWith("getCustomerInfo"))?.headers.Authorization, login);
+      assert.equal(requests.find(r => r.path.endsWith("/api_keys"))?.headers.Authorization, !team && family === "zai" ? `Bearer ${login}` : login);
+      const issue = requests.find(r => r.path.endsWith("/access_tokens"));
+      assert.equal(issue?.headers.Authorization, `Bearer ${login}`);
+      assert.deepEqual(JSON.parse(issue?.body ?? "null"), { clientType: "zcode", clientVersion: "3.16.2" });
+      assert.equal(requests.some(r => r.path.includes("/copy/")), false);
+      assert.equal(first?.apiKeyId, teamPlan ? "TEST-TEAM-KEY-ID" : "TEST-PERSONAL-KEY-ID");
+
+      const originalNow = Date.now;
+      Date.now = () => originalNow() + 500_000;
+      t.after(() => { Date.now = originalNow; });
+      assert.equal((await resolve())?.apiKey, "TEST-PAT-2", "refresh before expiry");
+      const fingerprint = crypto.createHash("sha256").update("TEST-PAT-2").digest("hex");
+      assert.equal((await tryPlanOAuth(family, team, "3.16.2", fingerprint))?.apiKey, "TEST-PAT-3");
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ ...credentials, [`oauth:${family}:access_token`]: "TEST-OTHER-LOGIN" }));
+      assert.equal((await resolve())?.apiKey, "TEST-PAT-4", "a new login cannot reuse the old token");
+    });
+  }
+}
+
+for (const data of [
+  { enable: false },
+  { accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600 },
+  { accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600, expiresAt: 1 },
+]) {
+  test(`disabled or malformed PAT does not fall back to stored keys: ${JSON.stringify(data)}`, async t => {
+    const dir = fixture(t);
+    fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+      "oauth:bigmodel:access_token": "TEST-OAUTH",
+      "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:old:api-key": "TEST-OLD-KEY",
+    }));
+    const requests = mockPlanQuotaApi(t, () => ({ code: 200, data }));
+    assert.equal(await tryPlanOAuth("bigmodel", undefined, "3.16.2"), null);
+    assert.equal(requests.some(r => r.path.includes("/copy/")), false);
+    assert.deepEqual(await fetchPlanQuota({ family: "bigmodel", kind: "individual-coding-plan" }, "3.16.2"), []);
+    assert.equal(requests.some(r => r.path.includes("/quota/limit")), false);
+  });
+}
+
+
+for (const version of ["3.14.4", "3.15.1", "3.16.2"]) {
+  test(`runtime and request-time login select the correct authentication for desktop ${version}`, async t => {
+    const dir = fixture(t);
+    const providerId = "account:zai-individual-coding-plan";
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: { [providerId]: {
+      kind: "anthropic", models: { "glm-test": {} }, options: { apiKey: "TEST-STALE-CONFIG-KEY" },
+    } } }));
+    fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({
+      providerFamilyDomain: "zai", modelProviderFamilyModes: { zai: "oauth" },
+    }));
+    fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+      "oauth:zai:access_token": "TEST-OAUTH",
+      [`account-provider:coding-plan:${providerId}:account:old:api-key`]: "TEST-LEGACY-ACCOUNT-KEY",
+    }));
+    const requests = mockPlanQuotaApi(t, () => ({ code: 200, data: {
+      enable: true, accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
+    } }));
+    const result = await resolveRuntime({ preferredProviderId: providerId, preferredModelId: "glm-test", appVersion: version });
+    assert.equal(result.ok, true);
+    const expected = version === "3.14.4" ? "TEST-LEGACY-ACCOUNT-KEY" : "TEST-PAT";
+    assert.equal(result.runtime?.apiKey, expected);
+    assert.equal((await resolveProviderRequestAuth(providerId, version))?.apiKey, expected);
+    const session = await resolveRuntimeForSession({ providerId, modelId: "glm-test" }, version);
+    assert.ok(session);
+    assert.equal(session.apiKey, expected);
+    assert.equal(result.runtime?.apiKeyId, version === "3.14.4" ? undefined : "TEST-PERSONAL-KEY-ID");
+    if (version === "3.14.4") assert.equal(requests.length, 0);
+  });
+}
+
+test("PAT refresh failures do not reuse the last token and can recover on the next request", async t => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
+  let fail = false;
+  mockPlanQuotaApi(t, () => fail ? { code: 403, data: {} } : { code: 0, data: {
+    accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
+  } });
+  assert.equal((await tryPlanOAuth("bigmodel", undefined, "3.16.2"))?.apiKey, "TEST-PAT");
+  const originalNow = Date.now;
+  Date.now = () => originalNow() + 700_000;
+  t.after(() => { Date.now = originalNow; });
+  fail = true;
+  assert.equal(await tryPlanOAuth("bigmodel", undefined, "3.16.2"), null);
+  fail = false;
+  assert.equal((await tryPlanOAuth("bigmodel", undefined, "3.16.2"))?.apiKey, "TEST-PAT");
+});
+
+test("PAT creation uses the dedicated Coding Plan key and usage scene", async t => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
+  const requests = mockPlanQuotaApi(t, () => ({ code: 200, data: {
+    accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
+  } }), []);
+  const result = await tryPlanOAuth("bigmodel", { organizationId: "org-current", projectId: "project-current" }, "3.16.2");
+  assert.equal(result?.apiKeyId, "TEST-CREATED-KEY-ID");
+  assert.deepEqual(JSON.parse(requests.find(r => r.method === "POST" && r.path.endsWith("/api_keys"))?.body ?? "null"), {
+    name: "zcode-team-api-key", keyType: 2, usageScene: 1,
+  });
+});
+
+test("a team outside customerInfo cannot obtain a project token", async t => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
+  const requests = mockPlanQuotaApi(t);
+  assert.equal(await tryPlanOAuth("bigmodel", { organizationId: "org-other", projectId: "project-other" }, "3.16.2"), null);
+  assert.equal(requests.length, 1);
+});
+
+
+for (const stale of [false, true]) {
+  for (const [type, kind] of [["openai-chat-completions", "openai-compatible"], ["anthropic-messages", "anthropic"], ["openai-responses", "openai"]]) {
+    test(`chat uses current ${type} credentials and endpoint with ${stale ? "stale" : "no"} legacy config`, async t => {
+      const dir = fixture(t);
+      const providerId = "new-provider";
+      const legacy: Record<string, V2Provider> = stale ? { [providerId]: {
+        kind: "openai-compatible", options: { apiKey: "TEST-OLD-KEY", baseURL: "https://old.example.test/v1" },
+        models: { "old-model": {} },
+      } } : {};
+      fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: legacy }));
+      fs.writeFileSync(path.join(dir, "setting.json"), "{}");
+      fs.writeFileSync(path.join(dir, "provider_config.json"), JSON.stringify({ config: { providerConfigRules: { providerRules: [{
+        providerId, providerName: "Current provider", config: {
+          access: { type: "api-key", apiKey: "TEST-NEW-KEY" },
+          api: { type, baseUrl: "https://new.example.test/v1" }, modelOrder: ["current-model"],
+        },
+      }] } } }));
+      const result = await resolveRuntime({ preferredProviderId: providerId, preferredModelId: "current-model" });
+      assert.equal(result.ok, true);
+      assert.equal(result.runtime?.apiKey, "TEST-NEW-KEY");
+      assert.equal(result.runtime?.baseURL, "https://new.example.test/v1");
+      assert.equal(result.runtime?.kind, kind);
+      assert.equal(JSON.stringify(result.picker).includes("TEST-NEW-KEY"), false);
+      const session = await resolveRuntimeForSession({ providerId, modelId: "current-model" });
+      assert.ok(session);
+      assert.equal(session.apiKey, "TEST-NEW-KEY");
+      const automatic = await resolveRuntime();
+      assert.equal(automatic.runtime?.apiKey, "TEST-NEW-KEY");
+      const file = syncCliConfig(result.runtime!, { provider: legacy });
+      const synced = JSON.parse(fs.readFileSync(file, "utf8")).provider[providerId];
+      assert.deepEqual([synced.options.apiKey, synced.options.baseURL, synced.kind],
+        ["TEST-NEW-KEY", "https://new.example.test/v1", kind]);
+      if (stale) assert.equal(await resolveRuntimeForSession({ providerId, modelId: "old-model" }), false);
+    });
+  }
+}
+
+test("desktop API templates supply protocol and endpoint without mixing stale settings", () => {
+  const personal = { config: { providerConfigRules: { providerRules: [{
+    providerId: "shortcut", templateId: "example", config: {
+      access: { apiKey: "TEST-CURRENT-KEY" }, personalModelIds: ["custom-model"],
+    },
+  }] } } };
+  const builtin = { config: { providerConfigRules: { templateRules: [{
+    templateId: "example", config: {
+      access: { type: "api-key" }, api: { type: "anthropic-messages", baseUrl: "https://template.example.test" },
+      builtinModelIds: ["template-model"],
+    },
+  }] } } };
+  const providers = mergeDesktopApiProviders({ shortcut: {
+    kind: "openai-compatible", options: { apiKey: "TEST-OLD-KEY", baseURL: "https://old.example.test" },
+  } }, personal, builtin);
+  assert.equal(providers.shortcut.kind, "anthropic");
+  assert.equal(providers.shortcut.options?.apiKey, "TEST-CURRENT-KEY");
+  assert.equal(providers.shortcut.options?.baseURL, "https://template.example.test");
+  assert.deepEqual(Object.keys(providers.shortcut.models ?? {}), ["custom-model", "template-model"]);
+});
+
+test("clearing a current desktop key cannot resurrect the legacy key", async t => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: { sample: {
+    options: { apiKey: "TEST-OLD-KEY", baseURL: "https://old.example.test" }, models: { model: {} },
+  } } }));
+  fs.writeFileSync(path.join(dir, "setting.json"), "{}");
+  fs.writeFileSync(path.join(dir, "provider_config.json"), JSON.stringify({ config: { providerConfigRules: { providerRules: [{
+    providerId: "sample", config: { access: { type: "api-key", apiKey: "" }, modelOrder: ["model"] },
+  }] } } }));
+  assert.equal((await resolveRuntime({ preferredProviderId: "sample", preferredModelId: "model", strictPreferredProvider: true })).ok, false);
+  assert.equal(await resolveRuntimeForSession({ providerId: "sample", modelId: "model" }), false);
+});
+
+
+test("CLI synchronization updates or removes credentials for providers other than the selected one", t => {
+  const dir = fixture(t);
+  const legacy = { sample: { options: { apiKey: "TEST-OLD-KEY", baseURL: "https://old.example.test" }, models: { model: {} } } };
+  const runtime = {
+    providerId: "active", providerName: "Active", modelId: "model", models: { model: {} },
+    kind: "openai-compatible", baseURL: "https://active.example.test", apiKey: "TEST-ACTIVE-KEY", source: "custom-provider" as const,
+  };
+  for (const key of ["TEST-NEW-KEY", ""]) {
+    fs.writeFileSync(path.join(dir, "provider_config.json"), JSON.stringify({ config: { providerConfigRules: { providerRules: [
+      { providerId: "sample", config: {
+        access: { type: "api-key", apiKey: key }, api: { type: "anthropic-messages", baseUrl: "https://new.example.test" }, modelOrder: ["model"],
+      } },
+      { providerId: "active", config: { access: { type: "api-key", apiKey: "TEST-ACTIVE-KEY" }, modelOrder: ["model"] } },
+    ] } } }));
+    const file = syncCliConfig(runtime, { provider: legacy });
+    const provider = JSON.parse(fs.readFileSync(file, "utf8")).provider.sample;
+    if (key) assert.deepEqual([provider.options.apiKey, provider.options.baseURL, provider.kind],
+      ["TEST-NEW-KEY", "https://new.example.test", "anthropic"]);
+    else assert.equal(provider, undefined);
+  }
+});

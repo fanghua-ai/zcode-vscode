@@ -5,6 +5,8 @@ import * as os from "os";
 import * as path from "path";
 import {
   OrgProject,
+  PlanAuth,
+  usesProjectTokens,
   PlanFamily,
   V2Config,
   V2Provider,
@@ -30,6 +32,8 @@ export interface ResolvedRuntime {
   kind: string;
   baseURL: string;
   apiKey: string;
+  /** Non-secret key ID marks a memory-only project access token. */
+  apiKeyId?: string;
   modelId: string;
   models: Record<string, unknown>;
   source:
@@ -562,27 +566,23 @@ export function parseTeamPlanKey(key: string): TeamPlanRef | null {
   return { providerId, organizationId, projectId, product };
 }
 
-export async function resolveProviderRequestAuth(providerId: string): Promise<{
-  apiKey: string;
-} | null> {
+export async function resolveProviderRequestAuth(
+  providerId: string, appVersion?: string | null, rejectedFingerprint?: string
+): Promise<PlanAuth | null> {
   const plan = readPlanSelection();
   const family = familyOfProvider(providerId, plan?.family);
   if (!family) return null;
   const kind = kindOfProvider(providerId, plan?.kind ?? "individual-coding-plan");
   if (kind === "team-coding-plan") {
     if (!plan?.team || plan.family !== family) return null;
-    const oauth = await tryPlanOAuth(family, plan.team);
-    return oauth?.apiKey ? { apiKey: oauth.apiKey } : null;
+    return tryPlanOAuth(family, plan.team, appVersion, rejectedFingerprint);
   }
-  if (providerId.startsWith("account:")) {
-    const stored = readStoredPlanApiKey(providerId);
-    if (stored) return { apiKey: stored };
-  } else {
-    const stored = readStoredPlanApiKey(`account:${family}-${kind}`);
+  if (!(kind !== "start-plan" && usesProjectTokens(appVersion))) {
+    const stored = readStoredPlanApiKey(providerId.startsWith("account:")
+      ? providerId : `account:${family}-${kind}`);
     if (stored) return { apiKey: stored };
   }
-  const oauth = await tryPlanOAuth(family);
-  return oauth?.apiKey ? { apiKey: oauth.apiKey } : null;
+  return tryPlanOAuth(family, undefined, kind === "start-plan" ? undefined : appVersion, rejectedFingerprint);
 }
 
 function productPlanBaseUrl(family: PlanFamily, kind: PlanKind): string {
@@ -737,6 +737,84 @@ export function buildPicker(config: V2Config | null): PickerModel[] {
   return out;
 }
 
+interface DesktopProviderRule {
+  providerId?: string;
+  providerName?: string;
+  templateId?: string;
+  enabled?: boolean;
+  config?: {
+    access?: { type?: string; apiKey?: string };
+    api?: { type?: string; baseUrl?: string };
+    modelOrder?: string[];
+    personalModelIds?: string[];
+    builtinModelIds?: string[];
+    visibility?: string;
+  };
+}
+
+/** Host-only credentials. Never attach these providers to picker/webview data. */
+export function mergeDesktopApiProviders(
+  legacy: Record<string, V2Provider>, personal: unknown, builtin: unknown
+): Record<string, V2Provider> {
+  type Registry = { config?: { providerConfigRules?: { providerRules?: DesktopProviderRule[]; templateRules?: Array<DesktopProviderRule & { templateId: string }> } } };
+  const rules = (personal as Registry | null)?.config?.providerConfigRules?.providerRules;
+  if (!Array.isArray(rules)) return legacy;
+  const templates = (builtin as Registry | null)?.config?.providerConfigRules?.templateRules ?? [];
+  const providers = { ...legacy };
+  const counts = new Map<string, number>();
+  for (const rule of rules) {
+    if (rule?.providerId) counts.set(rule.providerId, (counts.get(rule.providerId) ?? 0) + 1);
+  }
+  for (const rule of rules) {
+    const id = rule?.providerId;
+    if (!id) continue;
+    if (counts.get(id) !== 1) { delete providers[id]; continue; }
+    const template = templates.find(item => item.templateId === rule.templateId)?.config;
+    const access = { ...template?.access, ...rule.config?.access };
+    // Account/OAuth providers keep their separate request-time authentication.
+    if (access.type !== "api-key" && access.type !== "zhipu-coding-plan-api-key") continue;
+    const previous = legacy[id];
+    const api = { ...template?.api, ...rule.config?.api };
+    const kinds: Record<string, string> = {
+      "anthropic-messages": "anthropic", "openai-chat-completions": "openai-compatible", "openai-responses": "openai",
+    };
+    if (api.type && !kinds[api.type]) { delete providers[id]; continue; }
+    const ids = [...(rule.config?.modelOrder ?? []), ...(rule.config?.personalModelIds ?? []), ...(template?.builtinModelIds ?? [])];
+    providers[id] = {
+      ...previous,
+      name: rule.providerName ?? previous?.name ?? id,
+      enabled: rule.enabled !== false && rule.config?.visibility !== "hidden",
+      kind: api.type ? kinds[api.type] : previous?.kind,
+      options: {
+        ...previous?.options,
+        // A current empty key is a cleared credential, never an old-key fallback.
+        apiKey: typeof access.apiKey === "string" ? access.apiKey : "",
+        baseURL: api.baseUrl ?? previous?.options?.baseURL,
+      },
+      models: { ...previous?.models, ...Object.fromEntries([...new Set(ids)].filter(id => typeof id === "string" && id.trim())
+        .map(id => [id, previous?.models?.[id] ?? {}])) },
+    };
+  }
+  return providers;
+}
+
+async function readRuntimeConfig(): Promise<V2Config | null> {
+  const legacy = await readV2ConfigWithRetry();
+  const file = path.join(zcodeDir(), "v2", "provider_config.json");
+  if (!fs.existsSync(file)) return legacy;
+  try {
+    const builtinFile = appServerEnv(resolveBinaryPath()).ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+    const [personal, builtin] = await Promise.all([
+      readDesktopJsonWithRetry<unknown>(file),
+      builtinFile ? readDesktopJsonWithRetry<unknown>(builtinFile).catch(() => null) : Promise.resolve(null),
+    ]);
+    return { ...legacy, provider: mergeDesktopApiProviders(legacy?.provider ?? {}, personal, builtin) };
+  } catch {
+    // A present but unreadable current registry must not revive stale keys.
+    return { ...legacy, provider: {} };
+  }
+}
+
 /**
  * ZCode desktop shortcuts are stored in provider_config.json, outside the CLI
  * config consumed by buildPicker. Read only model metadata and whether a key is
@@ -782,6 +860,7 @@ export function buildPersonalShortcutPickerState(providerConfig: unknown, builti
     providerModelEnabled.set(`${modelRule.providerId}\0${modelRule.modelId}`, modelRule.config.enabled);
   }
 
+  const apiProviders = mergeDesktopApiProviders({}, providerConfig, builtinProviderConfig);
   const models: PickerModel[] = [];
   const disabledModelKeys = new Set<string>();
   const managedProviderIds = new Set<string>();
@@ -801,7 +880,6 @@ export function buildPersonalShortcutPickerState(providerConfig: unknown, builti
       };
     };
     const providerId = typeof rule.providerId === "string" ? rule.providerId.trim() : "";
-    const access = rule.config?.access;
     if (!providerId) continue;
     // This set also prevents stale backend catalog rows from reappearing for
     // account providers. Do not use it to prune configured account models below:
@@ -821,7 +899,7 @@ export function buildPersonalShortcutPickerState(providerConfig: unknown, builti
       }
       continue;
     }
-    const hasKey = access?.type === "api-key" && typeof access.apiKey === "string" && !!access.apiKey.trim();
+    const hasKey = !!providerApiKey(apiProviders[providerId]);
 
     for (const rawModelId of ids) {
       if (typeof rawModelId !== "string" || !rawModelId.trim()) continue;
@@ -966,7 +1044,7 @@ function resolvePicker(config: V2Config | null, shortcutState: PersonalShortcutP
 /** Re-read desktop and CLI model metadata without resolving login or restarting the app-server. */
 export async function readPickerResolution(): Promise<PickerResolution> {
   const [config, shortcutState] = await Promise.all([
-    readV2ConfigWithRetry(),
+    readRuntimeConfig(),
     readPersonalShortcutPicker(),
   ]);
   return resolvePicker(config, shortcutState);
@@ -985,6 +1063,7 @@ export async function isSessionModelAvailable(model: { providerId: string; model
 }
 
 export async function resolveRuntime(opts?: {
+  appVersion?: string | null;
   modelOverride?: string;
   preferredProviderId?: string;
   preferredModelId?: string;
@@ -992,7 +1071,7 @@ export async function resolveRuntime(opts?: {
   strictPreferredProvider?: boolean;
 }): Promise<ResolveResult> {
   const [config, settings, shortcutState] = await Promise.all([
-    readV2ConfigWithRetry(),
+    readRuntimeConfig(),
     readV2SettingsWithRetry(),
     readPersonalShortcutPicker(),
   ]);
@@ -1081,6 +1160,8 @@ export async function resolveRuntime(opts?: {
     preferredModel?: string
   ): ResolvedRuntime | null => {
     if (!providerId) return null;
+    if (usesProjectTokens(opts?.appVersion) && /^(?:account|builtin):/.test(providerId) && isDesktopOauthProvider(providerId) &&
+        !providerId.includes("start-plan")) return null;
     if (!isProviderInDesktopInventory(providerId)) return null;
     if (!isProviderRuntimeSelectable(providerId)) return null;
     const provider = providers[providerId];
@@ -1108,7 +1189,7 @@ export async function resolveRuntime(opts?: {
     const provider = providers[providerId] ?? fallbackPlanProvider(family, kind);
     const modelId = pickSelectableModelId(providerId, provider, preferredModel);
     if (modelId === null) return null;
-    if (!prefer) {
+    if (!prefer && !(kind !== "start-plan" && usesProjectTokens(opts?.appVersion))) {
       const stored = await readStoredPlanApiKeyWithRetry(`account:${family}-${kind}`);
       if (stored) {
         return toRuntime(
@@ -1121,15 +1202,13 @@ export async function resolveRuntime(opts?: {
       }
     }
     exchangedLogin = true;
-    const oauth = await tryPlanOAuth(family, prefer);
+    const oauth = await tryPlanOAuth(family, prefer, kind === "start-plan" ? undefined : opts?.appVersion);
     if (!oauth?.apiKey) return null;
-    return toRuntime(
-      providerId,
-      provider,
-      modelId,
-      oauth.apiKey,
-      prefer ? "desktop-team-oauth" : "desktop-personal-oauth"
-    );
+    return {
+      ...toRuntime(providerId, provider, modelId, oauth.apiKey,
+        prefer ? "desktop-team-oauth" : "desktop-personal-oauth"),
+      ...(oauth.apiKeyId ? { apiKeyId: oauth.apiKeyId } : {}),
+    };
   };
 
   const domain = settings?.providerFamilyDomain || "";
@@ -1294,11 +1373,12 @@ export async function resolveRuntime(opts?: {
 export async function resolveRuntimeForSession(model: {
   providerId: string;
   modelId: string;
-}): Promise<ResolvedRuntime | null | false> {
+}, appVersion?: string | null): Promise<ResolvedRuntime | null | false> {
   const resolved = await resolveRuntime({
     preferredProviderId: model.providerId,
     preferredModelId: model.modelId,
     strictPreferredProvider: true,
+    appVersion,
   });
   const isAccountOrBuiltin = model.providerId.startsWith("account:") || model.providerId.startsWith("builtin:");
   const configuredProvider = readV2Config()?.provider?.[model.providerId];
@@ -1322,6 +1402,7 @@ export async function resolveRuntimeForSession(model: {
     !model.providerId.startsWith("builtin:") &&
     !resolved.managedProviderIds?.includes(model.providerId)
   ) return null;
+  if (resolved.providerInventoryAuthoritative && resolved.managedProviderIds?.includes(model.providerId)) return null;
   if (isDesktopOauthProvider(model.providerId)) return null;
   return runtimeFromStoredProvider(model.providerId, model.modelId);
 }
@@ -1356,12 +1437,14 @@ export function syncCliConfig(
   // third-party providers. Do not copy deleted providers back from stale CLI
   // or desktop config into the app-server's next session defaults.
   let shortcutInventory: PersonalShortcutPickerState | null = null;
+  let shortcutConfig: unknown;
+  let builtinConfig: unknown;
   const shortcutFile = path.join(zcodeDir(), "v2", "provider_config.json");
   if (fs.existsSync(shortcutFile)) {
     try {
-      const shortcutConfig = readDesktopJson<unknown>(shortcutFile);
+      shortcutConfig = readDesktopJson<unknown>(shortcutFile);
       const builtinFile = appServerEnv(resolveBinaryPath()).ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
-      const builtinConfig = builtinFile && fs.existsSync(builtinFile)
+      builtinConfig = builtinFile && fs.existsSync(builtinFile)
         ? readDesktopJson<unknown>(builtinFile)
         : undefined;
       shortcutInventory = buildPersonalShortcutPickerState(shortcutConfig, builtinConfig);
@@ -1386,11 +1469,16 @@ export function syncCliConfig(
     if (defaultProviderId && (!providerIsCurrent(defaultProviderId) || !defaultModelAvailable)) delete existing.model;
   }
 
-  const v2Providers = all?.provider ?? readV2Config()?.provider ?? {};
+  // Project tokens belong to the request-time auth channel, never CLI config.
+  if (runtime.apiKeyId) delete providerMap[runtime.providerId];
+  const v2Providers = mergeDesktopApiProviders(all?.provider ?? readV2Config()?.provider ?? {}, shortcutConfig, builtinConfig);
   for (const [pid, p] of Object.entries(v2Providers)) {
     if (!providerIsCurrent(pid)) continue;
-    const key = pid === runtime.providerId ? runtime.apiKey : providerApiKey(p);
-    if (!key) continue;
+    const key = pid === runtime.providerId ? (runtime.apiKeyId ? "" : runtime.apiKey) : providerApiKey(p);
+    if (!key) {
+      if (managedProviderIds.has(pid)) delete providerMap[pid];
+      continue;
+    }
     providerMap[pid] = {
       name: p.name ?? pid,
       kind: p.kind ?? "openai-compatible",
@@ -1407,7 +1495,7 @@ export function syncCliConfig(
       name: runtime.providerName,
       kind: runtime.kind,
       options: {
-        apiKey: runtime.apiKey,
+        ...(runtime.apiKeyId ? {} : { apiKey: runtime.apiKey }),
         baseURL: runtime.baseURL,
       },
       models: runtime.models,
@@ -1441,7 +1529,7 @@ export function syncCliConfig(
 
 export function runtimeEnv(runtime: ResolvedRuntime): Record<string, string> {
   const env: Record<string, string> = {};
-  if (runtime.kind === "anthropic" && runtime.apiKey) {
+  if (runtime.kind === "anthropic" && runtime.apiKey && !runtime.apiKeyId) {
     env.ANTHROPIC_API_KEY = runtime.apiKey;
   }
   return env;

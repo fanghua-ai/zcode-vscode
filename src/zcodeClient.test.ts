@@ -2393,3 +2393,29 @@ test("confirmed controls preserve the base permission and return independent rea
   assert.equal(state.lastControls.thoughtLevels[0].label,"Low");
   client.dispose();
 });
+
+
+test("PAT-backed runtime always resolves request auth instead of freezing its startup token", async () => {
+  const runtime: ResolvedRuntime = {
+    providerId: "account:zai-individual-coding-plan", providerName: "Test", modelId: "m", models: {},
+    kind: "anthropic", baseURL: "https://example.invalid", apiKey: "TEST-STARTUP-TOKEN", apiKeyId: "TEST-KEY-ID",
+    source: "desktop-personal-oauth",
+  };
+  let reads = 0;
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", runtime, onEvent: () => {},
+    resolveProviderAuth: async () => ({ apiKey: `TEST-REQUEST-TOKEN-${++reads}`, apiKeyId: "TEST-KEY-ID", accountScope: "TEST-ACCOUNT-SCOPE" }),
+  });
+  const replies: Array<{ result: { requestAuth?: { apiKey: string; apiKeyId?: string } } }> = [];
+  const state = client as unknown as { write: (reply: unknown) => void; handleProviderRuntimeHeaders: (id: number, params: unknown) => Promise<void> };
+  state.write = reply => replies.push(reply as typeof replies[number]);
+  try {
+    await state.handleProviderRuntimeHeaders(1, { providerId: runtime.providerId });
+    await state.handleProviderRuntimeHeaders(2, { providerId: runtime.providerId });
+    assert.deepEqual(replies.map(reply => reply.result.requestAuth), [
+      { apiKey: "TEST-REQUEST-TOKEN-1", apiKeyId: "TEST-KEY-ID", accountScope: "TEST-ACCOUNT-SCOPE" },
+      { apiKey: "TEST-REQUEST-TOKEN-2", apiKeyId: "TEST-KEY-ID", accountScope: "TEST-ACCOUNT-SCOPE" },
+    ]);
+    await state.handleProviderRuntimeHeaders(3, { providerId: runtime.providerId, expectedAccountScope: "OTHER-ACCOUNT" });
+    assert.equal(replies[2].result.requestAuth, undefined);
+  } finally { client.dispose(); }
+});

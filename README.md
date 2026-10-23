@@ -29,7 +29,7 @@
 | 右下角 | 双环显示上下文和额度概况；发送、立即插入与停止按钮随运行状态切换。 |
 | 下方额度栏 | 展开后查看上下文、5 小时与每周额度的比例和详情；第三方 API 可通过 `zcode.quotaAdapters` 映射显示。 |
 
-为兼容桌面 CLI，扩展会把供应商 API Key 同步到 `~/.zcode/cli/config.json`。Linux/macOS 上该目录限制为 `0700`、文件为 `0600`；Windows 使用用户目录的访问控制。不要分享此配置文件。
+新版 Coding Plan 使用的短期项目 Token 只保留在内存中，并在请求时检查刷新。为兼容桌面 CLI，扩展会把手动配置或旧版套餐的供应商 API Key 同步到 `~/.zcode/cli/config.json`。Linux/macOS 上该目录限制为 `0700`、文件为 `0600`；Windows 使用用户目录的访问控制。不要分享此配置文件。
 
 对话时不必开着桌面窗口。切换项目、重新登录或登录状态过期后，请先在桌面端完成相应操作，再在扩展里选择「重新读取登录」。
 
@@ -43,7 +43,7 @@
 
 本版本已在 **ZCode 桌面端 3.12.3 和 3.14.4** 上验证；3.14.4 已完成真实会话切换与停止回归。更早的桌面版本不支持，未列出的版本仍需验证兼容性。
 
-2.0.1 修复了桌面端 **3.16.2** 的会话列表兼容问题；该版本的套餐登录、自定义供应商等其他功能仍需进一步验证。
+2.0.2 进一步适配桌面端 **3.16.2** 的 Coding Plan 鉴权和自定义 API 配置。3.16.2 已通过隔离配置下的真实运行时会话切换、停止和附件回归；Z.AI 个人套餐仍需真实账号验证，macOS 仍未实测。
 
 桌面端更新后协议可能变化，建议确认扩展兼容性后再更新。
 
@@ -284,7 +284,7 @@ Chat with the ZCode agent from the VS Code secondary side bar (the right-hand ch
 | Bottom right | Two rings summarize context and quota; send, insert-now, and stop controls vary with the running state. |
 | Quota strip | Expand for context, five-hour, and weekly quota details; map third-party API readings with `zcode.quotaAdapters`. |
 
-For desktop CLI compatibility, provider API keys are synchronized to `~/.zcode/cli/config.json`. On Linux and macOS, the directory is restricted to `0700` and the file to `0600`; Windows uses the user directory’s access controls. Do not share this configuration file.
+Short-lived project tokens used by newer Coding Plans stay in memory and are checked for refresh at request time. For desktop CLI compatibility, manually configured or legacy plan API keys are synchronized to `~/.zcode/cli/config.json`. On Linux and macOS, the directory is restricted to `0700` and the file to `0600`; Windows uses the user directory’s access controls. Do not share this configuration file.
 
 You can keep the desktop window closed while chatting. If you switch projects, sign in again, or your sign-in expires, complete the required action in the desktop app, then choose “重新读取登录” (Reload sign-in) in the extension.
 
@@ -298,7 +298,7 @@ For development and contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). This 
 
 This version has been verified with **ZCode desktop 3.12.3 and 3.14.4**, including real session-switching and stop-behavior regression checks on 3.14.4. Earlier desktop versions are unsupported; unlisted versions still require compatibility testing.
 
-Version 2.0.1 fixes session listing with desktop **3.16.2**. Coding-plan sign-in, custom providers, and other features on that desktop version still require further verification.
+Version 2.0.2 also adapts Coding Plan authentication and custom API configuration for desktop **3.16.2**. Its actual runtime has passed session-switching, stop, and attachment regressions with isolated fixtures. Z.AI personal plans still need real-account validation; macOS remains untested.
 
 Desktop updates may change the protocol. Check extension compatibility before updating.
 

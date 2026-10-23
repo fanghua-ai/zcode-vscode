@@ -282,7 +282,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private disabledModelKeys = new Set<string>();
   private managedProviderIds = new Set<string>();
   private providerInventoryAuthoritative = false;
-  private resolveSessionModelRuntime = resolveRuntimeForSession;
+  private desktopAppVersion: string | null = null;
+  private resolveSessionModelRuntime = (model: Parameters<typeof resolveRuntimeForSession>[0]) =>
+    resolveRuntimeForSession(model, this.desktopAppVersion);
   private pickerRefreshRevision = 0;
   private livePicker: { client: ZCodeClient; sessionId: string; models: AvailableModel[] } | null = null;
   private currentModel?: { providerId: string; modelId: string };
@@ -1150,6 +1152,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         ? ""
         : vscode.workspace.getConfiguration("zcode").get<string>("model") || "";
       const resolved = await resolveRuntime({
+        appVersion: this.desktopAppVersion,
         modelOverride,
         preferredProviderId: defaults.model?.providerId,
         preferredModelId: defaults.model?.modelId,
@@ -1749,7 +1752,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "status", status: "resolving_credentials" });
 
     const loginStarted = Date.now();
+    this.desktopAppVersion = desktopVersion(binaryPath);
     const loginRequest = {
+      appVersion: this.desktopAppVersion,
       modelOverride,
       preferredProviderId: opts?.preferredProviderId ?? (opts?.createNew ? defaults.model?.providerId : undefined),
       preferredModelId: opts?.preferredModelId ?? (opts?.createNew ? defaults.model?.modelId : undefined),
@@ -1853,6 +1858,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async settleStartupLogin(request: {
+    appVersion?: string | null;
     modelOverride?: string;
     preferredProviderId?: string;
     preferredModelId?: string;
@@ -1868,6 +1874,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     );
     if (!fallbackPick) return resolved;
     const fallback = await resolveRuntime({
+      appVersion: request.appVersion,
       preferredProviderId: fallbackPick.providerId,
       preferredModelId: fallbackPick.modelId,
     });

@@ -49,6 +49,13 @@ for(const configFile of [path.join(root,'.zcode','cli','config.json'),path.join(
  await writeFile(configFile,JSON.stringify(config));
 }
 
+// Exercise desktops that no longer mirror providers into legacy config.json.
+if(process.env.ZCODE_TEST_PROVIDER_CONFIG_ONLY==='1'){
+ for(const configFile of [path.join(root,'.zcode','cli','config.json'),path.join(root,'.zcode','v2','config.json')]){
+  await writeFile(configFile,JSON.stringify({model:'fake/test',provider:{}}));
+ }
+}
+
 const harness=path.join(root,'session-client.cjs');
 await build({stdin:{contents:`
 import {ZCodeClient} from ${JSON.stringify(path.resolve(process.env.ZCODE_REVIEW_SOURCE || 'src/zcodeClient.ts'))};
