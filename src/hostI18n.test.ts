@@ -27,9 +27,9 @@ test("host notices read the preference on every call, independently of webview s
 test("owned database errors translate while external diagnostics and interpolated data stay intact", () => {
   try {
     const cause = new Error("native failure: 文件.db");
-    const error = new LocalizedError("无法安全写入 WAL 数据库：当前运行时不支持原生 SQLite。请升级 VS Code 后重试。", {}, { cause });
+    const error = new LocalizedError("当前 VS Code 运行环境不支持原生 SQLite，请更新 VS Code 后重试。", {}, { cause });
     setTestLanguage("en");
-    assert.match(userFacingError(error), /^Cannot safely write to the WAL database:/);
+    assert.match(userFacingError(error), /^This VS Code runtime does not support native SQLite\./);
     assert.equal(error.cause, cause);
     assert.equal(userFacingError(new LocalizedError("已设置的 zcode.binaryPath 不存在：{0}", { 0: "/路径/文件 $&" })),
       "The configured zcode.binaryPath does not exist: /路径/文件 $&");
@@ -47,7 +47,7 @@ test("owned database errors translate while external diagnostics and interpolate
       "计划模式和目标不能同时使用。先退出其中一个再继续。"
     );
     setTestLanguage("zh-TW");
-    assert.match(userFacingError(error), /請升級 VS Code 後重試/);
+    assert.match(userFacingError(error), /請更新 VS Code 後重試/);
   } finally { setTestLanguage("auto"); }
 });
 

@@ -64,32 +64,42 @@ marked.use({
   },
 });
 
-const renderer = new marked.Renderer();
-
-renderer.code = ({ text, lang }: { text: string; lang?: string }) => {
+function renderCode({ text, lang }: { text: string; lang?: string }, streaming: boolean): string {
   const language = (lang || "").trim();
   let highlighted: string;
-  try {
-    if (language && hljs.getLanguage(language)) {
-      highlighted = hljs.highlight(text, { language }).value;
-    } else {
-      highlighted = hljs.highlightAuto(text).value;
-    }
-  } catch {
+  // Re-running a highlighter over a growing code block dominates long replies.
+  // Keep streamed code readable and escaped; highlight once the part settles.
+  if (streaming) {
     highlighted = escapeHtml(text);
+  } else {
+    try {
+      if (language && hljs.getLanguage(language)) {
+        highlighted = hljs.highlight(text, { language }).value;
+      } else {
+        highlighted = hljs.highlightAuto(text).value;
+      }
+    } catch {
+      highlighted = escapeHtml(text);
+    }
   }
   const langClass = language ? ` language-${escapeHtml(language)}` : "";
   const label = language || "code";
   return `<div class="code-block"><div class="code-toolbar"><span class="code-lang">${escapeHtml(
     label
   )}</span><button class="copy-btn" type="button" data-copy="1">Copy</button></div><pre><code class="hljs${langClass}">${highlighted}</code></pre></div>`;
-};
+}
 
-marked.use({ renderer });
+const renderer = new marked.Renderer();
+renderer.code = (code) => renderCode(code, false);
+const streamingRenderer = new marked.Renderer();
+streamingRenderer.code = (code) => renderCode(code, true);
 
-export function renderMarkdown(text: string): string {
+export function renderMarkdown(text: string, streaming = false): string {
   const closed = closeOpenFences(text);
-  const html = marked.parse(closed, { async: false }) as string;
+  const html = marked.parse(closed, {
+    async: false,
+    renderer: streaming ? streamingRenderer : renderer,
+  }) as string;
   return DOMPurify.sanitize(html, {
     ADD_ATTR: ["target", "rel", "data-copy", "class"],
     ADD_TAGS: ["button"],

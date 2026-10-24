@@ -64,12 +64,17 @@
 
 在 VS Code 扩展市场搜索 **ZCode Chat**（发布者 **fanghua**）并安装，再执行 **Developer: Reload Window**。
 
-也可以使用 VSIX 安装：
+市场有两条更新通道：
 
-命令面板：**Extensions: Install from VSIX…** → 选择下载的 `zcode-desktop-chat-2.0.1.vsix` → **Developer: Reload Window**。
+- **稳定版**使用偶数次版本号，当前是 **2.0.2**。直接安装会留在稳定版，不会自动升到预览版。
+- **预览版**使用奇数次版本号。只有在扩展页面选择 **Install Pre-Release Version**，或执行 `code --install-extension fanghua.zcode-desktop-chat --pre-release` 的用户才会安装预览版，并继续接收更高的预览版。之后若发布更高版本号的稳定版，预览版会被该稳定版替换。
+
+也可以手动安装 VSIX。文件名是 `zcode-desktop-chat-<版本>.vsix`，请选择与要安装的稳定版或预览版一致的文件：
+
+命令面板：**Extensions: Install from VSIX…** → 选择下载的 VSIX → **Developer: Reload Window**。
 
 ```bash
-code --install-extension zcode-desktop-chat-2.0.1.vsix --force
+code --install-extension zcode-desktop-chat-<版本>.vsix --force
 ```
 
 ### 使用
@@ -109,7 +114,7 @@ code --install-extension zcode-desktop-chat-2.0.1.vsix --force
 
 智能体修改文件后，可在对应工具卡片中打开文件或查看 diff。
 
-回复支持行内公式 `$…$`、`\(...\)` 和独立公式 `$$…$$`、`\[...\]`，公式字体随扩展离线提供。宽公式可横向滚动；不支持的语法保留原文，代码块不做公式转换。
+回复支持行内公式 `$…$`、`\(...\)` 和独立公式 `$$…$$`、`\[...\]`。公式离线显示；回复旁的「美化公式」会下载约 260 KB 字体，之后可离线使用。宽公式可横向滚动；不支持的语法保留原文，代码块不做公式转换。
 
 ### 登录与模型
 
@@ -223,7 +228,7 @@ macOS 可再查 `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`。Win
 | `无法定位 CLI ZCode Built-in Provider Config` | 桌面更新后 app-server 找不到内置模型配置 | 确认桌面已打开过一次；扩展会带上 `ZCODE_BUILTIN_PROVIDER_*` 环境变量。若仍失败，检查 `/opt/ZCode/resources/config/provider/zcode-builtin.json`（macOS 在 `ZCode.app/Contents/Resources/config/provider/`） |
 | `Unrecognized key` / `Method not found` / `not in the workspace model registry` | 桌面端版本和本扩展不匹配 | 把 ZCode 桌面升到当前最新，并安装对应的本扩展 vsix |
 | `余额不足` / 类似额度错误 | 当前桌面选择的套餐没额度 | 桌面端换有额度的项目，再「重新读取登录」 |
-| `无法安全写入 WAL 数据库` | 当前 VS Code 的 SQLite 写入能力不可用 | 升级 VS Code 后重试；扩展不会把临时快照写入误报为成功 |
+| `当前 VS Code 运行环境不支持原生 SQLite` | 扩展宿主缺少所需的 `node:sqlite` 模块 | 更新 VS Code 后重试；数据库读取和写入都需要原生 SQLite |
 | 历史里归档会话跑到「活动」 | 读不了桌面的 `tasks-index.sqlite`（少见） | 看日志里 sqlite / archive；VS Code 过旧时能力会降级，一般仍能聊 |
 | `会话同步失败` / `会话快照同步超时` | 对话快照同步失败或超时；扩展会逐步延长间隔自动重试 | 稍等后重新切换会话；仍未恢复可重新加载窗口，并提供日志中的 `conversation resync failed`。任务完成时的正常重同步不代表故障 |
 | 已连接但插件与桌面端互相看不到会话 | 工作区路径不同，或 Windows 上同一目录被记录成不同大小写（如 `e:\Projects\项目` 与 `E:\Projects\项目`） | 先确认两端打开同一文件夹，并检查 `zcode.workspacePath` 是否覆盖了路径；Windows 路径大小写兼容问题已在 1.3.5 修复，并由作者初步实测确认会话可对齐；安装 1.3.5 或更高版本后 Reload Window；看不到会话不一定表示数据丢失 |
@@ -319,12 +324,17 @@ Before starting a chat, check the following:
 
 Search for **ZCode Chat** by **fanghua** in the VS Code Extensions Marketplace, install it, then run **Developer: Reload Window**.
 
-Alternatively, install a VSIX:
+The Marketplace has two update channels:
 
-Command Palette: **Extensions: Install from VSIX…** → choose the downloaded `zcode-desktop-chat-2.0.1.vsix` → **Developer: Reload Window**.
+- **Stable** releases use an even minor version. The current stable release is **2.0.2**. A normal install stays on stable and is not upgraded to a preview.
+- **Preview** releases use an odd minor version. Only users who choose **Install Pre-Release Version** on the extension page, or run `code --install-extension fanghua.zcode-desktop-chat --pre-release`, receive a preview and later higher previews. A later stable release with a higher version replaces the preview.
+
+You can also install a VSIX manually. Its name is `zcode-desktop-chat-<version>.vsix`; choose the file for the stable or preview release you want:
+
+Command Palette: **Extensions: Install from VSIX…** → choose the downloaded VSIX → **Developer: Reload Window**.
 
 ```bash
-code --install-extension zcode-desktop-chat-2.0.1.vsix --force
+code --install-extension zcode-desktop-chat-<version>.vsix --force
 ```
 
 ### Usage
@@ -354,7 +364,7 @@ Files dragged from the VS Code file tree can also be referenced. Paths are relat
 
 After the agent changes a file, the tool card can open the file or show a diff.
 
-Replies support inline math with `$…$` or `\(...\)` and display math with `$$…$$` or `\[...\]`. Formula fonts are bundled for offline rendering. Wide formulas scroll horizontally; unsupported syntax remains readable, and code blocks are unchanged.
+Replies support inline math with `$…$` or `\(...\)` and display math with `$$…$$` or `\[...\]`. Formulas render offline with system fonts. Choose Improve formulas beside a reply to download the 260 KB font pack once; later formulas keep those fonts offline. Wide formulas scroll horizontally; unsupported syntax remains readable, and code blocks are unchanged.
 
 ### Sign-in and models
 
@@ -469,7 +479,7 @@ Error cards provide recovery steps and direct actions for models, connections an
 | `无法定位 CLI ZCode Built-in Provider Config` | After a desktop update, app-server cannot find the built-in model config | Open the desktop app once; the extension sets `ZCODE_BUILTIN_PROVIDER_*`. If it still fails, check `/opt/ZCode/resources/config/provider/zcode-builtin.json` (on macOS, `ZCode.app/Contents/Resources/config/provider/`) |
 | `Unrecognized key` / `Method not found` / `not in the workspace model registry` | The desktop version and this extension do not match | Update the ZCode desktop to the current latest, and install the matching extension vsix |
 | `余额不足` or a similar quota error | The plan selected in the desktop app has no quota | Switch to a project that has quota, then “重新读取登录” |
-| `无法安全写入 WAL 数据库` | This VS Code runtime cannot safely write the WAL database | Upgrade VS Code and retry; temporary snapshot writes are never reported as saved |
+| `当前 VS Code 运行环境不支持原生 SQLite` | This VS Code runtime does not support native SQLite | Update VS Code and retry |
 | An archived session shows under “活动” (Active) in history | The desktop `tasks-index.sqlite` could not be read (uncommon) | Check sqlite / archive in the log; a very old VS Code degrades this, and chat usually still works |
 | `Conversation synchronization failed` / `Conversation snapshot synchronization timed out` | Snapshot synchronization failed or timed out; the extension retries with increasing delays | Wait, then switch away and back. Reload the window if it does not recover, and include `conversation resync failed` logs. Normal resynchronization at turn completion is not a fault |
 | Connected, but sessions are not visible across the extension and desktop | Different workspace paths, or Windows spelling differences for the same directory, such as `e:\Projects\项目` and `E:\Projects\项目` | Confirm both apps use the same folder and check `zcode.workspacePath`. The Windows path spelling issue was fixed in 1.3.5, and the author confirmed in an initial test that sessions became visible. Install 1.3.5 or later, then reload the window. Missing list entries do not necessarily mean lost data |

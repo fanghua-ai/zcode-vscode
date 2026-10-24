@@ -6,24 +6,16 @@ import { writeThirdPartyNotices } from "./scripts/collect-third-party-notices.mj
 const production = process.argv.includes("--production");
 const watch = process.argv.includes("--watch");
 
-function copySqliteWasm() {
-  const srcDir = path.join("node_modules", "node-sqlite3-wasm", "dist");
-  for (const name of ["node-sqlite3-wasm.js", "node-sqlite3-wasm.wasm"]) {
-    fs.copyFileSync(path.join(srcDir, name), path.join("dist", name));
-  }
-}
-
-// VS Code's Chromium only needs WOFF2. Keep formula assets local and omit legacy fonts.
+// Ship KaTeX layout CSS only. WOFF2 faces download into global storage on request.
 function copyFormulaAssets() {
   const source = path.join("node_modules", "katex", "dist");
   const target = path.join("dist", "math");
-  fs.mkdirSync(path.join(target, "fonts"), { recursive: true });
+  fs.rmSync(path.join(target, "fonts"), { recursive: true, force: true });
+  fs.mkdirSync(target, { recursive: true });
   const css = fs.readFileSync(path.join(source, "katex.min.css"), "utf8")
-    .replace(/,url\([^)]*\.(?:woff|ttf)\) format\("[^" ]*"\)/g, "");
+    .replace(/@font-face\{[^}]*\}/g, "");
+  if (css.includes("url(")) throw new Error("Formula CSS still references a font file");
   fs.writeFileSync(path.join(target, "katex.min.css"), css);
-  for (const font of fs.readdirSync(path.join(source, "fonts"))) {
-    if (font.endsWith(".woff2")) fs.copyFileSync(path.join(source, "fonts", font), path.join(target, "fonts", font));
-  }
   fs.copyFileSync(path.join("node_modules", "katex", "LICENSE"), path.join(target, "LICENSE"));
 }
 
@@ -32,7 +24,7 @@ const extensionOptions = {
   entryPoints: ["src/extension.ts"],
   bundle: true,
   outfile: "dist/extension.js",
-  external: ["vscode", "node-sqlite3-wasm", "node:sqlite"],
+  external: ["vscode", "node:sqlite"],
   format: "cjs",
   platform: "node",
   target: "node18",
@@ -59,7 +51,6 @@ async function main() {
     const ext = await esbuild.context(extensionOptions);
     const web = await esbuild.context(webviewOptions);
     fs.mkdirSync("dist", { recursive: true });
-    copySqliteWasm();
     copyFormulaAssets();
     writeThirdPartyNotices();
     await Promise.all([ext.watch(), web.watch()]);
@@ -70,7 +61,6 @@ async function main() {
       esbuild.build(extensionOptions),
       esbuild.build(webviewOptions),
     ]);
-    copySqliteWasm();
     copyFormulaAssets();
     writeThirdPartyNotices();
     console.log("[esbuild] build complete");

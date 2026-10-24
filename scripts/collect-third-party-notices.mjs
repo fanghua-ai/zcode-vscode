@@ -68,19 +68,6 @@ function fontMetadata() {
   return { names: [...names].sort(), notices: [...notices].sort() };
 }
 
-function sqliteUpstreamNotes() {
-  const readme = readText(path.join("node_modules", "node-sqlite3-wasm", "README.md"));
-  const basedOn = readme.match(/_node-sqlite3-wasm_ is currently based on SQLite \d+\.\d+\.\d+\./)?.[0];
-  const licenseHeading = readme.indexOf("\n## License\n");
-  if (!basedOn || licenseHeading < 0) {
-    throw new Error("node-sqlite3-wasm README is missing the expected SQLite version or license section");
-  }
-  return {
-    basedOn,
-    licenseSection: readme.slice(licenseHeading).trim() + "\n",
-  };
-}
-
 function block(label, text) {
   const body = text.replace(/\s+$/, "") + "\n";
   return `----- BEGIN ${label} -----\n${body}----- END ${label} -----\n`;
@@ -92,33 +79,26 @@ export function thirdPartyNoticeFragments() {
     highlight: installedPackage("highlight.js"),
     marked: installedPackage("marked"),
     katex: installedPackage("katex"),
-    sqlite: installedPackage("node-sqlite3-wasm"),
   };
   const fonts = fontMetadata();
-  const sqlite = sqliteUpstreamNotes();
   const fragments = [
     readText("node_modules/dompurify/LICENSE"),
     readText("node_modules/dompurify/LICENSE-MPL"),
     readText("node_modules/highlight.js/LICENSE"),
     readText("node_modules/marked/LICENSE.md"),
     readText("node_modules/katex/LICENSE"),
-    readText("node_modules/node-sqlite3-wasm/LICENSE"),
     readText("scripts/third-party/OFL-1.1.txt"),
-    readText("scripts/third-party/sqlite-public-domain.txt"),
-    sqlite.licenseSection,
-    sqlite.basedOn,
     "MPL-2.0 OR Apache-2.0",
     "This project does not elect either DOMPurify license.",
-    "The installed package does not include a separate sql.js license file.",
   ];
   for (const item of Object.values(packages)) fragments.push(`${item.name} ${item.version}`);
   for (const name of fonts.names) fragments.push(`Reserved Font Name ${name}.`);
   for (const notice of fonts.notices) fragments.push(notice);
-  return { packages, fonts, sqlite, fragments };
+  return { packages, fonts, fragments };
 }
 
 export function renderThirdPartyNotices() {
-  const { packages, fonts, sqlite } = thirdPartyNoticeFragments();
+  const { packages, fonts } = thirdPartyNoticeFragments();
   const fontCopyright = fonts.notices.join("\n\n");
   const sections = [
     ["node_modules/dompurify/LICENSE", readText("node_modules/dompurify/LICENSE")],
@@ -126,10 +106,7 @@ export function renderThirdPartyNotices() {
     ["node_modules/highlight.js/LICENSE", readText("node_modules/highlight.js/LICENSE")],
     ["node_modules/marked/LICENSE.md", readText("node_modules/marked/LICENSE.md")],
     ["node_modules/katex/LICENSE", readText("node_modules/katex/LICENSE")],
-    ["node_modules/node-sqlite3-wasm/LICENSE", readText("node_modules/node-sqlite3-wasm/LICENSE")],
     ["scripts/third-party/OFL-1.1.txt", readText("scripts/third-party/OFL-1.1.txt")],
-    ["scripts/third-party/sqlite-public-domain.txt", readText("scripts/third-party/sqlite-public-domain.txt")],
-    ["node_modules/node-sqlite3-wasm/README.md license section", sqlite.licenseSection],
   ];
 
   return `第三方声明 / Third-party notices
@@ -162,12 +139,8 @@ ${Object.values(packages).map(item => `- ${item.name} ${item.version}`).join("\n
   Bundled into dist/webview.js for Markdown. The complete LICENSE.md is included below, including its Markdown notice, not only the main license name.
 
 - KaTeX ${packages.katex.version} (${packages.katex.homepage})
-  渲染器打包进 dist/webview.js。样式和 WOFF2 字体复制到 dist/math/。软件许可是 MIT，同一文本也保留为 dist/math/LICENSE。字体是 SIL Open Font License 1.1；发布包只带 WOFF2，许可仍适用于这些字体。Reserved Font Name 来自当前安装字体的元数据，不是另行推断。
-  The renderer is bundled into dist/webview.js. The stylesheet and WOFF2 fonts are copied to dist/math/. The software license is MIT, and the same text is also kept as dist/math/LICENSE. The fonts are under the SIL Open Font License 1.1; the package ships WOFF2 only, and that license still applies to those fonts. Reserved Font Names come from the installed font metadata, not from a separate guess.
-
-- node-sqlite3-wasm ${packages.sqlite.version} (${packages.sqlite.homepage})
-  dist/node-sqlite3-wasm.js 和 dist/node-sqlite3-wasm.wasm 是复制而非打包。包装层许可是 MIT，版权人为 Tobias Enderle。${sqlite.basedOn} 上游 README 写明部分代码来自 sql.js（同样是 MIT），SQLite 处于公有领域。当前安装的包没有单独附带 sql.js 许可文件，因此这里只保留上游说明，不另补一份无法对应版本的 sql.js 许可文本。
-  dist/node-sqlite3-wasm.js and dist/node-sqlite3-wasm.wasm are copied rather than bundled. The wrapper license is MIT, copyright Tobias Enderle. ${sqlite.basedOn} The upstream README says parts of the code come from sql.js, also under the MIT license, and that SQLite is in the public domain. The installed package does not include a separate sql.js license file. This notice keeps the upstream statement and does not add a sql.js license text whose version cannot be identified.
+  渲染器打包进 dist/webview.js，布局样式复制到 dist/math/katex.min.css。软件许可是 MIT，同一文本保留为 dist/math/LICENSE。WOFF2 字体不进入 VSIX，由用户按需下载。字体包包含这些 WOFF2、KaTeX 的 MIT LICENSE，以及 SIL Open Font License 1.1 全文（OFL.txt）。Reserved Font Name 来自当前安装字体的元数据，不是另行推断。
+  The renderer is bundled into dist/webview.js, and the layout stylesheet is copied to dist/math/katex.min.css. The software license is MIT, and the same text is kept as dist/math/LICENSE. WOFF2 fonts are not included in the VSIX; they are downloaded on request. The font pack contains those WOFF2 files, the KaTeX MIT LICENSE, and the full SIL Open Font License 1.1 text (OFL.txt). Reserved Font Names come from the installed font metadata, not from a separate guess.
 
 字体元数据原文 / Font metadata
 ------------------------------

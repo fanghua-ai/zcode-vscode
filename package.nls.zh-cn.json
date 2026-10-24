@@ -60,5 +60,9 @@
   "quotaAdapter.field.budgetLimitDivisor.description": "上限金额可选的正数除数，例如用 100 将分换算为元。",
   "quotaAdapter.field.budgetUsedPath.description": "已用金额的 JSON Pointer。多请求时以请求 ID 开头，例如 /usage/total。",
   "quotaAdapter.field.budgetUsedDivisor.description": "相减前用于缩放已用金额的除数；例如额度单位为元、接口按分返回时填写 100。",
-  "capabilities.untrustedWorkspaces.description": "ZCode Chat 需要启动本地 ZCode 进程，因此仅在受信任的工作区中运行。"
+  "capabilities.untrustedWorkspaces.description": "ZCode Chat 需要启动本地 ZCode 进程，因此仅在受信任的工作区中运行。",
+  "config.formulaFonts.description": "遇到公式时是否下载 KaTeX 字体。auto 在回复旁询问，on 下载并保留字体，off 使用系统字体且不再询问。",
+  "config.formulaFonts.auto": "在公式回复旁询问",
+  "config.formulaFonts.on": "下载并使用公式字体",
+  "config.formulaFonts.off": "使用系统字体，不再询问"
 }

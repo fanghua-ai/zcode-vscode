@@ -38,6 +38,10 @@ import {
 import { disposeLog, getLog, logDebug, logError, logInfo, logWarn } from "./log";
 import { redactSecrets } from "./redact";
 import { parseWebviewMessage } from "./webviewMessages";
+import {
+  MATH_FONT_VERSION, MATH_FONTS_SHA256, formulaFontMode, installMathFontPack,
+  loadMathFontPack, mathFontDataHref, mathFontFaceCss, mathFontPackReady,
+} from "./mathFonts";
 import { StartupTiming } from "./startupTiming";
 import { SendTiming } from "./sendTiming";
 import { locateAppServer } from "./serverPath";
@@ -49,9 +53,11 @@ import { readConfiguredProviderApiKey, readV2Config, readV2Settings, v2Dir } fro
 import { buildQuotaAdapterRegistry, fetchQuotaAdapter, quotaSecretStorageKey, type QuotaAdapterConfig } from "./quotaAdapters";
 import {
   loadTaskFlags,
+  loadSessionArchiveTimes,
   loadOverriddenTitles,
   persistCliSession,
   setSessionDisplayTitle,
+  SessionSyncError,
   setTaskArchived,
   setTaskDeleted,
   upsertDesktopTask,
@@ -175,6 +181,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("zcode.language")) provider.pushLanguage();
+      if (e.affectsConfiguration("zcode.formulaFonts")) provider.syncMathFonts();
       if (e.affectsConfiguration("zcode.quotaAdapters")) provider.refreshQuota();
       if (["binaryPath", "nodePath", "workspacePath", "model"].some(key => e.affectsConfiguration(`zcode.${key}`))) {
         logInfo("ZCode settings changed; restarting session");
@@ -270,6 +277,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private viewMessageListener?: vscode.Disposable;
   private viewDisposeListener?: vscode.Disposable;
   private starting: Promise<void> | null = null;
+  private mathFontTask?: Promise<void>;
+  private mathFontPhase: "idle" | "downloading" | "failed" = "idle";
+  private mathFontCssCache?: { key: string; css: string };
+  private mathFontReported = "";
   private timing: StartupTiming | null = null;
   private readonly sendTiming = new SendTiming(data => logInfo("send timing", data));
   private webviewEpoch = 0;
@@ -326,6 +337,108 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   pushLanguage(): void {
     const language = this.interfaceLanguage();
     this.post({ type: "ui_language", language: language.locale, setting: language.setting });
+  }
+
+  private currentFormulaFontMode() {
+    return formulaFontMode(vscode.workspace.getConfiguration("zcode").get("formulaFonts", "auto"));
+  }
+
+  private mathFontDirectory(): string | undefined {
+    const root = this.context.globalStorageUri?.fsPath;
+    return root ? path.join(root, "math-fonts", MATH_FONT_VERSION) : undefined;
+  }
+
+  /** Tell the open page whether formula fonts are available. Does not reload it. */
+  private pushMathFonts(): void {
+    const mode = this.currentFormulaFontMode();
+    const directory = this.mathFontDirectory();
+    const ready = !!directory && mathFontPackReady(directory, MATH_FONTS_SHA256);
+    let status = mode === "off" ? "disabled"
+      : ready ? "ready"
+      : this.mathFontPhase === "downloading" ? "downloading"
+      : this.mathFontPhase === "failed" ? "failed"
+      : "absent";
+    let css = "";
+    if (status === "ready" && directory && this.view) {
+      try {
+        css = this.mathFontCssFor(directory);
+      } catch (error) {
+        logWarn("Could not build formula font CSS", error);
+        this.mathFontCssCache = undefined;
+      }
+    }
+    if (status === "ready" && this.view && !css) status = "failed";
+    const report = `${mode}:${status}`;
+    if (report !== this.mathFontReported) {
+      this.mathFontReported = report;
+      logInfo("formula fonts", { mode, status, ...(css ? { cssBytes: css.length } : {}) });
+    }
+    this.post({ type: "math_fonts", mode, status, css });
+  }
+
+  private mathFontCssFor(directory: string): string {
+    const key = `${directory}\0${MATH_FONTS_SHA256}`;
+    if (this.mathFontCssCache?.key === key) return this.mathFontCssCache.css;
+    const css = mathFontFaceCss(file => mathFontDataHref(fs.readFileSync(path.join(directory, "fonts", file))));
+    this.mathFontCssCache = { key, css };
+    return css;
+  }
+
+  syncMathFonts(): void {
+    if (this.currentFormulaFontMode() === "on") {
+      void this.ensureMathFonts().catch(error => logWarn("Formula font setup failed", error));
+      return;
+    }
+    this.mathFontPhase = "idle";
+    this.pushMathFonts();
+  }
+
+  private async enableMathFonts(): Promise<void> {
+    try {
+      await vscode.workspace.getConfiguration("zcode").update("formulaFonts", "on", vscode.ConfigurationTarget.Global);
+    } catch (error) {
+      logWarn("Could not enable formula fonts", error);
+      this.mathFontPhase = "failed";
+      this.pushMathFonts();
+      return;
+    }
+    await this.ensureMathFonts(true);
+  }
+
+  private async ensureMathFonts(force = false): Promise<void> {
+    if (!force && this.currentFormulaFontMode() !== "on") {
+      this.pushMathFonts();
+      return;
+    }
+    const directory = this.mathFontDirectory();
+    if (!directory) {
+      this.mathFontPhase = "failed";
+      this.pushMathFonts();
+      return;
+    }
+    if (mathFontPackReady(directory, MATH_FONTS_SHA256)) {
+      this.mathFontPhase = "idle";
+      this.pushMathFonts();
+      return;
+    }
+    if (!this.mathFontTask) {
+      this.mathFontPhase = "downloading";
+      this.pushMathFonts();
+      this.mathFontTask = this.installMathFonts(directory).finally(() => { this.mathFontTask = undefined; });
+    }
+    await this.mathFontTask;
+  }
+
+  private async installMathFonts(directory: string): Promise<void> {
+    try {
+      const bytes = await loadMathFontPack();
+      await installMathFontPack(bytes, directory, MATH_FONTS_SHA256);
+      this.mathFontPhase = "idle";
+    } catch (error) {
+      logWarn("Formula font download failed", error);
+      this.mathFontPhase = "failed";
+    }
+    this.pushMathFonts();
   }
 
   private composerChrome(): ComposerChrome {
@@ -486,6 +599,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.setRunningPollVisibility(visible);
     webviewView.webview.options = {
       enableScripts: true,
+      // Fonts are inlined as data URIs. The cache directory is not a webview resource.
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, "dist"),
         vscode.Uri.joinPath(this.context.extensionUri, "media"),
@@ -685,6 +799,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         this.pushLanguage();
         break;
       }
+      case "installMathFonts":
+        await this.enableMathFonts();
+        break;
       case "setChrome": {
         const current = this.composerChrome();
         const key = msg.chromeKey as keyof ComposerChrome | undefined;
@@ -715,6 +832,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         this.pushLanguage();
         this.pushChrome();
         this.pushNewSessionDefaults();
+        void this.syncMathFonts();
         this.flushOpenSettings();
         if (this.starting) await this.starting;
         if (!this.client) await this.startZCode();
@@ -2024,8 +2142,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const ticket = this.switchTicket;
     if (!client) return;
     try {
-      const listed = startupList ?? await client.listSessions(true);
+      const serverList = startupList ?? await client.listSessions(true);
       if (client !== this.client || ticket !== this.switchTicket) return;
+      const archiveTimes = loadSessionArchiveTimes(serverList.map(s => s.sessionId));
+      const listed = serverList.map(s => archiveTimes.has(s.sessionId)
+        ? { ...s, archivedAt: archiveTimes.get(s.sessionId) || undefined }
+        : s);
       // Persistent flags are authoritative and must be read after the list returns.
       const flags = this.workspacePath
         ? loadTaskFlags(this.workspacePath)
@@ -2055,29 +2177,28 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         currentId: this.client.currentSessionId,
         includeArchived,
       });
-      if (!includeArchived) {
-        for (const s of listed) {
-          const ws = this.workspacePath || s.workspacePath || "";
-          if (!ws || archived.has(s.sessionId) || deleted.has(s.sessionId)) continue;
-          upsertDesktopTask({
-            workspacePath: ws,
-            sessionId: s.sessionId,
-            title: s.title,
-            model: s.model
-              ? `${s.model.providerId}/${s.model.modelId}`
-              : this.runtime
-                ? `${this.runtime.providerId}/${this.runtime.modelId}`
-                : undefined,
-            createdAt: s.createdAt,
-            updatedAt: s.updatedAt,
-            mode:
-              s.sessionId === this.client.currentSessionId
-                ? this.client.currentMode()
-                : undefined,
-          });
-        }
-        // A server list may be paginated. Never delete desktop tasks absent from it.
+      for (const s of listed) {
+        const ws = this.workspacePath || s.workspacePath || "";
+        if (!ws || deleted.has(s.sessionId)) continue;
+        upsertDesktopTask({
+          workspacePath: ws,
+          sessionId: s.sessionId,
+          title: s.title,
+          model: s.model
+            ? `${s.model.providerId}/${s.model.modelId}`
+            : this.runtime
+              ? `${this.runtime.providerId}/${this.runtime.modelId}`
+              : undefined,
+          createdAt: s.createdAt,
+          updatedAt: s.updatedAt,
+          archived: archived.has(s.sessionId) || !!s.archivedAt,
+          mode:
+            s.sessionId === this.client.currentSessionId
+              ? this.client.currentMode()
+              : undefined,
+        });
       }
+      // A server list may be paginated. Never delete desktop tasks absent from it.
     } catch (e) {
       logWarn("listSessions failed", e);
     }
@@ -2094,7 +2215,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       logError("session management operation failed", e);
       // Management failures must never terminate the running conversation UI.
       // Report even after a switch: the user still needs the operation's outcome.
-      this.post({ type: "toast", text: saved
+      this.post({ type: "toast", text: e instanceof SessionSyncError ? userFacingError(e) : saved
         ? t("{0}已保存，但后续同步未完成：{1}", { 0: action(), 1: userFacingError(e) })
         : t("{0}未能完成：{1}", { 0: action(), 1: userFacingError(e) }) });
     }
@@ -2431,7 +2552,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     // Catch up immediately after reopening the panel, then resume the regular
     // poll. Hidden panels do not need to keep background badges current.
     this.client.pollBackgroundRuns();
-    // Without node:sqlite each poll may rebuild a WASM snapshot; poll less often as a fallback.
+    // An unsupported runtime cannot read session storage; avoid repeatedly retrying at the normal rate.
     this.runningPoll = setInterval(() => this.client?.pollBackgroundRuns(), nativeSqliteAvailable() ? 1500 : 15000);
   }
 

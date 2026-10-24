@@ -1,0 +1,77 @@
+name: SQLite host compatibility
+
+on:
+  push:
+    branches: [main, 'codex/test-sqlite-*']
+  pull_request:
+    paths:
+      - 'src/taskIndex.ts'
+      - 'src/taskIndex.test.ts'
+      - 'src/storage.test.ts'
+      - 'scripts/test.mjs'
+      - 'src/desktopProjects*.ts'
+      - 'src/testSupport/sqlite*.ts'
+      - 'scripts/sqlite-host.mjs'
+      - '.github/workflows/sqlite-host.yml'
+      - 'package*.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sqlite-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sqlite:
+    name: ${{ matrix.os }} / VS Code ${{ matrix.vscode }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14, macos-15-intel]
+        vscode: ['1.106.0', stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: Run storage regression tests
+        run: node scripts/test.mjs storage.test.ts taskIndex.test.ts desktopProjects.test.ts
+      - run: npm run build && npm run check:package
+      - name: Run SQLite tests in the extension host (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:sqlite-host -- --vscode-version ${{ matrix.vscode }}
+      - name: Run SQLite tests in the extension host (Windows/macOS)
+        if: runner.os != 'Linux'
+        run: npm run test:sqlite-host -- --vscode-version ${{ matrix.vscode }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sqlite-${{ matrix.os }}-${{ matrix.vscode }}
+          path: test-results/sqlite-host/
+          retention-days: 7
+
+  cleanup:
+    needs: sqlite
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/codex/test-sqlite-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the temporary test branch after all platforms pass
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ref = context.ref.slice('refs/'.length);
+            const { data } = await github.rest.git.getRef({ ...context.repo, ref });
+            if (data.object.sha !== context.sha) {
+              core.notice('The branch has moved; leaving it for the newer run.');
+              return;
+            }
+            await github.rest.git.deleteRef({ ...context.repo, ref });

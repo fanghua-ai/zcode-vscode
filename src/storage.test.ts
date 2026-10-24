@@ -4,14 +4,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { runtimeEnv, readConfiguredDefaultModel, readCliDefaultModel, syncCliConfig, type ResolvedRuntime } from "./desktop";
-import { cleanupOrphanedSqliteSnapshots, disposeSqliteSnapshots, listWorkspacePathVariants, loadOverriddenTitles, upsertDesktopTask, loadTaskFlags, setTaskDeleted, setTaskArchived } from "./taskIndex";
+import { cleanupOrphanedSqliteSnapshots, listWorkspacePathVariants, loadOverriddenTitles, upsertDesktopTask, loadTaskFlags, setTaskDeleted, setTaskArchived } from "./taskIndex";
 import { ZCodeClient } from "./zcodeClient";
 import { activate, ZCodeViewProvider } from "./extension";
 import { setTestConfirmation, getRegisteredProvider } from "./testSupport/vscode";
 
 // Each test file runs in its own process. Redirect all desktop paths to fake data.
 const os = require("os") as typeof import("os");
-const loader = require("module") as { _load: (name: string, ...args: unknown[]) => unknown };
 interface Database {
   exec(sql: string): void;
   prepare(sql: string): { run(...args: unknown[]): unknown; get(...args: unknown[]): Record<string, unknown> };
@@ -34,15 +33,6 @@ function fixture(t: TestContext) {
     meta_json TEXT, searchable_text TEXT, PRIMARY KEY(workspace_key,task_id))`);
   t.after(() => { db.close(); os.homedir = original; fs.rmSync(root, { recursive: true, force: true }); });
   return { root, db };
-}
-
-function withoutNative<T>(fn: () => T): T {
-  const original = loader._load;
-  loader._load = function(name, ...args) {
-    if (name === "node:sqlite") throw new Error("Simulated runtime without SQLite");
-    return original.call(this, name, ...args);
-  };
-  try { return fn(); } finally { loader._load = original; }
 }
 
 test("refreshing a paginated list keeps older and other-provider desktop tasks", async (t) => {
@@ -71,42 +61,6 @@ test("refreshing a paginated list keeps older and other-provider desktop tasks",
   assert.deepEqual({ ...db.prepare("SELECT title,pinned FROM tasks WHERE task_id='s80'").get() }, { title: "saved 80", pinned: 1 });
   assert.equal(db.prepare("SELECT provider FROM tasks WHERE task_id='s81'").get().provider, "other-agent");
   provider.client = null;
-});
-
-test("WASM snapshot includes committed WAL records and refuses writes to snapshots", (t) => {
-  const { db } = fixture(t);
-  db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)");
-  db.prepare("INSERT INTO tasks(workspace_key,task_id,archived) VALUES(?,?,1)").run("/project", "wal-only");
-  withoutNative(() => {
-    assert.deepEqual(loadTaskFlags("/project"), { archived: ["wal-only"], deleted: [] });
-    assert.throws(() => setTaskDeleted("/project", "wal-only"), /无法安全写入/);
-    assert.throws(() => setTaskArchived("/project", "wal-only", false), /无法安全写入/);
-  });
-  assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='wal-only'").get().archived, 1);
-  assert.equal(db.prepare("SELECT deleted FROM tasks WHERE task_id='wal-only'").get().deleted, 0);
-});
-
-test("WASM snapshot is reused until the database or WAL changes, and removed on dispose", (t) => {
-  const { db } = fixture(t);
-  disposeSqliteSnapshots();
-  t.after(disposeSqliteSnapshots);
-  const snapshots = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith(`zcode-sqlite-${process.pid}-`));
-  db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)");
-  db.prepare("INSERT INTO tasks(workspace_key,task_id,archived) VALUES(?,?,1)").run("/project", "first");
-  withoutNative(() => {
-    assert.deepEqual(loadTaskFlags("/project"), { archived: ["first"], deleted: [] });
-    const [built] = snapshots();
-    assert.ok(built, "no snapshot was cached");
-    assert.deepEqual(loadTaskFlags("/project"), { archived: ["first"], deleted: [] });
-    assert.deepEqual(snapshots(), [built], "an unchanged database rebuilt its snapshot");
-    db.prepare("INSERT INTO tasks(workspace_key,task_id,deleted) VALUES(?,?,1)").run("/project", "second");
-    assert.deepEqual(loadTaskFlags("/project"), { archived: ["first"], deleted: ["second"] }, "a WAL change served a stale snapshot");
-    const rebuilt = snapshots();
-    assert.equal(rebuilt.length, 1, "the previous snapshot was not removed");
-    assert.notEqual(rebuilt[0], built);
-  });
-  disposeSqliteSnapshots();
-  assert.deepEqual(snapshots(), []);
 });
 
 test("native WAL writes remain durable", (t) => {
@@ -402,8 +356,9 @@ test("Windows legacy workspace keys keep title and flags when synchronized for d
   assert.deepEqual(loadOverriddenTitles(canonical), { old: "My title" });
   assert.deepEqual(loadTaskFlags(canonical), { archived: ["old"], deleted: [] });
   assert.ok(upsertDesktopTask({workspacePath: canonical, sessionId: "old", title: "Generated"}));
-  const row = db.prepare("SELECT * FROM tasks WHERE workspace_key=? AND task_id='old'").get(canonical);
+  const row = db.prepare("SELECT * FROM tasks WHERE workspace_key=? AND task_id='old'").get(oldPath);
   assert.equal(row.title, "My title"); assert.equal(row.archived, 1); assert.equal(row.pinned, 1); assert.equal(row.mode, "plan");
+  assert.equal(db.prepare("SELECT count(*) AS n FROM tasks WHERE task_id='old'").get().n, 1);
   setTaskArchived(canonical, "old", false);
   assert.deepEqual(loadTaskFlags(oldPath), { archived: [], deleted: [] });
   assert.ok(upsertDesktopTask({workspacePath: canonical, sessionId: "old", title: "Renamed", overrideTitle: true}));
@@ -411,7 +366,7 @@ test("Windows legacy workspace keys keep title and flags when synchronized for d
   setTaskDeleted(canonical, "old");
   assert.deepEqual(loadTaskFlags(oldPath), { archived: [], deleted: ["old"] });
   assert.ok(upsertDesktopTask({workspacePath: canonical, sessionId: "old", title: "Generated"}));
-  assert.equal(db.prepare("SELECT deleted FROM tasks WHERE workspace_key=? AND task_id='old'").get(canonical).deleted, 1);
+  assert.equal(db.prepare("SELECT deleted FROM tasks WHERE workspace_key=? AND task_id='old'").get(oldPath).deleted, 1);
 });
 
 test("Windows workspace variants include CLI-only paths and exclude other directories", t => {
@@ -427,14 +382,14 @@ test("Windows workspace variants include CLI-only paths and exclude other direct
   assert.deepEqual(listWorkspacePathVariants("E:\\Projects\\项目"), ["E:\\Projects\\项目", "e:/projects/项目/"]);
 });
 
-test("Linux desktop flags remain isolated between case-distinct directories", t => {
+test("Linux desktop flags remain isolated between case-distinct directories", { skip: process.platform === "win32" }, t => {
   const { db } = fixture(t);
   db.exec("INSERT INTO tasks (workspace_key, task_id, deleted) VALUES ('/project/A', 'upper', 1), ('/project/a', 'lower', 1)");
   assert.deepEqual(loadTaskFlags("/project/A"), { archived: [], deleted: ["upper"] });
   assert.deepEqual(listWorkspacePathVariants("/project/A"), ["/project/A"]);
 });
 
-test("Windows listing queries both exact server paths, deduplicates IDs, and syncs legacy sessions into desktop's key", async t => {
+test("Windows listing queries both exact server paths, deduplicates IDs, and retains the legacy desktop key", async t => {
   const { db } = fixture(t);
   windowsPlatform(t);
   const canonical = "E:\\Projects\\项目", legacy = "e:\\Projects\\项目";
@@ -462,7 +417,8 @@ test("Windows listing queries both exact server paths, deduplicates IDs, and syn
   const internal = provider as unknown as {workspacePath: string; client: ZCodeClient; refreshSessions: () => Promise<void>};
   internal.workspacePath = canonical; internal.client = client;
   await internal.refreshSessions();
-  assert.equal(db.prepare("SELECT count(*) AS n FROM tasks WHERE workspace_key=? AND task_id='plugin'").get(canonical).n, 1);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM tasks WHERE workspace_key=? AND task_id='plugin'").get(legacy).n, 1);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM tasks WHERE task_id='plugin'").get().n, 1);
 });
 
 test("copy diagnostics uses an allowlist and omits credentials, session IDs and raw errors", async t => {
@@ -551,4 +507,169 @@ test("short-lived plan tokens never enter CLI config or the app-server environme
     assert.equal(config.includes("TEST-STALE-KEY"), false);
     assert.deepEqual(runtimeEnv(runtime), {});
   }
+});
+
+function sessionOperations(t: TestContext) {
+  const f = fixture(t);
+  f.db.prepare("INSERT INTO tasks(workspace_key,task_id,title) VALUES('/project','A','original')").run();
+  const cliPath = path.join(f.root, ".zcode/cli/db/db.sqlite");
+  fs.mkdirSync(path.dirname(cliPath), { recursive: true });
+  const cli = new DatabaseSync(cliPath);
+  cli.exec(`CREATE TABLE session(id TEXT PRIMARY KEY,title TEXT,title_source TEXT,version TEXT,
+    directory TEXT,path TEXT,time_updated INTEGER,time_title_updated INTEGER,time_archived INTEGER);
+    INSERT INTO session(id,title,version) VALUES('A','original','3.16.2');`);
+  cli.close();
+  const provider = new ZCodeViewProvider({ subscriptions: [],
+    workspaceState: { get: () => undefined, update: async () => {} },
+    globalState: { get: () => undefined, update: async () => {} },
+  } as unknown as vscode.ExtensionContext);
+  const posted: Array<{ type: string; text?: string; sessions?: Array<{ sessionId: string; title?: string }> }> = [];
+  const state = provider as unknown as {
+    workspacePath: string;
+    sessions: Array<{ sessionId: string; title?: string }>;
+    client: { currentSessionId: string; listSessions: () => Promise<Array<{sessionId: string; title?: string; archivedAt?: number}>> };
+    post: (message: typeof posted[number]) => void;
+    refreshSessions: (includeArchived?: boolean) => Promise<void>;
+    applyRename: (id: string, title: string) => Promise<void>;
+    archiveSession: (id: string, archived: boolean) => Promise<void>;
+  };
+  state.workspacePath = "/project";
+  state.sessions = [{ sessionId: "A", title: "original" }];
+  state.client = { currentSessionId: "other", listSessions: async () => [{sessionId: "A", title: "stale server title"}] };
+  state.post = message => posted.push(message);
+  return { ...f, state, posted, cliPath, index: path.join(f.root, ".zcode/v2/tasks-index.sqlite") };
+}
+
+test("failed session listing preserves displayed sessions and a later refresh recovers", async t => {
+  const { state, posted } = sessionOperations(t);
+  const existing = state.sessions;
+  state.client.listSessions = async () => { throw new Error("desktop unavailable"); };
+  await state.refreshSessions();
+  assert.equal(state.sessions, existing);
+  assert.ok(!posted.some(message => message.type === "sessions"), "failure replaced the list with empty results");
+  state.client.listSessions = async () => [{ sessionId: "A", title: "recovered" }];
+  await state.refreshSessions();
+  assert.equal(state.sessions[0].title, "recovered");
+  assert.equal(posted.filter(message => message.type === "sessions").length, 1);
+});
+
+test("rename and archive persist after reopening storage and override stale server lists", async t => {
+  const { state, posted, index, cliPath } = sessionOperations(t);
+  await state.applyRename("A", "My saved title");
+  const reopenedCli = new DatabaseSync(cliPath);
+  try {
+    assert.deepEqual({ ...reopenedCli.prepare("SELECT title,title_source FROM session WHERE id='A'").get() },
+      { title: "My saved title", title_source: "custom" });
+  } finally { reopenedCli.close(); }
+  await state.archiveSession("A", true);
+  const reopened = new DatabaseSync(index);
+  try {
+    assert.deepEqual({ ...reopened.prepare("SELECT title,title_overridden,archived FROM tasks WHERE task_id='A'").get() },
+      { title: "My saved title", title_overridden: 1, archived: 1 });
+  } finally { reopened.close(); }
+  await state.refreshSessions(true);
+  assert.deepEqual(state.sessions.map(s => [s.sessionId, s.title]), [["A", "My saved title"]]);
+  await state.archiveSession("A", false);
+  assert.equal(state.sessions.length, 0, "a restored session must leave the archived tab");
+  await state.refreshSessions(false);
+  assert.deepEqual(state.sessions.map(s => [s.sessionId, s.title]), [["A", "My saved title"]]);
+  assert.ok(!posted.some(message => /同步失败|未能完成/.test(message.text || "")));
+  assert.ok(!posted.some(message => message.type === "session_error"));
+});
+
+test("restoring a session survives stale archived server lists and reopening the index", async t => {
+  const { state, index } = sessionOperations(t);
+  await state.archiveSession("A", true);
+  state.client.listSessions = async () => [{ sessionId: "A", title: "original", archivedAt: 100 }];
+  await state.archiveSession("A", false);
+  assert.equal(state.sessions.length, 0, "restored session must leave the archived tab");
+  assert.equal(upsertDesktopTask({ workspacePath: "/project", sessionId: "A", title: "original", archived: true }), true,
+    "indexing a cached archive must honor the restored CLI state");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await state.refreshSessions(false);
+    assert.deepEqual(state.sessions.map(s => s.sessionId), ["A"]);
+    const reopened = new DatabaseSync(index);
+    try { assert.equal(reopened.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 0); }
+    finally { reopened.close(); }
+  }
+  state.client.listSessions = async () => [{ sessionId: "A", title: "original" }];
+  await state.refreshSessions(false);
+  assert.deepEqual(state.sessions.map(s => s.sessionId), ["A"]);
+});
+
+for (const action of ["rename", "archive"] as const) {
+  test(`${action} under a real database write lock reports failure and leaves saved state unchanged`, async t => {
+    const { state, posted, db, cliPath } = sessionOperations(t);
+    const locker = action === "rename" ? new DatabaseSync(cliPath) : db;
+    locker.exec("PRAGMA journal_mode=WAL; BEGIN IMMEDIATE");
+    try {
+      if (action === "rename") await state.applyRename("A", "must not save");
+      else await state.archiveSession("A", true);
+      assert.deepEqual({ ...db.prepare("SELECT title,archived FROM tasks WHERE task_id='A'").get() },
+        { title: "original", archived: 0 });
+      assert.equal(posted.length, 1);
+      assert.equal(posted[0].type, "toast");
+      assert.match(posted[0].text!, /未能完成/);
+      assert.ok(!posted.some(message => message.type === "session_title" || message.type === "session_error"));
+    } finally { locker.exec("ROLLBACK"); if (locker !== db) locker.close(); }
+    // The same user action must work once the desktop releases its lock.
+    if (action === "rename") await state.applyRename("A", "retry saved");
+    else await state.archiveSession("A", true);
+    assert.equal(db.prepare(action === "rename" ? "SELECT title AS value FROM tasks WHERE task_id='A'" :
+      "SELECT archived AS value FROM tasks WHERE task_id='A'").get().value, action === "rename" ? "retry saved" : 1);
+  });
+}
+
+for (const action of ["rename", "archive"] as const) {
+  test(`${action} reports a partial save when the second database fails and retry finishes synchronization`, async t => {
+    const { state, posted, db, cliPath } = sessionOperations(t);
+    const cli = new DatabaseSync(cliPath);
+    try {
+      const failing = action === "rename" ? db : cli;
+      failing.exec(`CREATE TRIGGER fail_sync BEFORE UPDATE ON ${action === "rename" ? "tasks" : "session"}
+        BEGIN SELECT RAISE(ABORT,'test second database failure'); END`);
+      const attempt = () => action === "rename" ? state.applyRename("A", "Saved name") : state.archiveSession("A", true);
+      await attempt();
+      assert.equal(posted.length, 1);
+      assert.equal(posted[0].type, "toast");
+      assert.match(posted[0].text!, /已保存.*同步失败.*重试/);
+      assert.ok(!posted.some(message => message.type === "session_error" || message.type === "session_title"));
+      if (action === "rename") {
+        assert.equal(cli.prepare("SELECT title FROM session WHERE id='A'").get().title, "Saved name");
+        assert.equal(db.prepare("SELECT title FROM tasks WHERE task_id='A'").get().title, "original");
+      } else {
+        assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 1);
+        assert.equal(cli.prepare("SELECT time_archived FROM session WHERE id='A'").get().time_archived, null);
+      }
+      failing.exec("DROP TRIGGER fail_sync");
+      posted.length = 0;
+      await attempt();
+      if (action === "rename") {
+        assert.equal(cli.prepare("SELECT title FROM session WHERE id='A'").get().title, "Saved name");
+        assert.equal(db.prepare("SELECT title FROM tasks WHERE task_id='A'").get().title, "Saved name");
+      } else {
+        assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 1);
+        assert.ok(cli.prepare("SELECT time_archived FROM session WHERE id='A'").get().time_archived);
+      }
+      assert.ok(!posted.some(message => /同步失败/.test(message.text || "")));
+      assert.equal(db.prepare("SELECT count(*) AS n FROM tasks WHERE task_id='A'").get().n, 1);
+    } finally { cli.close(); }
+  });
+}
+
+test("Windows rename keeps both the CLI directory spelling and existing desktop key", async t => {
+  const { state, db, cliPath } = sessionOperations(t);
+  windowsPlatform(t);
+  const original = "e:/Work/Repo", canonical = "E:\\work\\repo";
+  state.workspacePath = canonical;
+  db.prepare("UPDATE tasks SET workspace_key=?,workspace_path=? WHERE task_id='A'").run(original, original);
+  const cli = new DatabaseSync(cliPath);
+  try {
+    cli.prepare("UPDATE session SET directory=?,path=? WHERE id='A'").run(original, original);
+    await state.applyRename("A", "Saved name");
+    assert.equal(cli.prepare("SELECT directory FROM session WHERE id='A'").get().directory, original);
+    assert.equal(db.prepare("SELECT workspace_key FROM tasks WHERE task_id='A'").get().workspace_key, original);
+    assert.equal(db.prepare("SELECT title FROM tasks WHERE task_id='A'").get().title, "Saved name");
+    assert.equal(db.prepare("SELECT count(*) AS n FROM tasks WHERE task_id='A'").get().n, 1);
+  } finally { cli.close(); }
 });

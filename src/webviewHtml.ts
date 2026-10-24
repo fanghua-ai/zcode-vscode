@@ -40,7 +40,7 @@ export function getWebviewHtml(
     `img-src ${webview.cspSource} data:`,
     `style-src ${webview.cspSource} 'unsafe-inline'`,
     `script-src 'nonce-${nonce}'`,
-    `font-src ${webview.cspSource}`,
+    `font-src ${webview.cspSource} data:`,
   ].join("; ");
 
   return `<!DOCTYPE html>
@@ -387,7 +387,7 @@ export function getWebviewHtml(
     margin-top: -10px;
     justify-content: flex-end;
   }
-  .msg-meta.reply-meta { margin-top: -4px; }
+  .msg-meta.reply-meta { margin-top: -4px; min-width: 0; }
   .msg-copy {
     width: 16px;
     height: 16px;
@@ -408,6 +408,16 @@ export function getWebviewHtml(
     background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
   }
   .msg-time { font-variant-numeric: tabular-nums; }
+  .math-font-hint {
+    border: 0; padding: 0; background: transparent; color: inherit;
+    font: inherit; cursor: pointer;
+    min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  }
+  .math-font-hint:hover,
+  .math-font-hint:focus-visible { color: var(--vscode-foreground); text-decoration: underline; }
+  .math-font-hint:disabled,
+  .math-font-hint:disabled:hover,
+  .math-font-hint:disabled:focus-visible { cursor: default; color: inherit; text-decoration: none; }
   .turn-hidden { display: none !important; }
   .turn-collapsed,
   .turn-folded {

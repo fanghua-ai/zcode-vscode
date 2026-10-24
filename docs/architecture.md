@@ -13,13 +13,13 @@ VS Code 的 `ZCodeViewProvider` 负责 webview 消息、编辑器上下文和宿
 | `src/extension.ts` | 扩展注册、provider、宿主消息、会话操作、恢复与诊断入口 |
 | `src/zcodeClient.ts` | 进程与 RPC、会话生命周期、模型权限、发送队列、v4 订阅和投影 |
 | `src/conversation.ts` | 帧解码、分片、副本、快照／增量一致性 |
-| `src/taskIndex.ts`、`src/workspacePath.ts` | 索引／持久化写入、归档删除、跨平台路径语义 |
+| `src/taskIndex.ts`、`src/desktopProjects.ts`、`src/workspacePath.ts` | 索引／持久化写入、归档删除、跨平台路径语义 |
 | `src/desktop.ts`、`src/credentials.ts`、`src/desktopJson.ts`、`src/serverPath.ts` | 桌面配置、登录、模型来源、运行时发现 |
 | `src/webview/main.ts`、`src/webviewHtml.ts` | 页面状态、消息与工作过程、输入、导航、滚动、HTML／CSS／CSP |
 | `src/webview/markdown.ts`、`fileMentions.ts`、`imageAttachments.ts` | 已分离的 Markdown、文件提及、图片辅助逻辑 |
 | `src/imageAttachments.ts`、`src/draftImagePreview.ts` | 原生附件与未发送图片预览缓存 |
 | `src/fileSearch.ts`、`src/fileContext.ts`、`src/promptContext.ts` | 工作区搜索与编辑器上下文 |
-| `src/math.ts`、`esbuild.mjs` | 公式识别、KaTeX 与本地 CSS／WOFF2 资源 |
+| `src/math.ts`、`esbuild.mjs`、`src/mathFonts.ts` | 公式识别、KaTeX、本地布局 CSS，以及按需下载的 WOFF2 |
 | `src/i18n.ts`、`src/i18n.zhTW.ts`、`src/hostI18n.ts` | 三语页面与宿主文案 |
 | `src/diffDocuments.ts`、`src/diagnostics.ts`、`src/errorGuidance.ts` | 只读 Diff、脱敏诊断、可操作错误指引 |
 
@@ -32,6 +32,12 @@ VS Code 的 `ZCodeViewProvider` 负责 webview 消息、编辑器上下文和宿
 3. 最终正文与中间工作过程分开，历史重绘和实时增量应得到相同文本与顺序。不能按重订阅后重新排列的序号拼接旧文本。
 4. 数据库写入集中管理，保留事务、WAL 与兼容性检查；Windows 路径比较忽略大小写，Linux 保留其语义。
 5. Markdown／工具结果不可信；HTML 清理、转义、CSP 和附件授权不可因展示需求放宽。公式资源离线加载，禁止信任危险公式命令。
+
+## SQLite 读取与回退
+
+Linux、Windows 和 macOS 统一使用扩展宿主内置的 `node:sqlite`：查询以只读连接打开原库，修改操作只写原库。WAL 数据库因缺少 SHM 或无法初始化共享内存而打不开时，查询可复用包含已提交 WAL 记录的临时快照，再由原生 SQLite 只读打开；锁冲突与损坏不会触发快照回退。快照随原库或 WAL 的变化失效，在扩展停用时清理。
+
+原生快照路径已在 Linux x64、Windows x64、macOS Intel／ARM64 的 VS Code 1.106.0 与 1.143.1 真实宿主中通过回归，随后统一启用；安装包不再携带 SQLite WASM。缺少 `node:sqlite` 的运行环境会明确报错并提示更新 VS Code。其他架构需单独验证。
 
 ## 套餐额度来源
 
@@ -46,3 +52,9 @@ Start Plan 使用独立的 ZCode JWT 查询 `/api/v1/zcode-plan/billing/balance`
 `zcodeClient.ts` 和 `webview/main.ts` 仍较大，目前并未完成模块化。后续可按单模块迁移，保留公开 API：客户端先分离传输与 RPC，再处理交互与投影；页面按消息、输入、滚动、用量和设置拆分。跨模块的生命周期与串行化先留在门面中。
 
 每一步先写清职责和输入输出，迁移后跑相关回归；协议状态或会话归属变更需全量检查。不要同时改变行为、目录和协议，也不要把重构前的私有成员测试机械复制到新的模块。
+
+## 桌面端项目归属
+
+同步任务索引时，支持项目目录表的桌面版本会在同一事务内补齐本地主机、根目录、项目关联和缺失的 CLI 会话事实。已有项目按根目录匹配（Windows 忽略大小写并兼容路径分隔符），未注册目录则创建项目；已有的非空任务归属和桌面端 CLI 事实保持不变。旧版没有项目表时沿用原有索引写入，不创建或迁移表结构。CLI session.project_id 与桌面任务索引的 project_id 属于两套独立模型，不混用。
+
+任务索引复用已有的工作区键，避免 Windows 路径变体与 `(host_id, task_id)` 唯一约束冲突。占位记录补齐缺失的供应商与创建时间；活动页和归档页刷新都同步项目归属，保留 CLI 和索引中已有的归档状态。索引库内的任务／项目写入保持事务性；跨 CLI 库和索引库的修改可能部分成功，此时明确报告已保存的位置，并允许重复相同操作完成同步。

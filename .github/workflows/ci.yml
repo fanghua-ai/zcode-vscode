@@ -24,3 +24,19 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run verify
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run browser regression tests
+        run: |
+          CHROME_BIN="$(command -v google-chrome)"
+          export CHROME_BIN
+          "$CHROME_BIN" --version
+          npm run test:browser

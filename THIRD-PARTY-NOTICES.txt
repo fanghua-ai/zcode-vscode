@@ -14,7 +14,6 @@ The LICENSE file covers this project and the Lucide icon attribution written the
 - highlight.js 11.12.0
 - marked 17.0.6
 - katex 0.19.0
-- node-sqlite3-wasm 0.8.60
 
 包含方式 / How each work is included
 ------------------------------------
@@ -32,12 +31,8 @@ The LICENSE file covers this project and the Lucide icon attribution written the
   Bundled into dist/webview.js for Markdown. The complete LICENSE.md is included below, including its Markdown notice, not only the main license name.
 
 - KaTeX 0.19.0 (https://katex.org)
-  渲染器打包进 dist/webview.js。样式和 WOFF2 字体复制到 dist/math/。软件许可是 MIT，同一文本也保留为 dist/math/LICENSE。字体是 SIL Open Font License 1.1；发布包只带 WOFF2，许可仍适用于这些字体。Reserved Font Name 来自当前安装字体的元数据，不是另行推断。
-  The renderer is bundled into dist/webview.js. The stylesheet and WOFF2 fonts are copied to dist/math/. The software license is MIT, and the same text is also kept as dist/math/LICENSE. The fonts are under the SIL Open Font License 1.1; the package ships WOFF2 only, and that license still applies to those fonts. Reserved Font Names come from the installed font metadata, not from a separate guess.
-
-- node-sqlite3-wasm 0.8.60 (https://github.com/tndrle/node-sqlite3-wasm)
-  dist/node-sqlite3-wasm.js 和 dist/node-sqlite3-wasm.wasm 是复制而非打包。包装层许可是 MIT，版权人为 Tobias Enderle。_node-sqlite3-wasm_ is currently based on SQLite 3.53.4. 上游 README 写明部分代码来自 sql.js（同样是 MIT），SQLite 处于公有领域。当前安装的包没有单独附带 sql.js 许可文件，因此这里只保留上游说明，不另补一份无法对应版本的 sql.js 许可文本。
-  dist/node-sqlite3-wasm.js and dist/node-sqlite3-wasm.wasm are copied rather than bundled. The wrapper license is MIT, copyright Tobias Enderle. _node-sqlite3-wasm_ is currently based on SQLite 3.53.4. The upstream README says parts of the code come from sql.js, also under the MIT license, and that SQLite is in the public domain. The installed package does not include a separate sql.js license file. This notice keeps the upstream statement and does not add a sql.js license text whose version cannot be identified.
+  渲染器打包进 dist/webview.js，布局样式复制到 dist/math/katex.min.css。软件许可是 MIT，同一文本保留为 dist/math/LICENSE。WOFF2 字体不进入 VSIX，由用户按需下载。字体包包含这些 WOFF2、KaTeX 的 MIT LICENSE，以及 SIL Open Font License 1.1 全文（OFL.txt）。Reserved Font Name 来自当前安装字体的元数据，不是另行推断。
+  The renderer is bundled into dist/webview.js, and the layout stylesheet is copied to dist/math/katex.min.css. The software license is MIT, and the same text is kept as dist/math/LICENSE. WOFF2 fonts are not included in the VSIX; they are downloaded on request. The font pack contains those WOFF2 files, the KaTeX MIT LICENSE, and the full SIL Open Font License 1.1 text (OFL.txt). Reserved Font Names come from the installed font metadata, not from a separate guess.
 
 字体元数据原文 / Font metadata
 ------------------------------
@@ -839,30 +834,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ----- END node_modules/katex/LICENSE -----
 
------ BEGIN node_modules/node-sqlite3-wasm/LICENSE -----
-MIT License
-
-Copyright (c) 2022-2024 Tobias Enderle
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
------ END node_modules/node-sqlite3-wasm/LICENSE -----
-
 ----- BEGIN scripts/third-party/OFL-1.1.txt -----
 SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
 
@@ -949,26 +920,4 @@ DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
 ----- END scripts/third-party/OFL-1.1.txt -----
-
------ BEGIN scripts/third-party/sqlite-public-domain.txt -----
-Source: https://www.sqlite.org/copyright.html
-Retrieved: 2026-10-15
-
-The following is the SQLite authors' public-domain dedication for the deliverable library. It is included because node-sqlite3-wasm distributes a compiled SQLite library. It is not a license added by this project.
-
-All of the code and documentation in SQLite has been dedicated to the public domain by the authors. All code authors, and representatives of the companies they work for, have signed affidavits dedicating their contributions to the public domain and originals of those signed affidavits are stored in a firesafe at the main offices of Hwaci. All contributors are citizens of countries that allow creative works to be dedicated into the public domain. Anyone is free to copy, modify, publish, use, compile, sell, or distribute the original SQLite code, either in source code form or as a compiled binary, for any purpose, commercial or non-commercial, and by any means.
-
-The previous paragraph applies to the deliverable code and documentation in SQLite - those parts of the SQLite library that you actually bundle and ship with a larger application. Some scripts used as part of the build process (for example the "configure" scripts generated by autoconf) might fall under other open-source licenses. Nothing from these build scripts ever reaches the final deliverable SQLite library, however, and so the licenses associated with those scripts should not be a factor in assessing your rights to copy and use the SQLite library.
------ END scripts/third-party/sqlite-public-domain.txt -----
-
------ BEGIN node_modules/node-sqlite3-wasm/README.md license section -----
-## License
-
-_node-sqlite3-wasm_ is
-[MIT](https://github.com/tndrle/node-sqlite3-wasm/blob/main/LICENSE) licensed.
-
-Parts of the code are from [sql.js](https://github.com/sql-js/sql.js), which is
-also MIT licensed. SQLite is in the [public
-domain](https://www.sqlite.org/copyright.html).
------ END node_modules/node-sqlite3-wasm/README.md license section -----
 

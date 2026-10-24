@@ -60,5 +60,9 @@
   "quotaAdapter.field.budgetLimitDivisor.description": "上限金額的選用正數除數，例如用 100 將分換算為元。",
   "quotaAdapter.field.budgetUsedPath.description": "已用金額的 JSON Pointer。多請求時以請求 ID 開頭，例如 /usage/total。",
   "quotaAdapter.field.budgetUsedDivisor.description": "相減前用來縮放已用金額的除數；例如額度使用元、介面回傳分時填 100。",
-  "capabilities.untrustedWorkspaces.description": "ZCode Chat 需要啟動本機 ZCode 程序，因此僅在受信任的工作區中執行。"
+  "capabilities.untrustedWorkspaces.description": "ZCode Chat 需要啟動本機 ZCode 程序，因此僅在受信任的工作區中執行。",
+  "config.formulaFonts.description": "遇到公式時是否下載 KaTeX 字型。auto 在回覆旁詢問，on 下載並保留字型，off 使用系統字型且不再詢問。",
+  "config.formulaFonts.auto": "在公式回覆旁詢問",
+  "config.formulaFonts.on": "下載並使用公式字型",
+  "config.formulaFonts.off": "使用系統字型，不再詢問"
 }

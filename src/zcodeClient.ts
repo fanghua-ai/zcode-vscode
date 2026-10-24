@@ -3574,22 +3574,35 @@ export class ZCodeClient {
     }
     if (this.proc) {
       const proc = this.proc;
+      this.proc = null;
       try {
         proc.stdin?.end();
       } catch {
         // ignore
       }
-      proc.kill("SIGTERM");
-      this.killTimer = setTimeout(() => {
+      // Node 22 keeps a failed spawn's handle until the error tick. kill()
+      // then uses pid 0 and signals the current process group.
+      if (childIsRunning(proc)) {
         try {
-          proc.kill("SIGKILL");
+          proc.kill("SIGTERM");
         } catch {
           // ignore
         }
-      }, 2000);
-      this.proc = null;
+        this.killTimer = setTimeout(() => {
+          if (!childIsRunning(proc)) return;
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            // ignore
+          }
+        }, 2000);
+      }
     }
   }
+}
+
+function childIsRunning(proc: ChildProcess): boolean {
+  return (proc.pid ?? 0) > 0 && proc.exitCode === null && proc.signalCode === null;
 }
 
 function readContextUsage(

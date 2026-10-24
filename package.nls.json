@@ -60,5 +60,9 @@
   "quotaAdapter.field.budgetLimitDivisor.description": "Optional positive divisor for the limit amount, for example 100 to convert cents to currency units.",
   "quotaAdapter.field.budgetUsedPath.description": "JSON Pointer to the used amount. For multiple requests, start with the request id, for example /usage/total.",
   "quotaAdapter.field.budgetUsedDivisor.description": "Divide the used amount by this value before subtraction, for example 100 when the API reports cents and the limit is in dollars.",
-  "capabilities.untrustedWorkspaces.description": "ZCode Chat starts a local ZCode process, so it only runs in trusted workspaces."
+  "capabilities.untrustedWorkspaces.description": "ZCode Chat starts a local ZCode process, so it only runs in trusted workspaces.",
+  "config.formulaFonts.description": "Download KaTeX fonts when a formula appears. auto asks beside the reply, on downloads and keeps the fonts, and off uses system fonts without asking.",
+  "config.formulaFonts.auto": "Ask beside a formula reply",
+  "config.formulaFonts.on": "Download and use formula fonts",
+  "config.formulaFonts.off": "Use system fonts without asking"
 }

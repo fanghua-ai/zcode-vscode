@@ -1,5 +1,35 @@
 # 更新日志 / Changelog
 
+## 2.1.0 — 2026-10-24
+
+### 中文
+
+- 更正第三方声明：公式字体不进入安装包。按需下载的字体包附带 SIL OFL 全文；已安装的旧字体包会在下次美化时重新下载。
+- 说明稳定版与预览版的更新通道。手动安装改为按 `zcode-desktop-chat-<版本>.vsix` 选择文件，不再写死旧文件名。
+- 关闭尚未启动成功的 ZCode 时，不再把终止信号发给编辑器自身。
+- 多个窗口同时下载公式字体时各自使用临时目录；其他窗口已经装好时直接复用，不再互相删除缓存。
+- 修复点击美化公式后字形不变的问题。字体随页面注入，不再让 webview 按文件加载 WOFF2。
+- 公式字体缓存不完整时重新下载；下载过程中「美化公式」不再接受重复点击。
+- 公式字体改为按需下载，安装包不再附带字体。回复结束后，可在复制和时间旁选择美化公式；下载一次后可离线使用。
+- 修复 Windows 路径变体导致会话索引冲突、桌面占位会话不可见及归档会话漏关联；跨库同步部分成功时明确提示，并支持重试相同操作。
+- 修复插件会话在新版桌面端落入普通任务的问题；自动复用或创建对应目录的项目，并补齐未关联会话的项目归属。
+- 各平台统一使用 VS Code 内置 SQLite，保留 WAL 快照恢复能力并移除 WASM 运行库，缩小安装包。
+- 合并同一帧内的回复增量，减少流式输出时的重复绘制；代码在生成过程中先以纯文本显示，结束后恢复高亮。
+
+### English
+
+- Correct the third-party notice: formula fonts are not included in the install package. The downloaded font pack includes the full SIL OFL text, and an older installed pack is downloaded again the next time formulas are improved.
+- Document the stable and preview update channels. Manual installation now uses `zcode-desktop-chat-<version>.vsix` instead of a stale filename.
+- Closing a ZCode process that never started no longer signals the editor itself.
+- Give each window its own temporary directory when downloading formula fonts, and reuse a pack another window has already installed instead of deleting the cache.
+- Fix formulas staying on the system font after Improve formulas. The faces are injected into the page instead of loaded as webview WOFF2 files.
+- Download formula fonts again when the saved pack is incomplete, and ignore extra clicks on Improve formulas while a download is running.
+- Download formula fonts on demand instead of including them in the install package. After a reply finishes, Improve formulas appears beside Copy and the time; the download is kept for offline use.
+- Fix session index conflicts with Windows path variants, invisible desktop placeholders, and missing project links for archived sessions. Report partial saves across databases and allow retrying the same operation.
+- Keep plugin sessions in the matching desktop project, creating a project for new workspace directories and associating previously unassigned sessions.
+- Use VS Code’s built-in SQLite across platforms, retain WAL snapshot recovery, and remove the WASM runtime to reduce package size.
+- Combine reply updates within each frame to reduce repeated rendering. Show plain code while streaming and restore syntax highlighting when the text finishes.
+
 ## 2.0.2 — 2026-10-23
 
 ### 中文

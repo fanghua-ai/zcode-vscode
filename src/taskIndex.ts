@@ -1,3 +1,4 @@
+import { syncDesktopProject } from "./desktopProjects";
 import { sameWorkspacePath } from "./workspacePath";
 import { LocalizedError } from "./i18n";
 import * as fs from "fs";
@@ -13,11 +14,16 @@ export interface DesktopTask {
   status?: string;
   createdAt?: number;
   updatedAt?: number;
+  /** A listed CLI session may already be archived before its desktop index exists. */
+  archived?: boolean;
   /** User renamed this task; do not let generated titles overwrite it. */
   overrideTitle?: boolean;
   /** Permission mode. Omitted values keep the row the desktop already stored. */
   mode?: string;
 }
+
+/** One database was saved; repeating the same operation completes synchronization. */
+export class SessionSyncError extends LocalizedError {}
 
 interface SqliteApi {
   exec(sql: string): void;
@@ -189,71 +195,29 @@ function wrapNative(db: {
   };
 }
 
-function wrapWasm(db: {
-  exec(sql: string): void;
-  all(sql: string, values?: unknown[]): unknown[];
-  get(sql: string, values?: unknown[]): unknown | null;
-  run(sql: string, values?: unknown[]): unknown;
-  close(): void;
-}): SqliteApi {
-  return {
-    exec: (sql) => db.exec(sql),
-    all: (sql, values) => db.all(sql, values),
-    get: (sql, values) => db.get(sql, values) ?? null,
-    run: (sql, values) => db.run(sql, values),
-    close: () => db.close(),
-  };
-}
-
-function loadWasmSqlite(): {
-  Database: new (filename: string, options?: { fileMustExist?: boolean }) => {
-    exec(sql: string): void;
-    all(sql: string, values?: unknown[]): unknown[];
-    get(sql: string, values?: unknown[]): unknown | null;
-    run(sql: string, values?: unknown[]): unknown;
-    close(): void;
-  };
-} {
-  const bundled = path.join(__dirname, "node-sqlite3-wasm.js");
-  const mod = fs.existsSync(bundled)
-    ? bundled
-    : require.resolve("node-sqlite3-wasm");
-  return require(mod);
-}
-
-function tryNativeSqlite(dbPath: string): SqliteApi | null {
-  let DatabaseSync: new (filename: string, options?: { timeout?: number }) => {
-    exec(sql: string): void;
-    prepare(sql: string): {
-      all: (...args: unknown[]) => unknown[];
-      get: (...args: unknown[]) => unknown;
-      run: (...args: unknown[]) => unknown;
-    };
-    close(): void;
-  };
+function openNativeSqlite(dbPath: string, readOnly = false): SqliteApi {
+  let DatabaseSync: new (
+    filename: string, options?: { timeout?: number; readOnly?: boolean }
+  ) => Parameters<typeof wrapNative>[0];
   try {
     DatabaseSync = require("node:sqlite").DatabaseSync;
-  } catch {
-    return null;
-  }
-  if (typeof DatabaseSync !== "function") return null;
-  try {
-    const db = new DatabaseSync(dbPath, { timeout: 5000 });
-    try {
-      db.exec("PRAGMA busy_timeout=5000");
-      db.prepare("SELECT 1").get();
-      return wrapNative(db);
-    } catch (e) {
-      try {
-        db.close();
-      } catch {
-        /* ignore */
-      }
-      throw e;
-    }
+    if (typeof DatabaseSync !== "function") throw new Error("DatabaseSync is unavailable");
   } catch (e) {
-    logDebug("node:sqlite could not open", dbPath, e);
-    return null;
+    throw new LocalizedError("当前 VS Code 运行环境不支持原生 SQLite，请更新 VS Code 后重试。", {}, { cause: e });
+  }
+  const db = new DatabaseSync(dbPath, { timeout: 5000, readOnly });
+  try {
+    db.exec("PRAGMA busy_timeout=5000");
+    // A real read surfaces WAL/permission errors before business queries, while recovery can still run.
+    db.prepare("SELECT name FROM sqlite_schema LIMIT 1").get();
+    return wrapNative(db);
+  } catch (e) {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
+    throw e;
   }
 }
 
@@ -280,7 +244,7 @@ function walChecksum(
   return [s1, s2];
 }
 
-/** Replay WAL frames into a rollback-journal copy. WASM SQLite cannot open WAL files. */
+/** Replay committed WAL frames into a rollback-journal copy that needs no shared-memory file. */
 function applyWal(main: Buffer, wal: Buffer): Buffer {
   if (wal.length < 32) return Buffer.from(main);
   const magic = wal.readUInt32BE(0);
@@ -357,25 +321,8 @@ function materializeRollbackCopy(dbPath: string): string {
   return dest;
 }
 
-function openWasm(dbPath: string): SqliteApi {
-  const { Database } = loadWasmSqlite();
-  const db = new Database(dbPath, { fileMustExist: true });
-  try {
-    db.exec("PRAGMA busy_timeout=5000");
-    db.get("SELECT 1");
-    return wrapWasm(db);
-  } catch (e) {
-    try {
-      db.close();
-    } catch {
-      /* ignore */
-    }
-    throw e;
-  }
-}
-
 let nativeSqlite: boolean | undefined;
-/** Whether this runtime ships node:sqlite; without it every read goes through the WASM snapshot path. */
+/** Whether this runtime provides the native SQLite module required by session storage. */
 export function nativeSqliteAvailable(): boolean {
   if (nativeSqlite === undefined) {
     try {
@@ -388,9 +335,9 @@ export function nativeSqliteAvailable(): boolean {
 }
 
 /**
- * WASM SQLite cannot read WAL databases, so it reads a rollback-journal snapshot. Building one copies the
- * whole database (about a second for a 150 MB store), so keep the latest snapshot per database and rebuild it
- * only when the main file or its WAL changes size or modification time.
+ * A rollback-journal snapshot also lets native SQLite read WAL stores that cannot initialize shared memory.
+ * Building one copies the whole database (about a second for a 150 MB store), so keep the latest snapshot per
+ * database and rebuild it only when the main file or its WAL changes size or modification time.
  */
 const snapshots = new Map<string, { key: string; tempPath: string }>();
 let exitCleanupRegistered = false;
@@ -486,25 +433,24 @@ export function disposeSqliteSnapshots(): void {
   for (const dbPath of [...snapshots.keys()]) dropSnapshot(dbPath);
 }
 
-function openSqlite(dbPath: string, writable = false): { db: SqliteApi; tempPath?: string } {
-  const native = tryNativeSqlite(dbPath);
-  if (native) return { db: native };
-
+function openSqlite(dbPath: string, writable = false): SqliteApi {
   try {
-    return { db: openWasm(dbPath) };
-  } catch (directErr) {
-    if (writable) {
-      throw new LocalizedError("无法安全写入 WAL 数据库：当前运行时不支持原生 SQLite。请升级 VS Code 后重试。", {}, { cause: directErr });
-    }
+    return openNativeSqlite(dbPath, !writable);
+  } catch (e) {
+    const code = (e as { errcode?: number } | null)?.errcode;
+    // CANTOPEN with a missing SHM, or READONLY_CANTINIT: the WAL is readable but its index cannot be built.
+    // Do not bypass native locks or write to a copy instead of the real database.
+    const needsSnapshot = code === 1288 ||
+      (typeof code === "number" && (code & 0xff) === 14 && !fs.existsSync(dbPath + "-shm"));
+    if (writable || !needsSnapshot || !fs.existsSync(dbPath + "-wal")) throw e;
     try {
-      // The cached snapshot outlives this call; withDb must not delete it, so no tempPath is returned.
       const snapshot = snapshotFor(dbPath);
-      const db = openWasm(snapshot.tempPath);
-      if (!snapshot.reused) logDebug("Opened WAL snapshot for", dbPath);
-      return { db };
+      const db = openNativeSqlite(snapshot.tempPath, true);
+      if (!snapshot.reused) logDebug("Opened native WAL snapshot for", dbPath);
+      return db;
     } catch (snapErr) {
       dropSnapshot(dbPath);
-      logWarn("WASM SQLite could not open", dbPath, directErr);
+      logWarn("Native SQLite could not read WAL snapshot", dbPath, e);
       throw snapErr;
     }
   }
@@ -515,21 +461,14 @@ function withWritableDb<T>(dbPath: string, fn: (db: SqliteApi) => T): T {
 }
 
 function withDb<T>(dbPath: string, fn: (db: SqliteApi) => T, writable = false): T {
-  const opened = openSqlite(dbPath, writable);
+  const db = openSqlite(dbPath, writable);
   try {
-    return fn(opened.db);
+    return fn(db);
   } finally {
     try {
-      opened.db.close();
+      db.close();
     } catch {
       /* ignore */
-    }
-    if (opened.tempPath) {
-      try {
-        fs.unlinkSync(opened.tempPath);
-      } catch {
-        /* ignore */
-      }
     }
   }
 }
@@ -550,82 +489,126 @@ export function upsertDesktopTask(task: DesktopTask): boolean {
   const title = task.title || "新会话";
   const model = task.model ?? null;
   const status = task.status ?? "completed";
-  const createdAt = task.createdAt ?? now;
+  const savedSession = readSavedSession(task.sessionId);
   const updatedAt = task.updatedAt ?? now;
   const overridden = task.overrideTitle ? 1 : 0;
   try {
     withWritableDb(dbPath, (db) => {
-      const scope = workspacePredicate(db, task.workspacePath);
-      const rows = db.all(
-        `SELECT mode, title, title_overridden, archived, deleted, pinned FROM tasks WHERE ${scope.sql} AND task_id=? ORDER BY updated_at DESC`,
-        [...scope.values, task.sessionId]
-      ) as Array<{ mode?: string; title: string; title_overridden: number; archived: number; deleted: number; pinned: number }>;
-      const existing = rows[0];
-      const renamed = rows.find(row => row.title_overridden);
-      const effectiveTitle = task.overrideTitle ? title : renamed?.title ?? title;
-      const mode = task.mode || existing?.mode || "build";
-      // `glm` is the desktop task-index agent id, not a model provider.
-      const meta = JSON.stringify({
-        taskId: task.sessionId,
-        title: effectiveTitle,
-        workspacePath: task.workspacePath,
-        createdAt,
-        updatedAt,
-        mode,
-        provider: "glm",
-        status,
-      });
-      db.run(
-        `
-        INSERT INTO tasks (
-          workspace_key, workspace_path, workspace_identity, task_id, title,
-          task_status, provider, mode, model, created_at, updated_at,
-          last_unread_at, pinned, archived, deleted, title_overridden,
-          meta_json, searchable_text
-        ) VALUES (?, ?, NULL, ?, ?, ?, 'glm', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, '')
-        ON CONFLICT(workspace_key, task_id) DO UPDATE SET
-          title=CASE
-            WHEN excluded.title_overridden=1 THEN excluded.title
-            WHEN tasks.title_overridden=1 THEN tasks.title
-            ELSE excluded.title
-          END,
-          title_overridden=MAX(tasks.title_overridden, excluded.title_overridden),
-          pinned=MAX(tasks.pinned, excluded.pinned),
-          archived=MAX(tasks.archived, excluded.archived),
-          deleted=MAX(tasks.deleted, excluded.deleted),
-          task_status=excluded.task_status,
-          mode=excluded.mode,
-          model=COALESCE(excluded.model, tasks.model),
-          updated_at=excluded.updated_at,
-          meta_json=excluded.meta_json
-        `,
-        [
-          task.workspacePath,
-          task.workspacePath,
-          task.sessionId,
-          effectiveTitle,
-          status,
-          mode,
-          model,
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const scope = workspacePredicate(db, task.workspacePath);
+        const rows = db.all(
+          `SELECT workspace_key, workspace_path, created_at, mode, title, title_overridden, archived, deleted, pinned FROM tasks WHERE ${scope.sql} AND task_id=? ORDER BY updated_at DESC`,
+          [...scope.values, task.sessionId]
+        ) as Array<{ workspace_key: string; workspace_path?: string; created_at?: number; mode?: string; title: string; title_overridden: number; archived: number; deleted: number; pinned: number }>;
+        const existing = rows[0];
+        // Reuse the existing identity, including its Windows spelling. Creating an
+        // alias row would collide with the desktop's UNIQUE(host_id, task_id).
+        const workspaceKey = existing?.workspace_key || task.workspacePath;
+        const workspacePath = existing?.workspace_path || workspaceKey;
+        const createdAt = existing?.created_at || task.createdAt || savedSession?.time_created || now;
+        const renamed = rows.find(row => row.title_overridden);
+        const effectiveTitle = task.overrideTitle ? title : renamed?.title ?? title;
+        const mode = task.mode || existing?.mode || "build";
+        // `glm` is the desktop task-index agent id, not a model provider.
+        const meta = JSON.stringify({
+          taskId: task.sessionId,
+          title: effectiveTitle,
+          workspacePath,
           createdAt,
           updatedAt,
-          Math.max(0, ...rows.map(row => row.pinned)),
-          Math.max(0, ...rows.map(row => row.archived)),
-          Math.max(0, ...rows.map(row => row.deleted)),
-          overridden || (renamed ? 1 : 0),
-          meta,
-        ]
-      );
-      if (task.overrideTitle) db.run(
-        `UPDATE tasks SET title=?, title_overridden=1 WHERE ${scope.sql} AND task_id=?`,
-        [title, ...scope.values, task.sessionId]
-      );
+          mode,
+          provider: "glm",
+          status,
+        });
+        db.run(
+          `
+          INSERT INTO tasks (
+            workspace_key, workspace_path, workspace_identity, task_id, title,
+            task_status, provider, mode, model, created_at, updated_at,
+            last_unread_at, pinned, archived, deleted, title_overridden,
+            meta_json, searchable_text
+          ) VALUES (?, ?, NULL, ?, ?, ?, 'glm', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, '')
+          ON CONFLICT(workspace_key, task_id) DO UPDATE SET
+            title=CASE
+              WHEN excluded.title_overridden=1 THEN excluded.title
+              WHEN tasks.title_overridden=1 THEN tasks.title
+              ELSE excluded.title
+            END,
+            title_overridden=MAX(tasks.title_overridden, excluded.title_overridden),
+            pinned=MAX(tasks.pinned, excluded.pinned),
+            archived=MAX(tasks.archived, excluded.archived),
+            deleted=MAX(tasks.deleted, excluded.deleted),
+            provider=COALESCE(NULLIF(tasks.provider,''), excluded.provider),
+            created_at=CASE WHEN COALESCE(tasks.created_at,0)=0 THEN excluded.created_at ELSE tasks.created_at END,
+            task_status=excluded.task_status,
+            mode=excluded.mode,
+            model=COALESCE(excluded.model, tasks.model),
+            updated_at=excluded.updated_at,
+            meta_json=excluded.meta_json
+          `,
+          [
+            workspaceKey,
+            workspacePath,
+            task.sessionId,
+            effectiveTitle,
+            status,
+            mode,
+            model,
+            createdAt,
+            updatedAt,
+            Math.max(0, ...rows.map(row => row.pinned)),
+            Math.max((savedSession && "time_archived" in savedSession
+              ? savedSession.time_archived : task.archived) ? 1 : 0, ...rows.map(row => row.archived)),
+            Math.max(0, ...rows.map(row => row.deleted)),
+            overridden || (renamed ? 1 : 0),
+            meta,
+          ]
+        );
+        syncDesktopProject(db, workspacePath, task.sessionId, scope.values);
+        if (task.overrideTitle) db.run(
+          `UPDATE tasks SET title=?, title_overridden=1 WHERE ${scope.sql} AND task_id=?`,
+          [title, ...scope.values, task.sessionId]
+        );
+        db.exec("COMMIT");
+      } catch (e) {
+        db.exec("ROLLBACK");
+        throw e;
+      }
     });
     logDebug("Indexed session for desktop", task.sessionId);
     return true;
   } catch (e) {
     logWarn("Failed to index session for ZCode desktop", e);
     return false;
+  }
+}
+
+/** Persisted archive timestamps take precedence over a server's cached session list. */
+export function loadSessionArchiveTimes(sessionIds: string[]): Map<string, number | null> {
+  const file = sessionDbPath();
+  if (!sessionIds.length || !fs.existsSync(file)) return new Map();
+  try {
+    return withDb(file, db => {
+      const rows = db.all(`SELECT id,time_archived FROM session WHERE id IN (${sessionIds.map(() => "?").join(",")})`, sessionIds) as
+        Array<{ id: string; time_archived: number | null }>;
+      return new Map(rows.map(row => [row.id, row.time_archived]));
+    });
+  } catch (e) {
+    logWarn("Could not read saved session archive timestamps", e);
+    return new Map();
+  }
+}
+
+function readSavedSession(sessionId: string): { time_created?: number; time_archived?: number } | undefined {
+  const file = sessionDbPath();
+  if (!fs.existsSync(file)) return undefined;
+  try {
+    return withDb(file, db => db.get("SELECT * FROM session WHERE id=?", [sessionId]) ?? undefined) as
+      { time_created?: number; time_archived?: number } | undefined;
+  } catch (e) {
+    logWarn("Could not read saved session facts for indexing", e);
+    return undefined;
   }
 }
 
@@ -647,9 +630,9 @@ export function persistCliSession(task: DesktopTask & { mode?: string }): boolea
   let skippedVersion = false;
   try {
     withWritableDb(dbPath, (db) => {
-      const existing = db.get("select title, title_source, version from session where id=?", [
+      const existing = db.get("select * from session where id=?", [
         task.sessionId,
-      ]) as { title?: string; title_source?: string; version?: string } | null;
+      ]) as { title?: string; title_source?: string; version?: string; directory?: string } | null;
       if (existing) {
         let keepTitle = title;
         let source = existing.title_source || "first_input";
@@ -662,13 +645,14 @@ export function persistCliSession(task: DesktopTask & { mode?: string }): boolea
         } else if (placeholders.has(title) && existing.title && !placeholders.has(existing.title)) {
           keepTitle = existing.title;
         }
+        const savedDirectory = existing.directory && sameWorkspacePath(existing.directory, directory) ? existing.directory : directory;
         db.run(
           `
           update session set title=?, title_source=?, directory=?, path=?, time_updated=?,
             time_title_updated=CASE WHEN ? THEN ? ELSE time_title_updated END
           where id=?
           `,
-          [keepTitle, source, directory, directory, now, force ? 1 : 0, now, task.sessionId]
+          [keepTitle, source, savedDirectory, savedDirectory, now, force ? 1 : 0, now, task.sessionId]
         );
         return;
       }
@@ -723,15 +707,17 @@ export function setTaskArchived(
   archived: boolean
 ): void {
   const now = Date.now();
+  let indexSaved = false;
   const indexPath = tasksIndexPath();
   if (fs.existsSync(indexPath)) {
     try {
       withWritableDb(indexPath, (db) => {
         const scope = workspacePredicate(db, workspacePath);
-        db.run(
+        const result = db.run(
           `UPDATE tasks SET archived=?, updated_at=? WHERE ${scope.sql} AND task_id=?`,
           [archived ? 1 : 0, now, ...scope.values, sessionId]
         );
+        indexSaved = Number((result as { changes: number | bigint }).changes) > 0;
       });
     } catch (e) {
       logWarn("Failed to update desktop archive flag", e);
@@ -751,6 +737,7 @@ export function setTaskArchived(
       });
     } catch (e) {
       logWarn("Failed to update session archive timestamp", e);
+      if (indexSaved) throw new SessionSyncError("会话归档状态已保存到桌面索引，但会话数据库同步失败。请重试相同操作。", {}, { cause: e });
       throw e;
     }
   }
@@ -799,7 +786,7 @@ export function setSessionDisplayTitle(
     updatedAt: now,
     overrideTitle: true,
   });
-  if (!indexed) throw new LocalizedError("会话名称未能同步到桌面索引，请查看日志。");
+  if (!indexed) throw new SessionSyncError("会话名称已保存，但桌面索引同步失败。请重试重命名。");
 }
 
 export function setTaskDeleted(workspacePath: string, sessionId: string): void {

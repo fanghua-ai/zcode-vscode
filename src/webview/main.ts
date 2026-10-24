@@ -287,6 +287,8 @@ const setupList = document.getElementById("setup-list")!;
 const toastEl = document.getElementById("toast")!;
 
 let isGenerating = false;
+let mathFontMode: "auto" | "on" | "off" = "auto";
+let mathFontStatus: "absent" | "downloading" | "ready" | "failed" | "disabled" = "absent";
 let revealAfterCompletionArmed = false;
 let completionRevealPending = false;
 let completionRevealJump = "";
@@ -831,6 +833,7 @@ function setConnStatus(kind: "idle" | "busy" | "error" | "warn", text?: string):
 }
 
 function setGenerating(generating: boolean, preserveCompletionReveal = false): void {
+  if (!generating && !holdStreams) finishAssistantRendering();
   const wasGenerating = isGenerating;
   isGenerating = generating;
   if (generating) {
@@ -1353,6 +1356,7 @@ function railQuestions(): IndexedQuestion[] {
 }
 
 function clearMessages(): void {
+  cancelAssistantRender();
   messageEpoch++;
   ignoreScroll = false;
   clearGreetingTimer();
@@ -1745,6 +1749,7 @@ function foldOldTurns(): void {
   // Folding changes the vertical position of every later question without
   // necessarily producing a scroll event. Re-evaluate after layout settles.
   requestAnimationFrame(updateQuestionRailActive);
+  syncMathFontHint();
 }
 
 function turnStateKey(turn: HTMLElement[], index: number): string {
@@ -3156,7 +3161,52 @@ function assistantVisibleText(el: HTMLElement): string {
   return el.querySelector(".md")?.textContent?.trim() || "";
 }
 
+// Only text painting is deferred. Protocol/state transitions remain synchronous.
+let assistantRenderFrame = 0;
+let pendingAssistantRender: { el: HTMLElement; text: string; streaming: boolean; epoch: number } | null = null;
+
+function cancelAssistantRender(): void {
+  if (assistantRenderFrame) cancelAnimationFrame(assistantRenderFrame);
+  assistantRenderFrame = 0;
+  pendingAssistantRender = null;
+}
+
+function flushAssistantRender(): void {
+  const pending = pendingAssistantRender;
+  cancelAssistantRender();
+  if (!pending || pending.epoch !== messageEpoch || !pending.el.isConnected) return;
+  const { el, text, streaming } = pending;
+  const viewport = el.closest<HTMLElement>(".work-fold-body");
+  const follow = viewport && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 24;
+  renderAssistantBody(el, text, !streaming && !isGenerating, streaming, streaming);
+  if (follow) viewport.scrollTop = viewport.scrollHeight;
+  scrollToBottom();
+}
+
+function finishAssistantRendering(): void {
+  if (pendingAssistantRender) pendingAssistantRender.streaming = false;
+  flushAssistantRender();
+  for (const el of messagesEl.querySelectorAll<HTMLElement>(".message.assistant[data-streaming-markdown]")) {
+    renderAssistantBody(el, el.dataset.streamText ?? "", false);
+  }
+}
+
+function scheduleAssistantRender(el: HTMLElement, text: string, streaming: boolean): void {
+  if (pendingAssistantRender && pendingAssistantRender.el !== el) flushAssistantRender();
+  // Replay guards must see the newest accepted text even before the next frame.
+  el.dataset.streamText = text;
+  pendingAssistantRender = { el, text, streaming, epoch: messageEpoch };
+  if (!streaming) { flushAssistantRender(); return; }
+  if (!assistantRenderFrame) {
+    const epoch = messageEpoch;
+    assistantRenderFrame = requestAnimationFrame(() => {
+      if (epoch === messageEpoch) flushAssistantRender();
+    });
+  }
+}
+
 function appendAssistantDelta(fullText: string, partId?: string, authoritative = false, streaming = true): void {
+  if (pendingAssistantRender && partId && pendingAssistantRender.el.dataset.partId !== partId) flushAssistantRender();
   if (partId) {
     const restored = [...messagesEl.querySelectorAll<HTMLElement>(".message.assistant")]
       .find(node => node.dataset.partId === partId);
@@ -3172,8 +3222,6 @@ function appendAssistantDelta(fullText: string, partId?: string, authoritative =
   if (streaming && !isGenerating) setGenerating(true);
   if (!currentAssistantEl) startAssistantMessage();
   const el = currentAssistantEl!;
-  const workViewport = el.closest<HTMLElement>(".work-fold-body");
-  const followWork = workViewport && workViewport.scrollHeight - workViewport.scrollTop - workViewport.clientHeight <= 24;
   const previous = el.dataset.streamText ?? el.dataset.copyText ?? "";
   // History can be ahead of a replayed prefix. Never replace it with less text.
   if (!authoritative && previous.startsWith(fullText) && fullText.length < previous.length) return;
@@ -3182,9 +3230,7 @@ function appendAssistantDelta(fullText: string, partId?: string, authoritative =
   // answer. Narration written while a tool is still running is not.
   if (!el.closest(".work-fold") && answerFollowsSettledTools()) el.dataset.afterSettled = "1";
   // A finished text part is not a finished turn: tools/reasoning may follow.
-  renderAssistantBody(el, fullText, !streaming && !isGenerating, streaming);
-  if (followWork) workViewport.scrollTop = workViewport.scrollHeight;
-  scrollToBottom();
+  scheduleAssistantRender(el, fullText, streaming);
 }
 
 function adoptTrailingAnswer(fullText: string): void {
@@ -3231,8 +3277,9 @@ function compactStatusLabel(status: string, origin?: string): string {
   return t("上下文已压缩");
 }
 
-const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssistantBody(el: HTMLElement, text: string, settled: boolean, liveAnswer = false): void {
+const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssistantBody(el: HTMLElement, text: string, settled: boolean, liveAnswer = false, streaming = false): void {
   el.dataset.streamText = text;
+  el.toggleAttribute("data-streaming-markdown", streaming);
   const parts = splitZaiBuiltin(text);
   let work = builtinWork.get(el);
   const tools = parts.some(part => part.kind === "tool");
@@ -3250,7 +3297,7 @@ const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssis
     const part=parts[index];
     if (part.kind === "text") {
       if (!part.text.trim()) continue;
-      const md=document.createElement("div"); md.className="md"; md.innerHTML=renderMarkdown(part.text);
+      const md=document.createElement("div"); md.className="md"; md.innerHTML=renderMarkdown(part.text, streaming);
       (index<lastTool && work ? work : el).append(md);
     } else {
       const tool=document.createElement("div"); if (toggles[toolIndex]) tool.dataset.userToggle=toggles[toolIndex]; toolIndex++;
@@ -3278,7 +3325,9 @@ const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssis
 }
 
 function finalizeAssistantMessage(): void {
+  flushAssistantRender();
   currentAssistantEl = null;
+  syncMathFontHint();
 }
 
 function formatPermissionInput(input: unknown): string {
@@ -3683,6 +3732,7 @@ function answerFollowsSettledTools(): boolean {
 }
 
 function parkCurrentAnswer(): void {
+  flushAssistantRender();
   const el = currentAssistantEl;
   if (!el) return;
   if (!assistantVisibleText(el)) {
@@ -4546,6 +4596,72 @@ function settleReplyFooters(): void {
   // Reapply turn visibility so newly added copy/time controls stay inside the
   // same folded turn instead of appearing as orphan actions below the fold bar.
   foldOldTurns();
+}
+
+function mathFontHintKey(): string | undefined {
+  if (mathFontMode === "off" || mathFontStatus === "ready" || mathFontStatus === "disabled") return;
+  if (mathFontStatus === "downloading") return "正在下载";
+  if (mathFontStatus === "failed") return "重试";
+  return "美化公式";
+}
+
+function replyHasFormula(meta: HTMLElement): boolean {
+  let node = meta.previousElementSibling;
+  while (node instanceof HTMLElement) {
+    if (node.classList.contains("timeline-mark")) return false;
+    if (node.classList.contains("message") && node.classList.contains("user") && !node.classList.contains("queued")) return false;
+    if (node.querySelector(".katex")) return true;
+    node = node.previousElementSibling;
+  }
+  return false;
+}
+
+function applyMathFontCss(css: string): void {
+  if (/[<>]|@import|expression\s*\(/i.test(css)) css = "";
+  const style = document.getElementById("math-font-faces");
+  if (!css) { style?.remove(); return; }
+  if (style?.textContent === css) return;
+  const next = style ?? document.createElement("style");
+  next.id = "math-font-faces";
+  next.textContent = css;
+  if (!style) document.head.append(next);
+}
+
+/** One quiet line on the newest visible formula reply, beside copy and time. */
+function syncMathFontHint(): void {
+  const key = mathFontHintKey();
+  const metas = [...messagesEl.querySelectorAll<HTMLElement>(":scope > .msg-meta.reply-meta")];
+  let target: HTMLElement | undefined;
+  if (key) {
+    for (let index = metas.length - 1; index >= 0; index--) {
+      const meta = metas[index];
+      if (meta.hidden || meta.closest(".turn-hidden, .turn-folded, .turn-collapsed")) continue;
+      if (replyHasFormula(meta)) { target = meta; break; }
+    }
+  }
+  for (const meta of metas) {
+    if (meta !== target) meta.querySelector(":scope > .math-font-hint")?.remove();
+  }
+  if (!target || !key) return;
+  let hint = target.querySelector<HTMLButtonElement>(":scope > .math-font-hint");
+  if (!hint) {
+    hint = document.createElement("button");
+    hint.type = "button";
+    hint.className = "math-font-hint";
+    hint.addEventListener("click", event => {
+      event.stopPropagation();
+      if (mathFontStatus === "downloading") return;
+      mathFontStatus = "downloading";
+      syncMathFontHint();
+      post({ type: "installMathFonts" });
+    });
+    target.append(hint);
+  }
+  setUiLabel(hint, key);
+  hint.title = t(key);
+  hint.setAttribute("aria-label", t(key));
+  hint.disabled = mathFontStatus === "downloading";
+  hint.setAttribute("aria-busy", hint.disabled ? "true" : "false");
 }
 
 function ensureReplyFooter(anchor: HTMLElement, at?: number): void {
@@ -6957,7 +7073,7 @@ function applyInterfaceLanguage(language: string, setting: LanguageSetting): voi
       if (value) node.setAttribute(attr, relocalizeUiText(value));
     }
   }
-  for (const node of document.querySelectorAll<HTMLElement>(".git-title[data-i18n-key],.perm-title[data-i18n-key],.tool-status[data-i18n-key],.tool-name[data-i18n-key],.reasoning-head [data-i18n-key],.process-group [data-i18n-key],.tool-section-label[data-i18n-key],.ask-summary [data-i18n-key],.message.error [data-i18n-key],#setup-title[data-i18n-key],#setup-hint[data-i18n-key],#setup-recovery [data-i18n-key]")) {
+  for (const node of document.querySelectorAll<HTMLElement>(".git-title[data-i18n-key],.perm-title[data-i18n-key],.tool-status[data-i18n-key],.tool-name[data-i18n-key],.reasoning-head [data-i18n-key],.process-group [data-i18n-key],.tool-section-label[data-i18n-key],.ask-summary [data-i18n-key],.message.error [data-i18n-key],#setup-title[data-i18n-key],#setup-hint[data-i18n-key],#setup-recovery [data-i18n-key],.math-font-hint[data-i18n-key]")) {
     if (node.closest(".md,.work-note,.message.user,.tool-body,.ask-q,.perm-reason") && !node.classList.contains("tool-section-label") && node.dataset.i18nKey !== "分析图片") continue;
     node.textContent = t(node.dataset.i18nKey!, JSON.parse(node.dataset.i18nValues || "{}"));
   }
@@ -7042,6 +7158,12 @@ window.addEventListener("keydown", (e) => {
 
 window.addEventListener("message", (event) => {
   const msg = event.data;
+  if (msg.type === "view_reset" || (msg.type === "session_ready" && msg.sessionId !== currentSessionId)) {
+    cancelAssistantRender();
+  } else if (msg.type !== "assistant_text_delta") {
+    // Tools, reasoning, history and completion must observe all preceding text.
+    flushAssistantRender();
+  }
   switch (msg.type) {
     case "session_ready":
       hideSetup();
@@ -7366,6 +7488,13 @@ window.addEventListener("message", (event) => {
       break;
     case "ui_language":
       applyInterfaceLanguage(msg.language, msg.setting);
+      break;
+    case "math_fonts":
+      if (msg.mode === "auto" || msg.mode === "on" || msg.mode === "off") mathFontMode = msg.mode;
+      if (msg.status === "absent" || msg.status === "downloading" || msg.status === "ready" || msg.status === "failed" || msg.status === "disabled") mathFontStatus = msg.status;
+      applyMathFontCss(typeof msg.css === "string" ? msg.css : "");
+      if (mathFontStatus === "ready" && !document.getElementById("math-font-faces")) mathFontStatus = "failed";
+      syncMathFontHint();
       break;
     case "composer_chrome":
       if (msg.chrome) applyComposerChrome(msg.chrome);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { ChildProcess } from "child_process";
 import test, { type TestContext } from "node:test";
 import * as fs from "fs";
 import * as path from "path";
@@ -913,7 +914,7 @@ test("session_ready carries the snapshot's builtin and custom slash commands", a
     return { sessions: [], messages: [] };
   };
   try {
-    await client.start({ createNew: true });
+    await state.createSession(true);
     const ready = events.find(event => event.type === "session_ready");
     assert.deepEqual(client.confirmedModel(), { providerId: "test-provider", modelId: "test-model" });
     assert.deepEqual((ready?.data as { slashCommands?: unknown }).slashCommands, [
@@ -921,6 +922,85 @@ test("session_ready carries the snapshot's builtin and custom slash commands", a
       { name: "my-report", description: "Custom user command.", inputHint: "/my-report [args]" },
     ]);
   } finally { client.dispose(); }
+});
+
+function acceptSpawnedSession(state: Internals): void {
+  const coldSnapshot = { session: {}, settings: { model: { available: [] } } };
+  state.sendRequest = async (method: string) => {
+    if (method === "session/create") { state.sessionId = "NEW"; return {}; }
+    if (method === "session/read") return coldSnapshot;
+    if (method === "v4/conversation/subscribe") {
+      state.handleConversationFrame({ topic: "conversation/NEW", subscriptionId: "conv", fromSeq: 0, toSeq: 1,
+        payload: { kind: "snapshot", snapshot: { logEpoch: "epoch", seq: 1, rows: { window: [] } } } });
+      return { ack: { subscriptionId: "conv" } };
+    }
+    if (method === "session/subscribe") return { snapshot: coldSnapshot };
+    return {};
+  };
+}
+
+test("dispose does not signal a child that failed to start", async () => {
+  const { client, state } = fixture();
+  acceptSpawnedSession(state);
+  const kills: Array<NodeJS.Signals | number | undefined> = [];
+  let proc: ChildProcess | null = null;
+  try {
+    await client.start({ createNew: true });
+    proc = (client as unknown as { proc: ChildProcess | null }).proc;
+    assert.ok(proc, "startup must retain the child until dispose");
+    assert.equal(proc.pid, undefined);
+    // A failed spawn still has a live handle. Calling the real kill() here can
+    // signal pid 0 and terminate the test process group.
+    proc.kill = (signal) => {
+      kills.push(signal);
+      return true;
+    };
+    client.dispose();
+    assert.deepEqual(kills, []);
+  } finally {
+    const current = (client as unknown as { proc: ChildProcess | null }).proc ?? proc;
+    if (current) current.kill = () => true;
+    client.dispose();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+});
+
+test("dispose terminates a running app-server", async (t) => {
+  const os = require("os") as typeof import("os");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-client-dispose-"));
+  const script = path.join(root, "stay-alive.js");
+  fs.writeFileSync(script, "setInterval(() => {}, 1000);\n");
+  let client: ZCodeClient | undefined;
+  let proc: ChildProcess | null = null;
+  t.after(() => {
+    const live = proc ?? (client as unknown as { proc?: ChildProcess | null } | undefined)?.proc ?? null;
+    if (live && live.exitCode === null && live.signalCode === null) {
+      try { ChildProcess.prototype.kill.call(live, "SIGKILL"); } catch { /* already exited */ }
+    }
+    client?.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  client = new ZCodeClient({ binaryPath: script, workspacePath: root, onEvent: () => undefined });
+  const state = client as unknown as Internals;
+  acceptSpawnedSession(state);
+  await client.start({ createNew: true });
+  proc = (client as unknown as { proc: ChildProcess | null }).proc;
+  assert.ok(proc?.pid && proc.pid > 0);
+  const signals: Array<NodeJS.Signals | number | undefined> = [];
+  const kill = proc.kill.bind(proc);
+  proc.kill = (signal) => {
+    signals.push(signal);
+    return kill(signal);
+  };
+  client.dispose();
+  assert.deepEqual(signals, ["SIGTERM"]);
+  if (proc.exitCode === null && proc.signalCode === null) {
+    await Promise.race([
+      new Promise<void>((resolve) => proc!.once("exit", resolve)),
+      new Promise<void>((resolve) => setTimeout(resolve, 1000)),
+    ]);
+  }
+  assert.equal(proc.signalCode, "SIGTERM");
 });
 
 test("stopping A leaves B's permission and input requests pending", async () => {

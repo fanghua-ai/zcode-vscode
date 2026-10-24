@@ -2,7 +2,7 @@
   "name": "zcode-desktop-chat",
   "displayName": "ZCode Chat",
   "description": "在 VS Code 右侧边栏里和 ZCode 智能体对话，复用桌面端的登录、模型和会话。Chat with the ZCode agent in the VS Code secondary side bar using the desktop app's account, models, and sessions.",
-  "version": "2.0.2",
+  "version": "2.1.0",
   "publisher": "fanghua",
   "author": "fanghua",
   "license": "MIT",
@@ -537,6 +537,22 @@
             }
           }
         },
+        "zcode.formulaFonts": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ],
+          "enumDescriptions": [
+            "%config.formulaFonts.auto%",
+            "%config.formulaFonts.on%",
+            "%config.formulaFonts.off%"
+          ],
+          "default": "auto",
+          "scope": "application",
+          "description": "%config.formulaFonts.description%"
+        },
         "zcode.language": {
           "type": "string",
           "enum": [
@@ -562,7 +578,8 @@
     "vscode:prepublish": "npm run verify",
     "check": "tsc --noEmit && tsc -p tsconfig.webview.json --noEmit",
     "test": "node scripts/test.mjs",
-    "test:browser": "npm run build && node scripts/browser-smoke.mjs && node scripts/browser-drafts-reload.mjs && node scripts/browser-image-policy.mjs && node scripts/browser-attachments.mjs",
+    "test:sqlite-host": "node scripts/sqlite-host.mjs",
+    "test:browser": "npm run build && node scripts/browser-smoke.mjs && node scripts/browser-drafts-reload.mjs && node scripts/browser-image-policy.mjs && node scripts/browser-attachments.mjs && node scripts/browser-streaming.mjs",
     "build": "node esbuild.mjs --production",
     "watch": "node esbuild.mjs --watch",
     "package": "node scripts/package.mjs",
@@ -576,6 +593,7 @@
     "@types/katex": "^0.16.8",
     "@types/node": "^20.11.0",
     "@types/vscode": "~1.106.0",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.28.2",
     "typescript": "^5.3.0"
@@ -584,7 +602,6 @@
     "dompurify": "^3.4.17",
     "highlight.js": "^11.11.1",
     "katex": "^0.19.0",
-    "marked": "^17.0.4",
-    "node-sqlite3-wasm": "^0.8.60"
+    "marked": "^17.0.4"
   }
 }
