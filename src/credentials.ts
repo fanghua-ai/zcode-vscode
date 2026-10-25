@@ -585,6 +585,54 @@ type CachedPlanToken = {
 // One active account/project per family. Scope includes the OAuth credential so
 // switching accounts or signing in again cannot reuse the previous token.
 const planTokens = new Map<PlanFamily, CachedPlanToken>();
+// Legacy keys have no expiry. Reuse only briefly during startup, and read
+// the current OAuth credential on every call so account changes invalidate it.
+const legacyPlanKeys = new Map<PlanFamily, CachedPlanToken>();
+
+/** A 401 must invalidate OAuth exchanges before either runtime refresh path runs. */
+export function invalidatePlanAuth(apiKey: string): void {
+  for (const cache of [planTokens, legacyPlanKeys]) {
+    for (const [family, entry] of cache) {
+      if (entry.value?.apiKey === apiKey) cache.delete(family);
+    }
+  }
+}
+
+async function resolveLegacyPlanKey(family: PlanFamily, oauth: string, prefer?: OrgProject,
+  rejectedFingerprint?: string): Promise<PlanAuth> {
+  const scope = crypto.createHash("sha256").update(JSON.stringify([
+    zcodeDir(), family, oauth, prefer?.organizationId, prefer?.projectId,
+  ])).digest("hex");
+  let entry = legacyPlanKeys.get(family);
+  if (!entry || entry.scope !== scope) {
+    entry = { scope };
+    legacyPlanKeys.set(family, entry);
+  }
+  if (rejectedFingerprint && entry.value &&
+      crypto.createHash("sha256").update(entry.value.apiKey).digest("hex") === rejectedFingerprint) {
+    entry.value = undefined;
+  }
+  if (entry.value && Date.now() < entry.refreshAt!) {
+    logDebug("Reusing recent plan login", { family, team: !!prefer });
+    return entry.value;
+  }
+  if (entry.pending) return entry.pending;
+  const current = entry;
+  current.pending = (async () => {
+    const authorization = family === "zai" ? `Bearer ${await resolveZaiBizToken(oauth)}` : oauth;
+    const apiKey = await resolveApiKey(family, authorization, prefer);
+    const latest = await readCredentialsWithRetry();
+    if (legacyPlanKeys.get(family) !== current ||
+        latest[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] !== oauth) {
+      throw new Error("project_token_account_changed");
+    }
+    current.value = { apiKey };
+    current.refreshAt = Date.now() + 30_000;
+    return current.value;
+  })();
+  try { return await current.pending; }
+  finally { current.pending = undefined; }
+}
 
 async function resolveProjectToken(
   family: PlanFamily, oauth: string, version: string, prefer?: OrgProject,
@@ -689,10 +737,8 @@ export async function tryPlanOAuth(
       return { ...auth, activeProvider: activeProvider ?? family };
     }
     stage = "exchange_api_key";
-    const authorization =
-      family === "zai" ? `Bearer ${await resolveZaiBizToken(accessToken)}` : accessToken;
-    const apiKey = await resolveApiKey(family, authorization, prefer);
-    return { apiKey, activeProvider: activeProvider ?? family };
+    const auth = await resolveLegacyPlanKey(family, accessToken, prefer, rejectedFingerprint);
+    return { ...auth, activeProvider: activeProvider ?? family };
   } catch (e) {
     logWarn("Plan API key exchange failed", { family, team: !!prefer, stage, reason: /^project_token_[a-z_]+$/.test((e as Error).message) ? (e as Error).message : undefined, code: (e as NodeJS.ErrnoException).code ?? (e as Error).name, status: /\b(?:401|403|429|5\d\d)\b/.exec((e as Error).message ?? "")?.[0] });
     return null;

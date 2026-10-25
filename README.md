@@ -220,6 +220,7 @@ macOS 可再查 `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`。Win
 |------------|----------|------|
 | 一直「连接中」或「读取登录…」然后失败 | 找不到 `zcode.cjs`，或 app-server 起不来 | 看日志里 `Starting app-server` 的 `cmd` / `args`；确认 `zcode.cjs` 存在，`cmd` 是 VS Code 的运行时 |
 | 连接最终成功，但首次等待很长 | 登录、会话恢复或共享扩展宿主阻塞 | 对照 `session timing`；若 `hostEventLoopDelayMaxMs` 达到数千毫秒，可尝试下面的独立宿主设置 |
+| Windows 上长时间未启动后，首次恢复会话要等几十秒；短时间内重开很快 | Microsoft Defender 实时扫描 ZCode 服务端同步读取的插件文件 | 恢复超过 20 秒时扩展会提示一次，可复制排除命令。如自行权衡后需要处理，在管理员 PowerShell 中排除 `<ZCode 安装目录>\resources\glm\packages` 和 `%USERPROFILE%\.zcode\cli\plugins`，不要排除 `Code.exe`；用 `Remove-MpPreference -ExclusionPath` 撤销 |
 | `ZCode credentials not found` | 没有 `~/.zcode/v2/credentials.json` | 打开桌面端登录后再 Reload |
 | `ZCode desktop data not found` | 没有 `~/.zcode/v2` | 先安装并登录桌面端 |
 | `Could not reuse the BigModel team plan` / `coding-plan login` | 桌面 OAuth 过期，或当前选的项目换了 | 桌面端保持登录并选对项目，扩展里「重新读取登录」 |
@@ -471,6 +472,7 @@ Error cards provide recovery steps and direct actions for models, connections an
 | What you see | Usual cause | What to do |
 |--------------|-------------|------------|
 | Stays on “连接中” or “读取登录…” and then fails | `zcode.cjs` was not found, or app-server did not start | Check `cmd` / `args` on `Starting app-server` in the log; confirm `zcode.cjs` exists and `cmd` is the VS Code runtime |
+| On Windows, the first chat restore after a long break takes tens of seconds, while reopening soon afterwards is fast | Microsoft Defender scans the plugin files that the ZCode server reads synchronously | The extension shows a one-time notice when a restore takes over 20 seconds and can copy an exclusion command. If you accept the trade-off, exclude `<ZCode install folder>\resources\glm\packages` and `%USERPROFILE%\.zcode\cli\plugins` in an administrator PowerShell, never `Code.exe`; undo with `Remove-MpPreference -ExclusionPath` |
 | `ZCode credentials not found` | `~/.zcode/v2/credentials.json` is missing | Sign in with the desktop app, then Reload |
 | `ZCode desktop data not found` | `~/.zcode/v2` is missing | Install the desktop app and sign in |
 | `Could not reuse the BigModel team plan` / `coding-plan login` | Desktop OAuth expired, or the selected project changed | Stay signed in on the desktop and select the right project, then “重新读取登录” in the extension |

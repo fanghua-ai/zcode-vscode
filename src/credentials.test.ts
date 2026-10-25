@@ -6,6 +6,7 @@ import * as crypto from "crypto";
 import { type V2Provider, usesProjectTokens, tryPlanOAuth, fetchPlanQuota, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey } from "./credentials";
 import { readDesktopJsonWithRetry } from "./desktopJson";
 import { mergeDesktopApiProviders, syncCliConfig, resolveProviderRequestAuth, resolveRuntime, resolveRuntimeForSession } from "./desktop";
+import { ZCodeClient } from "./zcodeClient";
 
 const os = require("os") as typeof import("os");
 const writableFs = require("fs") as typeof import("fs");
@@ -425,6 +426,169 @@ function mockPlanQuotaApi(t: TestContext, issueToken?: () => unknown, listedKeys
   }) as unknown as typeof https.request;
   t.after(() => { https.get = originalGet; https.request = originalRequest; });
   return requests;
+}
+
+for (const appVersion of ["3.14.4", "3.16.2"]) {
+for (const family of ["bigmodel", "zai"] as const) {
+ for (const teamPlan of [false, true]) {
+  for (const route of ["headers", "align"] as const) {
+   for (const failed of [false, true]) {
+    test(`${appVersion} ${family} ${teamPlan ? "team" : "personal"} 401 invalidates OAuth cache before ${route}, refresh fails=${failed}`, async t => {
+      const dir = fixture(t);
+      const kind = teamPlan ? "team-coding-plan" : "individual-coding-plan";
+      const providerId = `account:${family}-${kind}`;
+      const team = teamPlan ? { organizationId: "org-current", projectId: "project-current" } : undefined;
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ [`oauth:${family}:access_token`]: "TEST-OAUTH" }));
+      fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: family,
+        modelProviderFamilyModes: { [family]: "oauth" },
+        providerFamilyConnectionSelections: { [family]: { kind, ...team } } }));
+      fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+        [providerId]: { name: "Fake", kind: "openai-compatible", options: { apiKey: "TEST-CONFIG-KEY", baseURL: "http://127.0.0.1:9" }, models: { test: {} } },
+      } }));
+      fs.writeFileSync(path.join(dir, "provider_config.json"), JSON.stringify({ config: {
+        providerConfigRules: { providerRules: [] }, modelConfigRules: { providerModelRules: [], manualProviderModelRules: [] },
+      } }));
+      const keys = [{ name: teamPlan ? "zcode-team-api-key" : "zcode-api-key", apiKey: "TEST-OLD-KEY-ID", keyType: teamPlan ? 2 : 1 }];
+      let issued = 0;
+      const requests = mockPlanQuotaApi(t, usesProjectTokens(appVersion) ? () => ({ code: 200, data: {
+        accessToken: `TEST-PAT-${++issued}`, tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
+      } }) : undefined, keys);
+      const initial = await resolveRuntime({ preferredProviderId: providerId, preferredModelId: "test", appVersion });
+      assert.ok(initial.ok && initial.runtime);
+      const oldKey = initial.runtime.apiKey;
+      assert.equal(requests.filter(r => r.path.endsWith("/api_keys")).length, 1);
+      keys[0].apiKey = "TEST-NEW-KEY-ID";
+      const https = require("https") as typeof import("https");
+      const get = https.get;
+      if (failed) https.get = (() => {
+        const request = new (require("events").EventEmitter)(); request.destroy = () => {};
+        process.nextTick(() => request.emit("error", new Error("TEST-OFFLINE")));
+        return request;
+      }) as typeof https.get;
+      const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", runtime: initial.runtime,
+        resolveSessionRuntime: model => resolveRuntimeForSession(model, appVersion), onEvent: () => {} });
+      const state = client as unknown as {
+        loginStale: boolean; sessionRuntime: { apiKey: string } | null; sessionId: string | null; desktopAppVersion: string;
+        pending: Map<number, unknown>; write: (reply: unknown) => void; handleLine: (line: string) => void;
+        handleProviderRuntimeHeaders: (id: number, params: unknown) => Promise<void>;
+        alignSessionRuntime: (model: { providerId: string; modelId: string }) => Promise<void>;
+      };
+      const replies: Array<{ result: { headersApplied: boolean; requestAuth?: { apiKey: string } } }> = [];
+      state.write = reply => replies.push(reply as typeof replies[number]);
+      state.sessionId = "A";
+      state.desktopAppVersion = appVersion;
+      state.pending.set(1, { resolve() {}, reject() {} });
+      try {
+        state.handleLine(JSON.stringify({ id: 1, error: { code: 401, message: "Unauthorized" } }));
+        assert.equal(state.loginStale, true);
+        if (route === "headers") {
+          await state.handleProviderRuntimeHeaders(2, { providerId });
+          assert.equal(replies[0].result.headersApplied, !failed);
+          assert.notEqual(replies[0].result.requestAuth?.apiKey, oldKey);
+        } else {
+          await state.alignSessionRuntime({ providerId, modelId: "test" });
+          assert.notEqual(state.sessionRuntime?.apiKey, oldKey);
+          assert.equal(state.sessionRuntime === null, failed);
+        }
+        assert.equal(state.loginStale, failed);
+        if (!failed) assert.equal(requests.filter(r => r.path.endsWith("/api_keys")).length, 2);
+      } finally { https.get = get; client.dispose(); }
+    });
+   }
+  }
+ }
+}
+}
+
+for (const teamPlan of [false, true]) {
+test(`legacy ${teamPlan ? "team" : "personal"} login never falls back to a rejected key or installs a result after account change`, async t => {
+  const dir = fixture(t), file = path.join(dir, "credentials.json");
+  fs.writeFileSync(file, JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
+  mockPlanQuotaApi(t);
+  const https = require("https") as typeof import("https");
+  const get = https.get;
+  let mode = "normal";
+  https.get = ((...args: unknown[]) => {
+    if (String(args[0]).endsWith("/api_keys")) {
+      if (mode === "fail") {
+        const request = new (require("events").EventEmitter)();
+        request.destroy = () => {};
+        process.nextTick(() => request.emit("error", new Error("TEST-OFFLINE")));
+        return request;
+      }
+      if (mode === "switch") fs.writeFileSync(file, JSON.stringify({ "oauth:bigmodel:access_token": "TEST-NEW-ACCOUNT" }));
+    }
+    return (get as unknown as (...values: unknown[]) => unknown)(...args);
+  }) as typeof https.get;
+  const team = teamPlan ? { organizationId: "org-current", projectId: "project-current" } : undefined;
+  const resolve = (fingerprint?: string) => tryPlanOAuth("bigmodel", team, "3.14.4", fingerprint);
+  try {
+    const first = await resolve();
+    assert.ok(first?.apiKey);
+    mode = "fail";
+    assert.equal(await resolve(crypto.createHash("sha256").update(first.apiKey).digest("hex")), null);
+    assert.equal(await resolve(), null, "failed refresh must not revive the rejected cache");
+    mode = "switch";
+    assert.equal(await resolve(), null, "a pending result belongs to the account that started it");
+    mode = "normal";
+    assert.ok((await resolve())?.apiKey, "the new account can retry normally");
+  } finally { https.get = get; }
+});
+}
+
+for (const family of ["bigmodel", "zai"] as const) {
+ for (const teamPlan of [false, true]) {
+  test(`${family} legacy ${teamPlan ? "team" : "personal"} login shares startup exchanges and invalidates on expiry, rejection and account changes`, async t => {
+    const dir = fixture(t), file = path.join(dir, "credentials.json");
+    const credentials = { [`oauth:${family}:access_token`]: "TEST-OAUTH" };
+    fs.writeFileSync(file, JSON.stringify(credentials));
+    const requests = mockPlanQuotaApi(t);
+    const team = teamPlan ? { organizationId: "org-current", projectId: "project-current" } : undefined;
+    const resolve = (rejected?: string) => tryPlanOAuth(family, team, "3.14.4", rejected);
+    const lists = () => requests.filter(r => r.path.endsWith("/api_keys")).length;
+    const [first, concurrent] = await Promise.all([resolve(), resolve()]);
+    assert.ok(first?.apiKey);
+    assert.equal(first.apiKey, concurrent?.apiKey);
+    assert.equal(lists(), 1);
+    await fetchPlanQuota({ family, kind: teamPlan ? "team-coding-plan" : "individual-coding-plan", team }, "3.14.4");
+    assert.equal(lists(), 1, "quota must reuse the same startup login");
+    const originalNow = Date.now;
+    let elapsed = 0;
+    Date.now = () => originalNow() + elapsed;
+    t.after(() => { Date.now = originalNow; });
+    elapsed = 31_000;
+    await resolve();
+    assert.equal(lists(), 2, "legacy keys are revalidated after the short startup window");
+    await resolve(crypto.createHash("sha256").update(first.apiKey).digest("hex"));
+    assert.equal(lists(), 3, "a rejected key must not be reused");
+    fs.writeFileSync(file, JSON.stringify({ [`oauth:${family}:access_token`]: "TEST-NEW-LOGIN" }));
+    await resolve();
+    assert.equal(lists(), 4);
+    await tryPlanOAuth(family, { organizationId: "org-current", projectId: "project-other" }, "3.14.4");
+    assert.equal(lists(), 5, "another project must not reuse the first project's login");
+    fs.writeFileSync(file, "{}");
+    assert.equal(await resolve(), null, "signing out must not reuse cached credentials");
+  });
+ }
+}
+
+for (const family of ["bigmodel", "zai"] as const) {
+  test(`${family} Start Plan OAuth fallback shares exchanges but a newly stored key takes precedence`, async t => {
+    const dir = fixture(t), file = path.join(dir, "credentials.json");
+    const credentials = { [`oauth:${family}:access_token`]: "TEST-OAUTH" };
+    fs.writeFileSync(file, JSON.stringify(credentials));
+    const requests = mockPlanQuotaApi(t);
+    const providerId = `account:${family}-start-plan`;
+    const resolve = () => resolveProviderRequestAuth(providerId, "3.16.2");
+    const [first, concurrent] = await Promise.all([resolve(), resolve()]);
+    assert.ok(first?.apiKey);
+    assert.equal(concurrent?.apiKey, first.apiKey);
+    assert.equal(requests.filter(r => r.path.endsWith("/api_keys")).length, 1);
+    fs.writeFileSync(file, JSON.stringify({ ...credentials,
+      [`account-provider:coding-plan:${providerId}:account:test:api-key`]: "TEST-STORED-KEY" }));
+    assert.equal((await resolve())?.apiKey, "TEST-STORED-KEY", "cached OAuth must not hide a new desktop key");
+    assert.equal(requests.filter(r => r.path.endsWith("/api_keys")).length, 1);
+  });
 }
 
 for (const family of ["bigmodel", "zai"] as const) {

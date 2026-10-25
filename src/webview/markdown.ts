@@ -50,11 +50,13 @@ marked.use({
       return cjkMaskedSrc ? defaultEmStrong.call(this, src, cjkMaskedSrc, prevChar) : undefined;
     },
     del(src, maskedSrc, prevChar) {
-      // Marked accepts single-tilde strikethrough. In prose like
-      // `0.15~3.25 ... 2.0~4.0`, those two range separators otherwise pair
-      // across an entire sentence. Consume only digit~digit as plain text;
-      // leave genuine ~~strikethrough~~ and other Markdown untouched.
-      if (prevChar && /^\d$/u.test(prevChar) && /^~\d/u.test(src)) {
+      // A single tilde beside a number is an approximation/range marker.
+      // Consume it before Marked can pair it across a sentence. Explicit
+      // double-tilde strikethrough (including ~~123~~) keeps normal semantics.
+      const singleTilde = src.startsWith("~") && !src.startsWith("~~");
+      const digitBefore = !!prevChar && /^\d$/u.test(prevChar);
+      const numberAfter = /^~[^\S\r\n]*[+−-]?(?:\d|\.\d)/u.test(src);
+      if (singleTilde && (digitBefore || numberAfter)) {
         // Marked types tokenizer.del as returning only Del tokens, while its
         // lexer accepts any inline token from an override at this position.
         return { type: "text", raw: "~", text: "~" } as unknown as NonNullable<ReturnType<typeof defaultDel>>;

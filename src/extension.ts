@@ -43,6 +43,7 @@ import {
   loadMathFontPack, mathFontDataHref, mathFontFaceCss, mathFontPackReady,
 } from "./mathFonts";
 import { StartupTiming } from "./startupTiming";
+import { defenderExclusionCommand, isSlowWindowsStartup, pluginScanFolders } from "./startupSlowness";
 import { SendTiming } from "./sendTiming";
 import { locateAppServer } from "./serverPath";
 import { materializeGitDiff, type StructuredPatch } from "./conversation";
@@ -72,6 +73,7 @@ const LAST_SESSION_KEY = "zcode.lastSessionId";
 const LAST_BINARY_KEY = "zcode.lastBinaryPath";
 const SESSION_MODELS_KEY = "zcode.sessionModels";
 const NEW_SESSION_DEFAULTS_KEY = "newSessionDefaults";
+const DEFENDER_NOTICE_KEY = "zcode.defenderNoticeDismissed";
 
 function configuredQuotaAdapters(): QuotaAdapterConfig[] {
   const raw = vscode.workspace.getConfiguration("zcode").get<unknown>("quotaAdapters", []);
@@ -282,6 +284,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private mathFontCssCache?: { key: string; css: string };
   private mathFontReported = "";
   private timing: StartupTiming | null = null;
+  private appServerPath = "";
+  private defenderNoticeShown = false;
   private readonly sendTiming = new SendTiming(data => logInfo("send timing", data));
   private webviewEpoch = 0;
   private pushedEpoch = -1;
@@ -539,9 +543,46 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   private finishTiming(timing: StartupTiming): void {
     timing.dispose();
-    logInfo("session timing", timing.snapshot());
+    const snapshot = timing.snapshot();
+    logInfo("session timing", snapshot);
     if (this.timing === timing) this.timing = null;
     this.client?.clearTiming(timing);
+    if (isSlowWindowsStartup(process.platform, snapshot)) {
+      void this.offerDefenderExclusion(Number(snapshot["session/resume"]));
+    }
+  }
+
+  /** Explain the measured Defender cost of a cold plugin scan; the user decides. */
+  private async offerDefenderExclusion(resumeMs: number): Promise<void> {
+    if (this.defenderNoticeShown || this.context.globalState.get<boolean>(DEFENDER_NOTICE_KEY)) return;
+    const folders = pluginScanFolders(this.appServerPath, os.homedir(), fs.existsSync);
+    if (!folders.length) return;
+    this.defenderNoticeShown = true;
+    const details = t("查看原因和处理方法");
+    const never = t("不再提示");
+    const choice = await vscode.window.showWarningMessage(
+      t("本次启动恢复会话用了 {0} 秒，Windows 上常见原因是 Microsoft Defender 实时扫描 ZCode 插件文件。",
+        { 0: Math.round(resumeMs / 1000) }),
+      details, never);
+    if (choice === never) {
+      await this.context.globalState.update(DEFENDER_NOTICE_KEY, true);
+      return;
+    }
+    if (choice !== details) return;
+    const copy = t("复制排除命令");
+    const picked = await vscode.window.showWarningMessage(
+      t("启动变慢的原因"),
+      {
+        modal: true,
+        detail: t("长时间未启动后，ZCode 服务端恢复会话前会同步读取插件文件。Microsoft Defender 会在首次打开时逐个扫描这些文件，可能耗时数十秒；短时间内重新打开会命中扫描缓存，所以通常只有几秒。\n\n可选处理：在管理员 PowerShell 中把下列目录加入 Defender 排除项：\n{0}\n\n排除后这些目录不再被实时扫描，请自行权衡。不要排除 Code.exe 进程。复制的命令包含撤销方法。",
+          { 0: folders.join("\n") }),
+      },
+      copy);
+    if (picked !== copy) return;
+    await vscode.env.clipboard.writeText(defenderExclusionCommand(folders,
+      t("在管理员 PowerShell 中运行；只排除 ZCode 插件目录，不要排除 Code.exe。"),
+      t("如需撤销，去掉下一行开头的 # 后运行：")));
+    void vscode.window.showInformationMessage(t("已复制。请在管理员 PowerShell 中运行，然后重启 VS Code。"));
   }
 
   private paintTitle(title?: string): void {
@@ -1697,6 +1738,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     if (sessionId && client.isGenerating()) {
       this.pendingModel = { sessionId, providerId, modelId };
       this.currentModel = { providerId, modelId };
+      client.stageSessionModel(this.currentModel);
       this.post({
         type: "models",
         current: this.currentModel,
@@ -1847,6 +1889,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       binaryPath = await locateAppServer(config.get<string>("binaryPath") || "", {
         preferred: this.context.globalState.get<string>(LAST_BINARY_KEY) || "",
       });
+      this.appServerPath = binaryPath;
       timing.add("locateBinary", Date.now() - locateStarted);
     } catch (e) {
       timing.add("locateBinary", Date.now() - locateStarted);
@@ -2124,7 +2167,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.postHistory(history, ticket);
     }
     client.endViewChange();
+    const indexStarted = Date.now();
     this.indexCurrentSession();
+    this.timing?.add("currentTaskIndex", Date.now() - indexStarted);
     await this.refreshSessions(false, opts?.startupList);
     if (!isCurrent()) return;
     const current = this.sessions.find((s) => s.sessionId === sessionId);
@@ -2144,6 +2189,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     try {
       const serverList = startupList ?? await client.listSessions(true);
       if (client !== this.client || ticket !== this.switchTicket) return;
+      const indexStarted = Date.now();
       const archiveTimes = loadSessionArchiveTimes(serverList.map(s => s.sessionId));
       const listed = serverList.map(s => archiveTimes.has(s.sessionId)
         ? { ...s, archivedAt: archiveTimes.get(s.sessionId) || undefined }
@@ -2177,6 +2223,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         currentId: this.client.currentSessionId,
         includeArchived,
       });
+      let indexed = 0;
       for (const s of listed) {
         const ws = this.workspacePath || s.workspacePath || "";
         if (!ws || deleted.has(s.sessionId)) continue;
@@ -2197,8 +2244,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
               ? this.client.currentMode()
               : undefined,
         });
+        indexed++;
       }
       // A server list may be paginated. Never delete desktop tasks absent from it.
+      this.timing?.add("sessionListIndex", Date.now() - indexStarted);
+      this.timing?.addCount("sessionListIndexCount", indexed);
     } catch (e) {
       logWarn("listSessions failed", e);
     }
@@ -2330,7 +2380,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const hasLiveCatalog = !!client && this.livePicker?.client === client && this.livePicker.sessionId === sessionId;
     if (client && sessionId && (!hasLiveCatalog || !hasFreshCurrent)) {
       try {
-        const live = await client.readAvailableModels();
+        const live = await client.readAvailableModels(!forceRead);
         if (client !== this.client || sessionId !== client.currentSessionId || ticket !== this.switchTicket) return;
         this.livePicker = {
           client,

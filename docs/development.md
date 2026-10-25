@@ -68,10 +68,20 @@ SQLite CI 分别在 Linux x64、Windows x64、macOS ARM64 和 Intel 上运行最
 - `metadataReadyMs`：本次流程的列表、模型与控制项发布完成。
 - `spawnToFirstRpc`、`session/resume`、`session/subscribe`、`conversationSubscribe`：定位启动、恢复和订阅的主要等待。
 - `sessionListCount`、`historyPosts`、`loginReuse`：核对重复查询、历史重画与登录复用次数。
+- `currentTaskIndex`、`sessionListIndex`／`sessionListIndexCount`：当前任务同步索引，以及列表返回后归档／标题处理、页面列表发布和逐项索引的耗时与条目数；不含列表网络等待。
+- `modelCatalogSnapshotReuse`：首轮模型列表是否复用了已收到的会话快照；显式刷新仍查询后端。额度请求在首次对话订阅完成后启动。
 - `questionIndex`、`questionIndexCacheHits`：问题导航索引的数据库查询耗时与缓存命中次数；索引只在送达页面的提问行变化时重新读取。
 - `resumeSnapshotReuse`／`resumeSnapshotRefresh`：恢复快照是否复用。订阅仍重放交互事件；事件序号或状态修订变化时，读取最新的单条消息快照，旧协议缺少必要字段则保留完整订阅快照。
 
 比较同一运行时、工作区和会话的冷／热启动，多次取样。隔离假模型测试验证流程正确性，不能替代真实账号的网络耗时；不要为了采样操作维护者的真实会话或凭据。历史去重需要核对发送页面的副本版本，不能只按会话 ID 去重；失效密钥刷新失败时不得回退旧缓存。
+
+启动时每次 `session/resume` 等待 90 秒，用于覆盖已观测到的约 45 秒冷启动插件解析。超时后直接尝试另一个会话，不再向仍在执行第一次恢复的服务端重发请求。恢复请求尚未返回时，并行的 `session/list` 也等待 90 秒。普通切换仍使用 30 秒恢复超时和 20 秒列表超时。客户端超时不会取消服务端已经开始的恢复，因此超时后仍按 90 秒等待列表，直到收到迟到的恢复回复或再过 90 秒。
+
+Windows 冷启动实测：服务端恢复前会同步读取并校验 `resources/glm/packages` 下的官方插件文件。Defender 性能记录显示，四个文档类插件的 `dist/ui/bundle-0.txt` 单次实时扫描合计约 20 秒。排除该目录和 `~/.zcode/cli/plugins` 后，冷启动降到几秒。启动恢复 `session/resume` 达到 20 秒时，扩展每个窗口最多提示一次。只提供说明和可复制的 PowerShell 命令（含撤销行），不代用户修改安全设置；「不再提示」写入 globalState。
+
+旧式套餐 API Key 的 OAuth 换证在内存中合并并发请求，并最多复用 30 秒以覆盖启动、会话模型检查与首次额度读取，适用于团队套餐，以及个人套餐／Start Plan 缺少已保存 Key 时的 OAuth 回退。每次调用仍读取当前 OAuth 凭据，账号／项目变化或请求明确拒绝的 Key 会失效；失败不回退旧 Key，不落盘。新版个人／团队项目 Token 继续使用自身有效期与提前刷新规则。桌面已保存的个人 Key、自定义 API 和 Start Plan 额度用的 JWT 按原逻辑本地读取，不为这些读取额外增加换证请求或缓存。
+
+实际 RPC 返回 401 时，会立即移除当前凭据对应的旧式套餐 Key／项目 Token 缓存；请求认证和会话模型重新对齐都必须重新获取凭据。回归测试走真实错误处理入口及认证解析链路，不只直接向缓存传入拒绝指纹。
 
 连接慢时还可查看 `runtimePreferencesRequestedMs`（启动后的首次运行偏好请求）、`runtimeHeadersMs` 和认证缓存命中次数，以及 `resumeReplyBytes`／`resumeReplyParseMs`／`notificationHandlingMs`。这些只记录数字，不记录正文或凭据；异步回调保留原计时归属。后端日志位于 CLI 的 `log/zcode-YYYY-MM-DD.jsonl`，以会话归属和 UTC 时间与扩展日志对齐；`zcode_protocol.session.resume_completed` 是内部恢复结束，不能等同整个 `session/resume` RPC 结束。MCP 初始化可能并行，不能直接把其耗时归入恢复。
 

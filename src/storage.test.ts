@@ -255,6 +255,7 @@ test("a model chosen during a reply applies on the next question", async () => {
     client: {
       currentSessionId: string;
       isGenerating: () => boolean;
+      stageSessionModel: (model: { providerId: string; modelId: string }) => void;
       setModel: (providerId: string, modelId: string) => Promise<void>;
       sendMessage: () => Promise<void>;
     };
@@ -268,6 +269,7 @@ test("a model chosen during a reply applies on the next question", async () => {
   state.client = {
     currentSessionId: "A",
     isGenerating: () => generating,
+    stageSessionModel: () => {},
     setModel: async (providerId, modelId) => { commands.push(`model:${providerId}/${modelId}`); },
     sendMessage: async () => { commands.push("send"); },
   };

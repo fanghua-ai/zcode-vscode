@@ -1590,12 +1590,12 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
  });
  await test('signed numeric tilde ranges stay literal in streamed and restored replies',()=>{
   reset();type('SIGNED_RANGES');sendBtn.click();
-  const ranges='范围 −3.2~−0.8米；第二段 -4.5~-2.2米；进度 0~+2.50%；小数 0~.5 与 1~.8。';
-  const text=ranges+'\n\n~~过期说明~~ 和 ~旧说明~\n\n`-2~-1`\n\n```text\n0~+1\n```';
+  const ranges='约 ~2秒，另一次 ~3秒；区间 2~3秒；约 ~ 2秒 和 ~−0.5秒、~+.5秒。范围 −3.2~−0.8米；第二段 -4.5~-2.2米；进度 0~+2.50%；小数 0~.5 与 1~.8。几百毫秒~3 秒，总启动则是 4~6 秒。';
+  const text=ranges+'\n\n~~过期说明~~ 和 ~旧说明~；~~123~~、2~~old~~、~~2秒~~\n\n`-2~-1`\n\n```text\n0~+1\n```';
   const checkReply=()=>{
    const prose=messages.querySelector('.message.assistant .md');
    check(prose?.textContent.includes(ranges),'signed range text changed');
-   check([...prose.querySelectorAll('del')].map(node=>node.textContent).join('|')==='过期说明|旧说明','signed ranges became strikethrough or intentional strikethrough broke');
+   check([...prose.querySelectorAll('del')].map(node=>node.textContent).join('|')==='过期说明|旧说明|123|old|2秒','signed ranges became strikethrough or intentional strikethrough broke');
    check([...prose.querySelectorAll('code')].some(node=>node.textContent==='-2~-1'),'inline code changed');
    check(prose.querySelector('pre code')?.textContent.trim()==='0~+1','fenced code changed');
   };
@@ -1857,6 +1857,21 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
     check((getComputedStyle(pop).backdropFilter||'').includes('blur'), 'option menu is not frosted');
     pop.querySelector('.overlay-item').click();
     check(!pop.classList.contains('open'), 'menu stayed open after a choice');
+
+    const current = {providerId:'vendor',modelId:'GLM-5.3'};
+    const many = Array.from({length: 40}, (_, index) => ({
+      providerId: index === 20 ? current.providerId : `vendor-${index}`,
+      modelId: index === 20 ? current.modelId : `model-${String(index + 1).padStart(2, '0')}`,
+      label: index === 20 ? current.modelId : `model-${String(index + 1).padStart(2, '0')}`,
+      hasKey: true
+    }));
+    document.getElementById('model-chip').click();
+    emit({type:'models', current, available: many});
+    const active = pop.querySelector('.overlay-item.active');
+    check(active && active.textContent.includes('GLM-5.3'), 'current model is not marked active');
+    check(active && Math.abs(active.getBoundingClientRect().bottom - pop.getBoundingClientRect().bottom) < 2,
+      'model picker did not reveal the current choice');
+    document.body.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
     document.getElementById('btn-settings').click();
     const settings=document.getElementById('settings-menu');
     check(!settings.hidden && (getComputedStyle(settings).backdropFilter||'').includes('blur'), 'settings menu is not frosted');
@@ -2380,6 +2395,16 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(document.getElementById('thought-chip').getAttribute('aria-label').includes('Low')||document.getElementById('thought-chip').getAttribute('aria-label').includes('低'),'reasoning rollback did not restore the confirmed choice');
   document.getElementById('plan-indicator').click();const request=sent.filter(item=>item.type==='setMode').at(-1);check(request?.mode==='build'&&request.sessionId==='A'&&request.viewGen===gen,'leaving plan used an unconfirmed permission or lost ownership');
  });
+await test('selected reply text falls back to the extension clipboard',async()=>{
+ reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'copy-q',role:'user',text:'Question'},{id:'copy-a',role:'assistant',text:'Selected answer'}]});
+ const prose=messages.querySelector('.message.assistant .md');
+ const range=document.createRange();range.selectNodeContents(prose);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);
+ navigator.clipboard.writeText=()=>Promise.resolve();
+ document.dispatchEvent(new Event('copy'));
+ const copied=sent.filter(item=>item.type==='copy').at(-1);check(copied?.text==='Selected answer','selected text did not reach the extension clipboard');
+ document.querySelector('#input').value='Composer text';document.querySelector('#input').dispatchEvent(new Event('copy'));
+ check(sent.filter(item=>item.type==='copy').at(-1)===copied,'composer copy was redirected');
+});
  await new Promise(r=>setTimeout(r,30));
  clearInterval(window.auditFrameKeepAlive);
  const pre=document.createElement('pre');pre.id='audit-results';pre.textContent=JSON.stringify({tests,errors:window.browserErrors || []});document.body.appendChild(pre);if(tests.some(t=>!t.pass)) document.body.setAttribute('data-smoke','failed');

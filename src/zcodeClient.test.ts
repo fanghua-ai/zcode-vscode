@@ -33,7 +33,7 @@ interface Internals {
   historyCache: { sessionId: string; items: HistoryItem[] } | null;
   pendingPermissions: Map<string, PermissionRequest>;
   pendingUserInputs: Map<string, UserInputRequest>;
-  sendRequest: (method: string, params?: unknown) => Promise<unknown>;
+  sendRequest: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
   write: (message: unknown) => void;
   afterSessionAttached: () => Promise<void>;
   adoptResumedModel: () => Promise<void>;
@@ -329,6 +329,112 @@ test("configured provider quota is used by exact provider id and falls back to Z
   assert.deepEqual(customCalls, ["private-provider", "private-provider", "another-provider"]);
   assert.equal(planCalls, 2);
   client.dispose();
+});
+
+test("startup waits once for a cold plugin scan and does not queue another resume", async () => {
+  const { client, state } = fixture();
+  const resumed: string[] = [];
+  const timeouts: number[] = [];
+  client.listSessions = async () => [
+    { sessionId: "REMEMBERED", title: "remembered", updatedAt: 3 },
+    { sessionId: "OTHER", title: "other", updatedAt: 2 },
+  ];
+  client.resumeSession = async (id: string, _known?: unknown, timeoutMs = 30000) => {
+    resumed.push(id);
+    timeouts.push(timeoutMs);
+    if (id === "REMEMBERED") throw new Error(`Request session/resume timed out after ${timeoutMs}ms`);
+    state.sessionId = id;
+  };
+  await state.openStartupSession({
+    chooseResume: (listed, rejected) => rejected.has("REMEMBERED")
+      ? listed.find((session) => session.sessionId === "OTHER")?.sessionId
+      : "REMEMBERED",
+  });
+  assert.deepEqual(resumed, ["REMEMBERED", "OTHER"]);
+  assert.deepEqual(timeouts, [90000, 90000]);
+  assert.equal(state.sessionId, "OTHER");
+});
+
+test("a session list waits out an in-flight resume before using its normal deadline", async () => {
+  const { client, state } = fixture();
+  const resume = deferred<unknown>();
+  const methods: string[] = [];
+  const timeouts: number[] = [];
+  state.afterSessionAttached = async () => {};
+  state.adoptResumedModel = async () => {};
+  state.sendRequest = async (method, _params, timeoutMs) => {
+    methods.push(method);
+    if (method === "session/list") timeouts.push(timeoutMs ?? 0);
+    if (method === "session/resume") return resume.promise;
+    return { sessions: [] };
+  };
+  const restoring = client.resumeSession("B", { sessionId: "B", title: "B", updatedAt: 1 });
+  for (let i = 0; i < 20 && !methods.includes("session/resume"); i++) await tick();
+  await client.listSessions();
+  assert.deepEqual(timeouts, [90000]);
+  resume.resolve({});
+  await restoring;
+  timeouts.length = 0;
+  await client.listSessions();
+  assert.deepEqual(timeouts, [20000]);
+  client.dispose();
+});
+
+test("a timed-out resume keeps later session lists waiting until the server replies", async () => {
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", onEvent: () => {} });
+  const state = client as unknown as {
+    write: (msg: { id: number; method: string; params?: { timeout?: number } }) => void;
+    sendRequest: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
+    handleLine: (line: string) => void;
+  };
+  const written: Array<{ id: number; method: string }> = [];
+  const listTimeouts: number[] = [];
+  const sendRequest = state.sendRequest.bind(client);
+  state.write = (msg) => { written.push(msg); };
+  try {
+    await assert.rejects(sendRequest("session/resume", { sessionId: "A" }, 5), /timed out after 5ms/);
+    state.sendRequest = async (method, _params, timeoutMs) => {
+      if (method === "session/list") listTimeouts.push(timeoutMs ?? 0);
+      return { sessions: [] };
+    };
+    await client.listSessions();
+    // A late reply for the abandoned id means the server queue has moved on.
+    state.handleLine(JSON.stringify({ id: written[0].id, result: {} }));
+    await client.listSessions();
+    assert.deepEqual(listTimeouts, [90000, 20000]);
+  } finally {
+    client.dispose();
+  }
+});
+
+test("a read during resume does not query a session the server has not activated", async () => {
+  const { client, state } = fixture();
+  const resume = deferred<unknown>();
+  const methods: string[] = [];
+  state.afterSessionAttached = async () => {};
+  state.adoptResumedModel = async () => {};
+  state.sendRequest = async (method) => {
+    methods.push(method);
+    if (method === "session/resume") return resume.promise;
+    if (method === "session/list") return { sessions: [] };
+    return {};
+  };
+  const switching = client.switchSession("B");
+  for (let i = 0; i < 10 && !methods.includes("session/resume"); i++) await tick();
+  await client.emitSessionControls();
+  assert.equal(methods.includes("session/read"), false);
+  resume.resolve({});
+  await switching;
+  methods.length = 0;
+  state.sendRequest = async (method) => {
+    methods.push(method);
+    return {
+      session: { model: { providerId: "p", modelId: "m" } },
+      settings: { mode: { current: "build" }, permission: { mode: "build" }, thoughtLevel: { enabled: false } },
+    };
+  };
+  await client.emitSessionControls();
+  assert.ok(methods.includes("session/read"));
 });
 
 test("startup follows the filtered choice and does not resume a stale first row", async () => {
@@ -1426,6 +1532,52 @@ test("fresh snapshot settings skip another session read", async () => {
   assert.equal(reads, 0);
   assert.equal(state.lastControls.mode, "build");
   client.dispose();
+});
+
+test("startup consumes an explicit model catalog once and never reuses it across session generations", async () => {
+  const { client, state } = fixture();
+  const internal = client as unknown as { noteSnapshotCompleteness: (snapshot: unknown) => void };
+  let reads = 0;
+  state.sendRequest = async () => { reads++; return { settings: { model: { available: [] } } }; };
+  const snapshot = { session: { model: { providerId: "test", modelId: "one" } },
+    settings: { model: { available: [{ ref: { providerId: "test", modelId: "one" }, disabledReason: "disabled" }] } } };
+  try {
+    internal.noteSnapshotCompleteness(snapshot);
+    const models = await client.readAvailableModels(true);
+    assert.equal(reads, 0);
+    assert.equal(models.available[0].disabledReason, "disabled");
+    await client.readAvailableModels(true);
+    assert.equal(reads, 1, "the snapshot catalog is only a one-shot startup optimization");
+    internal.noteSnapshotCompleteness(snapshot);
+    state.sessionGeneration++;
+    await client.readAvailableModels(true);
+    assert.equal(reads, 2, "a changed session generation invalidates the catalog");
+    internal.noteSnapshotCompleteness(snapshot);
+    await client.readAvailableModels();
+    assert.equal(reads, 3, "an explicit model refresh still queries the backend");
+    internal.noteSnapshotCompleteness({ settings: { model: { available: [] } } });
+    assert.deepEqual((await client.readAvailableModels(true)).available, []);
+    assert.equal(reads, 3, "an explicitly empty catalog is authoritative too");
+  } finally { client.dispose(); }
+});
+
+test("initial quota refresh starts only after conversation subscription completes", async () => {
+  const { client, state } = fixture();
+  const subscribed = deferred<void>();
+  const order: string[] = [];
+  const internal = client as unknown as { startPlanQuota: () => void; ensureSessionModel: () => Promise<void> };
+  state.sendRequest = async () => ({});
+  internal.ensureSessionModel = async () => {};
+  internal.startPlanQuota = () => { order.push("quota"); };
+  state.subscribeConversation = async () => { order.push("subscribe"); await subscribed.promise; };
+  try {
+    const attached = state.afterSessionAttached();
+    for (let i = 0; i < 10 && !order.length; i++) await Promise.resolve();
+    assert.deepEqual(order, ["subscribe"]);
+    subscribed.resolve();
+    await attached;
+    assert.deepEqual(order, ["subscribe", "quota"]);
+  } finally { subscribed.resolve(); client.dispose(); }
 });
 
 test("late login resolution cannot overwrite runtime or emit model metadata after a switch", async () => {

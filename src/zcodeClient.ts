@@ -24,7 +24,7 @@ import {
   listStoredProviderModels,
   workspaceObject,
 } from "./desktop";
-import { fetchPlanQuota, type PlanQuotaLimit, type QuotaLine, type PlanAuth } from "./credentials";
+import { fetchPlanQuota, invalidatePlanAuth, type PlanQuotaLimit, type QuotaLine, type PlanAuth } from "./credentials";
 import { desktopVersion } from "./diagnostics";
 import { appServerLaunch, startupExitMessage } from "./serverPath";
 import { StartupTiming } from "./startupTiming";
@@ -342,8 +342,17 @@ export class ZCodeClient {
   private msgId = 1;
   private pending = new Map<string | number, Pending>();
   private sessionId: string | null = null;
+  /** False while resume/create has selected an id the server has not activated. */
+  private sessionReadable = true;
+  /** Counts resume RPCs that the server may still be executing. */
+  private resumeRequests = 0;
+  /** Resume ids whose client deadline passed; the server keeps running them. */
+  private lateResumes = new Map<string | number, NodeJS.Timeout>();
   private historyCache: { sessionId: string; items: HistoryItem[] } | null = null;
   private static readonly historyPage = 200;
+  private static readonly startupResumeTimeoutMs = 90_000;
+  private static readonly sessionListTimeoutMs = 20_000;
+  private static readonly sessionListTimeoutDuringResumeMs = 90_000;
   private readonly opts: ZCodeClientOptions;
   private seenRowIds = new Set<number>();
   private seenToolCallIds = new Set<string>();
@@ -401,6 +410,7 @@ export class ZCodeClient {
   /** session/subscribe just applied settings, so the follow-up reads can reuse them. */
   private snapshotSettingsFresh = false;
   private snapshotModelFresh = false;
+  private snapshotModelCatalog?: { sessionId: string; generation: number; models: ReturnType<typeof modelsFromSnapshot> };
   private historyDelivery: HistoryDelivery | null = null;
   private readonly historyVersions = new WeakMap<readonly unknown[], HistoryDelivery>();
   private startupLoginConsumed = false;
@@ -487,6 +497,11 @@ export class ZCodeClient {
 
   setDefaultRuntime(runtime: ResolvedRuntime): void {
     this.defaultRuntime = runtime;
+  }
+
+  stageSessionModel(model: { providerId: string; modelId: string } | null): void {
+    this.setSessionModel(model);
+    if (this.quotaStarted) void this.refreshPlanQuota();
   }
 
   setTiming(timing: StartupTiming | undefined): void {
@@ -766,7 +781,7 @@ export class ZCodeClient {
       if (opts?.resumeSessionId) {
         try {
           logInfo("Resuming remembered session", opts.resumeSessionId);
-          await this.resumeSession(opts.resumeSessionId);
+          await this.resumeSession(opts.resumeSessionId, undefined, ZCodeClient.startupResumeTimeoutMs);
           return;
         } catch (e) {
           if (this.startupError) throw this.startupError;
@@ -788,7 +803,7 @@ export class ZCodeClient {
       try {
         logInfo("Resuming session", sessionId);
         const known = listed.find((session) => session.sessionId === sessionId);
-        await this.resumeSession(sessionId, known);
+        await this.resumeSession(sessionId, known, ZCodeClient.startupResumeTimeoutMs);
         return;
       } catch (e) {
         if (this.startupError) throw this.startupError;
@@ -824,6 +839,26 @@ export class ZCodeClient {
       pending.reject(error);
     }
     this.pending.clear();
+    this.clearLateResumes();
+  }
+
+  private noteLateResume(id: string | number): void {
+    // The server cannot cancel a resume, so later requests still queue behind it.
+    const timer = setTimeout(() => this.lateResumes.delete(id), ZCodeClient.startupResumeTimeoutMs);
+    timer.unref?.();
+    this.lateResumes.set(id, timer);
+  }
+
+  private settleLateResume(id: string | number): void {
+    const timer = this.lateResumes.get(id);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.lateResumes.delete(id);
+  }
+
+  private clearLateResumes(): void {
+    for (const timer of this.lateResumes.values()) clearTimeout(timer);
+    this.lateResumes.clear();
   }
 
   private ws() {
@@ -832,6 +867,9 @@ export class ZCodeClient {
 
   async listSessions(includeArchived = false): Promise<SessionSummary[]> {
     const started = Date.now();
+    const timeoutMs = this.resumeRequests > 0 || this.lateResumes.size > 0
+      ? ZCodeClient.sessionListTimeoutDuringResumeMs
+      : ZCodeClient.sessionListTimeoutMs;
     try {
       const paths = listWorkspacePathVariants(this.opts.workspacePath);
       const results = await Promise.all(paths.map(async workspacePath => {
@@ -839,14 +877,14 @@ export class ZCodeClient {
         try {
           return await this.sendRequest("session/list", {
             ...params, ...(this.sessionListSupportsArchived ? { includeArchived } : {}),
-          }, 20000) as { sessions?: unknown[] };
+          }, timeoutMs) as { sessions?: unknown[] };
         } catch (error) {
           // Desktop 3.16.2 removed this optional field from its strict schema.
           const message = error instanceof Error ? error.message : "";
           if (!/ZCode error -32602:/.test(message) ||
               !/Unrecognized key[^\n]*["']includeArchived["']/i.test(message)) throw error;
           this.sessionListSupportsArchived = false;
-          return await this.sendRequest("session/list", params, 20000) as { sessions?: unknown[] };
+          return await this.sendRequest("session/list", params, timeoutMs) as { sessions?: unknown[] };
         }
       }));
       const byId = new Map<string, SessionSummary>();
@@ -913,9 +951,11 @@ export class ZCodeClient {
     this.sessionGeneration++;
     this.snapshotSettingsFresh = false;
     this.snapshotModelFresh = false;
+    this.snapshotModelCatalog = undefined;
     this.attachSessionControls();
     this.stopping = false;
     this.sessionId = null;
+    this.sessionReadable = false;
     this.lastContext = null;
     this.modelWindow = null;
     this.setSessionModel(null);
@@ -944,20 +984,22 @@ export class ZCodeClient {
       return;
     }
 
+    this.sessionReadable = true;
     await this.afterSessionAttached("created", applyModel, createdRuntime, undefined, newSessionDefaults);
   }
 
-  async resumeSession(sessionId: string, known?: SessionSummary): Promise<void> {
-    return this.serializeSessionChange(() => this.resumeSessionInner(sessionId, known));
+  async resumeSession(sessionId: string, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
+    return this.serializeSessionChange(() => this.resumeSessionInner(sessionId, known, timeoutMs));
   }
 
-  private async resumeSessionInner(sessionId: string, known?: SessionSummary): Promise<void> {
+  private async resumeSessionInner(sessionId: string, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
     const changingSession = this.sessionId !== sessionId;
     this.releaseStopWait();
     this.runtimeNeedsRevalidation = true;
     this.sessionGeneration++;
     this.snapshotSettingsFresh = false;
     this.snapshotModelFresh = false;
+    this.snapshotModelCatalog = undefined;
     this.attachSessionControls(sessionId);
     this.stopping = false;
     if (changingSession) {
@@ -967,6 +1009,7 @@ export class ZCodeClient {
       this.setSessionModel(null);
     }
     this.sessionId = sessionId;
+    this.sessionReadable = false;
     this.seenRowIds.clear();
     this.seenToolCallIds.clear();
     this.lastTitle = "";
@@ -985,13 +1028,20 @@ export class ZCodeClient {
     }
 
     const resumeStarted = Date.now();
-    const resumedSnapshot = await this.sendRequest("session/resume", {
-      sessionId,
-      workspace: this.ws(),
-    });
+    this.resumeRequests++;
+    let resumedSnapshot: unknown;
+    try {
+      resumedSnapshot = await this.sendRequest("session/resume", {
+        sessionId,
+        workspace: this.ws(),
+      }, timeoutMs);
+    } finally {
+      this.resumeRequests--;
+    }
     this.activeTiming?.add("session/resume", Date.now() - resumeStarted);
 
     this.sessionId = sessionId;
+    this.sessionReadable = true;
     await this.afterSessionAttached("resumed", false, null, resumedSnapshot as SessionSnapshot | undefined);
     if (!this.liveModelReady || !this.lastTitle) await this.adoptResumedModel();
   }
@@ -1186,8 +1236,8 @@ export class ZCodeClient {
       }
     }
     await this.emitSessionControls();
-    this.startPlanQuota();
     await this.subscribeConversation();
+    this.startPlanQuota();
   }
 
   private async applyNewSessionDefaults(defaults: NewSessionDefaults): Promise<void> {
@@ -1307,6 +1357,10 @@ export class ZCodeClient {
 
   private noteSnapshotCompleteness(snapshot: SessionSnapshot): void {
     const settings = snapshot.settings;
+    if (this.sessionId && Array.isArray(settings?.model?.available)) {
+      this.snapshotModelCatalog = { sessionId: this.sessionId, generation: this.sessionGeneration,
+        models: modelsFromSnapshot(snapshot) };
+    }
     // A partial snapshot must not suppress model-dependent controls reads.
     this.snapshotModelFresh = !!extractModel(snapshot.session?.model || settings?.model?.current);
     this.snapshotSettingsFresh = this.snapshotModelFresh
@@ -1318,7 +1372,9 @@ export class ZCodeClient {
   }
 
   private async readSessionSnapshot(): Promise<SessionSnapshot | undefined> {
-    if (!this.sessionId || this.disposed) return undefined;
+    // The id is published before session/resume returns. Reading then is always
+    // rejected with -32004 and can race the activation request.
+    if (!this.sessionId || this.disposed || !this.sessionReadable) return undefined;
     const sessionId = this.sessionId;
     const isCurrent = this.sessionScope();
     const started = Date.now();
@@ -1627,10 +1683,16 @@ export class ZCodeClient {
     };
   }
 
-  async readAvailableModels(): Promise<{
+  async readAvailableModels(reuseSnapshot = false): Promise<{
     current?: { providerId: string; modelId: string };
     available: AvailableModel[];
   }> {
+    const cached = this.snapshotModelCatalog;
+    this.snapshotModelCatalog = undefined;
+    if (reuseSnapshot && cached?.sessionId === this.sessionId && cached.generation === this.sessionGeneration) {
+      this.activeTiming?.addCount("modelCatalogSnapshotReuse");
+      return { ...cached.models, current: this.confirmedModel() ?? cached.models.current };
+    }
     const snapshot = await this.readSessionSnapshot();
     if (!snapshot) return { available: [] };
     return modelsFromSnapshot(snapshot);
@@ -3230,6 +3292,7 @@ export class ZCodeClient {
           ? setTimeout(() => {
               if (this.pending.has(id)) {
                 this.pending.delete(id);
+                if (method === "session/resume") this.noteLateResume(id);
                 reject(new Error(`Request ${method} timed out after ${timeoutMs}ms`));
               }
             }, timeoutMs)
@@ -3268,6 +3331,7 @@ export class ZCodeClient {
       try { this.handleNotification(msg as ZCodeNotification); }
       finally { timing?.add("notificationHandlingMs", performance.now() - started); }
     } else if ("id" in msg && "result" in msg) {
+      this.settleLateResume(msg.id);
       const pending = this.pending.get(msg.id);
       if (pending) {
         if (pending.method === "session/resume") {
@@ -3284,13 +3348,19 @@ export class ZCodeClient {
         pending.resolve(msg.result);
       }
     } else if ("id" in msg && "error" in msg) {
+      this.settleLateResume(msg.id);
       const pending = this.pending.get(msg.id);
       if (pending) {
         if (pending.timer) clearTimeout(pending.timer);
         this.pending.delete(msg.id);
         const err = msg as ZCodeErrorResponse;
         const message = `${err.error.code}: ${err.error.message}`;
-        if (/\b401\b|unauthorized/i.test(message)) this.loginStale = true;
+        if (/\b401\b|unauthorized/i.test(message)) {
+          this.loginStale = true;
+          for (const runtime of [this.sessionRuntime, this.defaultRuntime]) {
+            if (runtime?.apiKey) invalidatePlanAuth(runtime.apiKey);
+          }
+        }
         pending.reject(
           new Error(`ZCode error ${message}`)
         );
@@ -3560,6 +3630,7 @@ export class ZCodeClient {
       p.reject(new LocalizedError("ZCode 客户端已关闭"));
     }
     this.pending.clear();
+    this.clearLateResumes();
     this.rl?.close();
     this.rl = null;
     this.errRl?.close();

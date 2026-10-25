@@ -1,5 +1,30 @@
 # 更新日志 / Changelog
 
+## 2.1.1 — 2026-10-25
+
+### 中文
+- 减少启动时团队及个人套餐 OAuth 换证的重复请求和模型列表读取，先完成会话订阅再请求额度，缩短进入对话时的等待。
+- 启动时恢复会话等待 90 秒，避免冷启动尚未完成就改开其他会话；超时后不再重复发送恢复请求。
+- 会话恢复进行中刷新侧栏会继续等待，恢复超时但服务端仍在处理时也一样，不再提前报告会话列表超时。
+- 会话尚未恢复完成时不再查询状态，启动和切换时不再出现 Session is not active 警告。
+- Windows 上启动恢复会话超过 20 秒时，提示可能是 Microsoft Defender 扫描 ZCode 插件文件，并可复制排除命令，由用户自行决定；可选择不再提示。
+- 选中模型回复后，始终通过扩展写入系统剪贴板；网页剪贴板即使返回成功，也不再出现选中后无法粘贴的情况。
+- 数字两侧的单个波浪号按范围显示，例如“几百毫秒~3 秒，总启动则是 4~6 秒”，不再把中间内容画成删除线；真正的 `~~删除线~~` 保持不变。
+- 回复生成中切换供应商时，额度面板立即显示所选供应商的额度，并继续在下一条消息应用该模型。
+- 打开模型选择器时自动定位到当前选中的模型，长列表中不再需要手动查找。
+
+### English
+- Reduce repeated team and personal plan OAuth exchanges and model catalog reads during startup, and subscribe to the conversation before fetching quota.
+- Restoring a chat at startup waits 90 seconds, so a cold start does not open another chat before that restore finishes. A timeout does not send a second restore request.
+- Refreshing the sidebar keeps waiting while a chat is being restored, including after a restore times out while the server is still working, instead of reporting a session-list timeout.
+- Session state is no longer read before a chat finishes resuming, so startup and switching no longer report Session is not active.
+- On Windows, when restoring a chat at startup takes over 20 seconds, a notice explains that Microsoft Defender may be scanning ZCode plugin files and can copy an exclusion command. The choice stays with the user, and the notice can be turned off.
+- Copying selected model text always writes it through the extension, so a webview clipboard that reports success can no longer leave the selection unpastable.
+- A single tilde beside a number stays a range marker, so text such as “几百毫秒~3 秒，总启动则是 4~6 秒” is no longer struck through; genuine `~~strikethrough~~` is unchanged.
+- When switching providers while a reply is running, the quota panel follows the selected provider immediately; the model is still applied to the next message.
+- Opening the model picker reveals the currently selected model, so long lists no longer require manual scrolling.
+
+
 ## 2.1.0 — 2026-10-24
 
 ### 中文

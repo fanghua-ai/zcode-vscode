@@ -28,6 +28,7 @@ function fixture() {
   const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", subscriptions: [] } as unknown as vscode.ExtensionContext);
   const state = provider as unknown as {
     client: { currentSessionId: string; currentMode: () => string; confirmedModel: () => {providerId: string; modelId: string} | undefined; confirmedControls: () => Partial<import("./zcodeClient").SessionControls>; setViewVisible: (visible: boolean) => void; pollBackgroundRuns: () => void; dispose: () => void; editUserQuery: () => Promise<unknown>; insertQueuedMessage: (text?: unknown) => Promise<unknown>; conversationFileChanges: () => Promise<unknown>; sendMessage: (...args: unknown[]) => Promise<unknown>; setMode: (mode: string) => Promise<void>; setModel: (...args: unknown[]) => Promise<unknown>; hasFreshSessionModel: () => boolean; readAvailableModels: () => Promise<{ current?: { providerId: string; modelId: string }; available: AvailableModel[] }>;
+      stageSessionModel: (model: { providerId: string; modelId: string } | null) => void;
       activitySince: () => number | undefined; noteHistoryDelivered: () => void; queuedMessages: () => unknown[] };
     switchTicket: number;
     webviewEpoch: number;
@@ -47,7 +48,8 @@ function fixture() {
     modelChoices: () => PickerModel[];
     resolveSessionModelRuntime: (model: { providerId: string; modelId: string }) => Promise<import("./desktop").ResolvedRuntime | null | false>;
   };
-  state.client = { currentSessionId: "A", currentMode: () => "build", confirmedModel: () => state.currentModel, confirmedControls: () => ({mode:"build"}), setViewVisible: visible => { visibility.push(visible); }, pollBackgroundRuns: () => { backgroundPolls++; }, dispose: () => {}, editUserQuery: () => response.promise, insertQueuedMessage: () => response.promise, conversationFileChanges: () => response.promise, sendMessage: () => response.promise, setMode: async () => {}, setModel: async () => {}, hasFreshSessionModel: () => false, readAvailableModels: async () => ({ available: [] }),
+  let stagedSessionModel: { providerId: string; modelId: string } | null | undefined;
+  state.client = { currentSessionId: "A", currentMode: () => "build", confirmedModel: () => state.currentModel, confirmedControls: () => ({mode:"build"}), setViewVisible: visible => { visibility.push(visible); }, pollBackgroundRuns: () => { backgroundPolls++; }, dispose: () => {}, editUserQuery: () => response.promise, insertQueuedMessage: () => response.promise, conversationFileChanges: () => response.promise, sendMessage: () => response.promise, setMode: async () => {}, setModel: async () => {}, hasFreshSessionModel: () => false, readAvailableModels: async () => ({ available: [] }), stageSessionModel: model => { stagedSessionModel = model; },
     activitySince: () => undefined, noteHistoryDelivered: () => {}, queuedMessages: () => [] };
   const pollState = provider as unknown as { runningPoll?: NodeJS.Timeout; dispose: () => void };
   state.post = message => posted.push(message);
@@ -67,7 +69,8 @@ function fixture() {
   const switchToB = () => { state.client.currentSessionId = "B"; state.switchTicket++; };
   const setVisible = (visible: boolean) => { view.visible = visible; onVisibilityChange(); };
   const disposeView = () => onViewDispose();
-  return { state, posted, response, handler, switchToB, setVisible, disposeView, releasedListeners, provider, view, visibility, pollState, backgroundPolls: () => backgroundPolls, dispose: () => provider.dispose() };
+  const stagedModels = () => stagedSessionModel;
+  return { state, posted, response, handler, switchToB, setVisible, disposeView, releasedListeners, provider, view, visibility, pollState, backgroundPolls: () => backgroundPolls, stagedModels, dispose: () => provider.dispose() };
 }
 
 test("Markdown file links open workspace images and reject stale or escaping paths", async () => {
@@ -886,4 +889,18 @@ for (const phase of ["resolve", "switch"]) test(`model ${phase} failure restores
   await (f.state as unknown as {selectModel:(provider: string, model: string) => Promise<void>}).selectModel("sample", "rejected");
   assert.deepEqual(f.posted, [{ type: "models", current }]);
   assert.deepEqual(f.state.currentModel, current);
+});
+
+test("choosing a model while generating stages it for quota display", async () => {
+  const f = fixture();
+  Object.assign(f.state.client, { isGenerating: () => true });
+
+  await (f.state as unknown as {selectModel:(provider: string, model: string) => Promise<void>}).selectModel("deepseek", "deepseek-chat");
+
+  assert.deepEqual(f.state.pendingModel, { sessionId: "A", providerId: "deepseek", modelId: "deepseek-chat" });
+  assert.deepEqual(f.stagedModels(), { providerId: "deepseek", modelId: "deepseek-chat" });
+  assert.deepEqual(f.posted.find(message => message.type === "models")?.current, {
+    providerId: "deepseek",
+    modelId: "deepseek-chat",
+  });
 });

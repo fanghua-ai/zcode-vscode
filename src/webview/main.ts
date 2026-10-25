@@ -4829,6 +4829,17 @@ async function copyMessage(el: HTMLElement, btn: HTMLButtonElement): Promise<voi
   }, 1200);
 }
 
+/** The webview clipboard can report success without updating the system clipboard. */
+document.addEventListener("copy", (event) => {
+  const target = event.target;
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement ||
+      (target instanceof HTMLElement && target.isContentEditable)) return;
+  const text = document.getSelection()?.toString() ?? "";
+  if (!text.trim()) return;
+  // The extension host writes the text the user can paste outside this webview.
+  post({ type: "copy", text });
+});
+
 function wireCopyButtons(root: HTMLElement): void {
   root.querySelectorAll<HTMLButtonElement>(".copy-btn").forEach((btn) => {
     btn.textContent = t("Copy");
@@ -5142,6 +5153,9 @@ function rebuildOverlay(query: string): void {
     el.addEventListener("click", () => selectOverlay(idx));
     listEl.appendChild(el);
   });
+  // The compact model picker can hold more entries than its visible viewport.
+  // Keep the current choice in view after search-driven rebuilds as well.
+  listEl.querySelector<HTMLElement>(".overlay-item.active")?.scrollIntoView({ block: "nearest" });
   placePicker();
 }
 
