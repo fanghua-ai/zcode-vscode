@@ -1,5 +1,13 @@
 # 更新日志 / Changelog
 
+## 2.1.3 — 2026-10-26
+
+### 中文
+- 修复选中回复后 Ctrl+C 或右键复制无效、或只能复制一次的问题。
+
+### English
+- Fix selected reply text failing to copy with Ctrl+C or the context menu, including copies failing after the first attempt.
+
 ## 2.1.2 — 2026-10-26
 
 ### 中文

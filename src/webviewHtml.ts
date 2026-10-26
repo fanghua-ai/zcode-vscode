@@ -2053,7 +2053,8 @@ export function getWebviewHtml(
         <label class="settings-switch"><span>${t("折叠权限和推理")}</span><span class="switch"><input type="checkbox" id="fold-session-controls" data-chrome="foldSessionControls"${chrome.foldSessionControls ? " checked" : ""}><i></i></span></label>
     </div>
   </div>
-  <div id="messages"></div>
+  <!-- Keep transcript selection focused when VS Code forwards clipboard commands. -->
+  <div id="messages" tabindex="-1"></div>
   <div id="messages-scrollbar" hidden aria-hidden="true"><div id="messages-thumb"></div></div>
   <div id="composer">
     <div id="goal-zone">

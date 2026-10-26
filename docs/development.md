@@ -26,12 +26,15 @@ npm run verify
 | `npm run build` | esbuild 生产构建，复制公式布局样式；字体不进入安装包 |
 | `npm run check:package` | 对构建后的 VSCE 文件清单检查必需资产、白名单，并确认公式字体未打入包内 |
 | `npm run test:sqlite-host` | 下载 VS Code 并在真实扩展宿主验证原生 SQLite 与 WAL 快照；无需桌面端和账号 |
+| `npm run test:clipboard-host` | 真实 VS Code webview 中连续使用键盘／右键菜单复制回复，并通过宿主 API 读回系统剪贴板；无需桌面端和账号 |
 | `npm run test:browser` | 真实页面与模拟 VS Code bridge；需要 Chrome |
 | `npm run test:themes` | 四种内置深浅色主题、两种宽度、多种状态；需要 Chrome 和 VS Code 主题文件 |
 | `npm run test:desktop-sessions` | 实际 CLI 后端与客户端组合，使用临时存储和 localhost 假模型 |
 | `npm run test:desktop-attachments` | 原生图片上传、发送、读取；同样使用隔离存储 |
 
-CI 在 Linux x64、macOS ARM64 和 Intel 上运行 `npm run verify`（类型检查、隔离单元测试、生产构建和打包白名单），浏览器回归单独在 Linux Chrome 中执行。通过这些检查不等于已验证 macOS 桌面端真实账号登录和端到端聊天。
+CI 在 Linux x64、macOS ARM64 和 Intel 上运行 `npm run verify`（类型检查、隔离单元测试、生产构建和打包白名单），浏览器回归单独在 Linux Chrome 中执行，剪贴板回归在 Linux 的真实 VS Code webview 中执行。通过这些检查不等于已验证 macOS 桌面端真实账号登录和端到端聊天。
+
+剪贴板回归使用独立 VS Code 配置、扩展目录和固定回复夹具。Linux 请通过 `xvfb-run -a npm run test:clipboard-host` 在独立显示环境中运行，隔离系统剪贴板；可附加 `-- --vscode-executable /usr/share/code/code --vscode-version 1.143.1` 使用已安装的版本，默认下载 `stable`。它通过真实鼠标选区、Ctrl+C 和右键菜单的 Copy 项触发复制，每次先写入旧内容，再用 `vscode.env.clipboard.readText()` 核对完整选中文本，覆盖两次连续键盘复制、两次连续右键复制以及输入框复制。报告写入 `test-results/clipboard-host/`，失败保留宿主日志；普通浏览器里的合成 `copy` 事件不能替代这一层验证。
 
 浏览器／主题脚本目前主要在 Linux 上使用。可用 `CHROME_BIN` 指定 Chrome 可执行文件；主题脚本可用 `VSCODE_THEME_DIR` 指定 VS Code 的 `theme-defaults/themes` 目录，`ZCODE_AUDIT_DIR` 指定报告输出位置。这些环境变量并不代表脚本已在 Windows／macOS 完整验证。
 
@@ -51,6 +54,7 @@ SQLite CI 分别在 Linux x64、Windows x64、macOS ARM64 和 Intel 上运行最
 
 - 文档：检查链接、版本与事实一致，不需要浏览器回归。
 - UI：类型、相关浏览器用例，深浅色／窄栏截图；不要只检查深色。
+- 复制、选区或焦点：额外运行真实剪贴板宿主回归；合成浏览器事件通过不代表系统剪贴板可用。
 - 会话、模型、权限、队列、恢复：类型、单元、浏览器与隔离原生会话；对新建、切走切回、停止后重发、编辑后重发补行为用例。
 - 图片：额外检查真实 FileReader、解码、会话切换迟到事件及原生附件。
 - 发布：完整测试集合、包清单与身份检查，记录未实测的平台。已完成的同一代码测试无需无理由重复，打包仍须通过门禁。
@@ -105,7 +109,7 @@ Windows 冷启动实测：服务端恢复前会同步读取并校验 `resources/
 
 容器、持续集成（CI）和远程开发环境均使用 Node.js 22.13+，执行 `npm ci` 和 `npm run verify`。这两步不需要账号、API Key 或 ZCode 桌面端。
 
-GitHub Actions 在推送 `main` 和提交 PR 时并行运行 `verify` 与 `browser` 两项检查。后者使用 Ubuntu runner 自带的 Chrome 执行 `npm run test:browser`，覆盖真实页面、草稿重载、图片策略、附件和流式合帧行为，只使用模拟 VS Code bridge，不依赖桌面端或账号；缺少 Chrome 或用例失败都会使该任务失败。
+GitHub Actions 在推送 `main`、`preview` 和提交 PR 时运行 `verify`、`browser` 与 `clipboard` 检查。`browser` 使用 Ubuntu runner 自带的 Chrome 执行 `npm run test:browser`，覆盖真实页面、草稿重载、图片策略、附件和流式合帧行为，使用模拟 VS Code bridge；`clipboard` 在独立 Xvfb 显示环境中执行真实 VS Code 宿主的剪贴板检查。它们不依赖桌面端或账号，缺少所需运行环境或用例失败都会使对应任务失败。
 
 仓库不附带桌面运行时；在其他环境中，没有 Chrome／VS Code 主题资源时不运行对应浏览器／主题检查，没有桌面运行时则不运行原生集成检查，并在交付中说明未覆盖范围。主题和原生集成检查仍由本地执行。不要把个人凭据、会话数据库或桌面配置上传到仓库来补齐测试环境。
 

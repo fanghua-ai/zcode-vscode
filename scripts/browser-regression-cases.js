@@ -2430,15 +2430,20 @@ await test('session list failures stay inside the list and remain distinct from 
  emit({type:'sessions',includeArchived:false,currentId:'A',sessions:[{sessionId:'A',title:'上次会话'}],notice:'ready'});
  check(document.getElementById('session-list-notice').hidden,'successful refresh left the failure notice');
 });
-await test('selected reply text falls back to the extension clipboard',async()=>{
- reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'copy-q',role:'user',text:'Question'},{id:'copy-a',role:'assistant',text:'Selected answer'}]});
- const prose=messages.querySelector('.message.assistant .md');
- const range=document.createRange();range.selectNodeContents(prose);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);
- navigator.clipboard.writeText=()=>Promise.resolve();
- document.dispatchEvent(new Event('copy'));
- const copied=sent.filter(item=>item.type==='copy').at(-1);check(copied?.text==='Selected answer','selected text did not reach the extension clipboard');
- document.querySelector('#input').value='Composer text';document.querySelector('#input').dispatchEvent(new Event('copy'));
- check(sent.filter(item=>item.type==='copy').at(-1)===copied,'composer copy was redirected');
+await test('reply selections survive VS Code clipboard command focus recovery',()=>{
+ reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'copy-q1',role:'user',text:'One'},{id:'copy-a1',role:'assistant',text:'First selection'},{id:'copy-q2',role:'user',text:'Two'},{id:'copy-a2',role:'assistant',text:'Second selection'}]});
+ const replies=[...messages.querySelectorAll('.message.assistant .md')];
+ for(const [index,expected] of ['First selection','Second selection'].entries()){
+  input.focus();input.blur();messages.focus();
+  const range=document.createRange();range.selectNodeContents(replies[index]);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);
+  // VS Code's webview wrapper restores the last focused control before copy
+  // when the document body has focus. The transcript must retain its selection.
+  if(document.activeElement===document.body||document.activeElement===document.documentElement)input.focus();
+  check(selection.toString().trim()===expected,'clipboard focus recovery erased the selected reply');
+ }
+ input.focus();input.value='Composer text';input.setSelectionRange(0,8);
+ check(document.activeElement===input&&input.value.slice(input.selectionStart,input.selectionEnd)==='Composer','transcript focus interfered with input selection');
+ getSelection().removeAllRanges();
 });
  await new Promise(r=>setTimeout(r,30));
  clearInterval(window.auditFrameKeepAlive);
