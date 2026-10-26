@@ -1,5 +1,23 @@
 # 更新日志 / Changelog
 
+## 2.1.2 — 2026-10-26
+
+### 中文
+- 修复个人与团队套餐并发认证时相互干扰、导致偶发登录失败的问题。
+- 遇到 ZCode 服务端请求或参数不兼容时，提示检查桌面端与扩展版本，并提供重新连接和诊断反馈指引，避免误判为登录或额度问题。
+- 插件市场页的输入区示意图继续使用已发布的 GitHub 图片。图片无法显示时，说明通常是访问 GitHub 的网络连接异常，并保留分区文字说明。
+- 启动时区分“正在启动服务”和“正在恢复上次会话”。等待较久时显示已等待时间，并说明草稿会保留。
+- 会话列表刷新失败时在列表内提示，并可以重试。已有结果时继续显示该页上次结果；首次加载失败会提供重试，不再显示为没有会话。活动页和归档页互不借用对方的结果。
+- 切换会话失败后可以再次选择同一会话。恢复超时，或恢复后对话订阅超时，都不再停在无法再次点击的空白页。
+
+### English
+- Fix occasional sign-in failures when personal and team plan authentication requests run concurrently.
+- Explain incompatible ZCode server requests or parameters, guide users to check desktop and extension versions, reconnect and share diagnostics, and avoid misleading sign-in or quota guidance.
+- Keep the Marketplace composer illustration on its published GitHub image. If it cannot be shown, explain that the GitHub connection is usually unavailable and keep the section guide visible.
+- Distinguish “Starting service” from “Restoring last chat” during startup. After a longer wait, show the elapsed time and explain that the draft will be kept.
+- Show an in-list notice with retry when a chat list cannot refresh. Keep that page's previous result when one exists, and offer retry after a failed first load instead of showing an empty workspace. Active and archived pages do not reuse each other's results.
+- A failed chat switch can be selected again. A restore timeout, or a conversation subscription timeout after restore, no longer leaves a blank page that ignores the next click.
+
 ## 2.1.1 — 2026-10-25
 
 ### 中文

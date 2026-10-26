@@ -344,6 +344,8 @@ export class ZCodeClient {
   private sessionId: string | null = null;
   /** False while resume/create has selected an id the server has not activated. */
   private sessionReadable = true;
+  /** False until that activation and its conversation subscription both finish. */
+  private sessionSynced = false;
   /** Counts resume RPCs that the server may still be executing. */
   private resumeRequests = 0;
   /** Resume ids whose client deadline passed; the server keeps running them. */
@@ -470,7 +472,7 @@ export class ZCodeClient {
       binaryPath: this.opts.binaryPath,
       nodePath: this.opts.nodePath || process.execPath,
       serverReady: this.serverReady,
-      sessionAttached: !!this.sessionId,
+      sessionAttached: this.sessionAttached,
       synchronizationFailures: this.resyncFailures,
       pendingPermissions: this.pendingPermissions.size,
       pendingQuestions: this.pendingUserInputs.size,
@@ -648,6 +650,12 @@ export class ZCodeClient {
 
   get currentTitle(): string {
     return this.lastTitle;
+  }
+
+  get sessionAttached(): boolean {
+    // A resumed session can be read before its conversation subscription
+    // finishes. Retry stays available until both steps succeed.
+    return !!this.sessionId && this.sessionReadable && this.sessionSynced;
   }
 
   async start(opts?: {
@@ -956,6 +964,7 @@ export class ZCodeClient {
     this.stopping = false;
     this.sessionId = null;
     this.sessionReadable = false;
+    this.sessionSynced = false;
     this.lastContext = null;
     this.modelWindow = null;
     this.setSessionModel(null);
@@ -985,7 +994,9 @@ export class ZCodeClient {
     }
 
     this.sessionReadable = true;
+    const stillThisSession = this.sessionScope();
     await this.afterSessionAttached("created", applyModel, createdRuntime, undefined, newSessionDefaults);
+    if (stillThisSession()) this.sessionSynced = true;
   }
 
   async resumeSession(sessionId: string, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
@@ -1010,6 +1021,7 @@ export class ZCodeClient {
     }
     this.sessionId = sessionId;
     this.sessionReadable = false;
+    this.sessionSynced = false;
     this.seenRowIds.clear();
     this.seenToolCallIds.clear();
     this.lastTitle = "";
@@ -1029,12 +1041,18 @@ export class ZCodeClient {
 
     const resumeStarted = Date.now();
     this.resumeRequests++;
+    const stillThisResume = this.sessionScope();
     let resumedSnapshot: unknown;
     try {
       resumedSnapshot = await this.sendRequest("session/resume", {
         sessionId,
         workspace: this.ws(),
       }, timeoutMs);
+    } catch (error) {
+      // The id was published before the server activated it. Leave it selected
+      // but unreadable so choosing the same chat can retry the attach.
+      if (stillThisResume()) this.sessionReadable = false;
+      throw error;
     } finally {
       this.resumeRequests--;
     }
@@ -1043,6 +1061,9 @@ export class ZCodeClient {
     this.sessionId = sessionId;
     this.sessionReadable = true;
     await this.afterSessionAttached("resumed", false, null, resumedSnapshot as SessionSnapshot | undefined);
+    // Subscription failure throws above. Readable stays true, but this session
+    // is not attached until the conversation catch-up succeeds.
+    if (stillThisResume()) this.sessionSynced = true;
     if (!this.liveModelReady || !this.lastTitle) await this.adoptResumedModel();
   }
 

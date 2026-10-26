@@ -964,6 +964,71 @@ test("a failed switch does not block the next switch", async () => {
   assert.equal(client.currentSessionId, "B");
 });
 
+test("a timed-out switch can be retried for the same session", async () => {
+  const { client, state } = fixture();
+  let attempts = 0;
+  state.afterSessionAttached = async () => {};
+  state.adoptResumedModel = async () => {};
+  state.sendRequest = async (method, _params, timeoutMs) => {
+    if (method === "session/resume") {
+      attempts++;
+      if (attempts === 1) throw new Error(`Request session/resume timed out after ${timeoutMs}ms`);
+      return {};
+    }
+    return { sessions: [], messages: [] };
+  };
+  await assert.rejects(client.switchSession("B"), /timed out/);
+  assert.equal(client.currentSessionId, "B");
+  assert.equal(client.sessionAttached, false);
+  await client.switchSession("B");
+  assert.equal(attempts, 2);
+  assert.equal(client.currentSessionId, "B");
+  assert.equal(client.sessionAttached, true);
+});
+
+test("a conversation subscribe timeout keeps the resumed session readable and retryable", async () => {
+  const { client, state } = fixture();
+  let conversationSubscribes = 0;
+  const settings = {
+    model: { current: { providerId: "p", modelId: "m" } },
+    mode: { current: "build" },
+    permission: { mode: "build" },
+    thoughtLevel: { enabled: false },
+  };
+  state.sendRequest = async (method, params) => {
+    if (method === "session/list") return { sessions: [] };
+    if (method === "session/resume") return {};
+    if (method === "session/subscribe") {
+      return { snapshot: { session: { sessionId: "B", title: "B", model: settings.model.current }, settings } };
+    }
+    if (method === "session/read") {
+      return { session: { sessionId: "B", title: "B", model: settings.model.current }, settings };
+    }
+    if (method === "v4/conversation/subscribe") {
+      conversationSubscribes++;
+      if (conversationSubscribes === 1) throw new Error("Request v4/conversation/subscribe timed out after 30000ms");
+      const topic = (params as { topic?: string } | undefined)?.topic ?? "conversation/B";
+      state.handleConversationFrame({
+        topic, subscriptionId: "retry-sub", fromSeq: 0, toSeq: 1,
+        payload: { kind: "snapshot", snapshot: { logEpoch: "epoch", seq: 1, rows: { window: [] } } },
+      });
+      return { ack: { subscriptionId: "retry-sub", logEpoch: "epoch" } };
+    }
+    return {};
+  };
+  try {
+    await assert.rejects(client.switchSession("B"), /v4\/conversation\/subscribe timed out/);
+    assert.equal(client.currentSessionId, "B");
+    assert.equal((client as unknown as { sessionReadable: boolean }).sessionReadable, true);
+    assert.equal(client.sessionAttached, false);
+    assert.equal(client.diagnosticSummary().sessionAttached, false);
+    await client.switchSession("B");
+    assert.equal(conversationSubscribes, 2);
+    assert.equal(client.currentSessionId, "B");
+    assert.equal(client.sessionAttached, true);
+  } finally { client.dispose(); }
+});
+
 test("sanitized backend snapshot hides runtime inputs so they cannot split a workbar", async () => {
   const { client, state, events } = fixture();
   state.sessionId = "workbar-fixture";

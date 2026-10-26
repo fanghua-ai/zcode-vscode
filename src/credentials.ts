@@ -582,18 +582,18 @@ type CachedPlanToken = {
   refreshAt?: number;
   pending?: Promise<PlanAuth>;
 };
-// One active account/project per family. Scope includes the OAuth credential so
-// switching accounts or signing in again cannot reuse the previous token.
-const planTokens = new Map<PlanFamily, CachedPlanToken>();
+// Concurrent personal and team exchanges need separate slots. The scope still
+// includes the OAuth credential, so signing in again cannot reuse the old token.
+const planTokens = new Map<string, CachedPlanToken>();
 // Legacy keys have no expiry. Reuse only briefly during startup, and read
 // the current OAuth credential on every call so account changes invalidate it.
-const legacyPlanKeys = new Map<PlanFamily, CachedPlanToken>();
+const legacyPlanKeys = new Map<string, CachedPlanToken>();
 
 /** A 401 must invalidate OAuth exchanges before either runtime refresh path runs. */
 export function invalidatePlanAuth(apiKey: string): void {
   for (const cache of [planTokens, legacyPlanKeys]) {
-    for (const [family, entry] of cache) {
-      if (entry.value?.apiKey === apiKey) cache.delete(family);
+    for (const [scope, entry] of cache) {
+      if (entry.value?.apiKey === apiKey) cache.delete(scope);
     }
   }
 }
@@ -603,10 +603,10 @@ async function resolveLegacyPlanKey(family: PlanFamily, oauth: string, prefer?: 
   const scope = crypto.createHash("sha256").update(JSON.stringify([
     zcodeDir(), family, oauth, prefer?.organizationId, prefer?.projectId,
   ])).digest("hex");
-  let entry = legacyPlanKeys.get(family);
+  let entry = legacyPlanKeys.get(scope);
   if (!entry || entry.scope !== scope) {
     entry = { scope };
-    legacyPlanKeys.set(family, entry);
+    legacyPlanKeys.set(scope, entry);
   }
   if (rejectedFingerprint && entry.value &&
       crypto.createHash("sha256").update(entry.value.apiKey).digest("hex") === rejectedFingerprint) {
@@ -622,7 +622,7 @@ async function resolveLegacyPlanKey(family: PlanFamily, oauth: string, prefer?: 
     const authorization = family === "zai" ? `Bearer ${await resolveZaiBizToken(oauth)}` : oauth;
     const apiKey = await resolveApiKey(family, authorization, prefer);
     const latest = await readCredentialsWithRetry();
-    if (legacyPlanKeys.get(family) !== current ||
+    if (legacyPlanKeys.get(scope) !== current ||
         latest[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] !== oauth) {
       throw new Error("project_token_account_changed");
     }
@@ -641,10 +641,10 @@ async function resolveProjectToken(
   const scope = crypto.createHash("sha256").update(JSON.stringify([
     zcodeDir(), family, oauth, prefer?.organizationId, prefer?.projectId, version,
   ])).digest("hex");
-  let entry = planTokens.get(family);
+  let entry = planTokens.get(scope);
   if (!entry || entry.scope !== scope) {
     entry = { scope };
-    planTokens.set(family, entry);
+    planTokens.set(scope, entry);
   }
   if (rejectedFingerprint && entry.value &&
       crypto.createHash("sha256").update(entry.value.apiKey).digest("hex") === rejectedFingerprint) {
@@ -695,7 +695,7 @@ async function resolveProjectToken(
     const expiresAt = Math.min(token.expiresAt * 1000, started + token.expiresIn * 1000);
     if (expiresAt <= Date.now()) throw new Error("project_token_expired");
     const latest = await readCredentialsWithRetry();
-    if (planTokens.get(family) !== current ||
+    if (planTokens.get(scope) !== current ||
         latest[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] !== oauth) {
       throw new Error("project_token_account_changed");
     }

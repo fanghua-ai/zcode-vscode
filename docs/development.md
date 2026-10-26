@@ -31,6 +31,8 @@ npm run verify
 | `npm run test:desktop-sessions` | 实际 CLI 后端与客户端组合，使用临时存储和 localhost 假模型 |
 | `npm run test:desktop-attachments` | 原生图片上传、发送、读取；同样使用隔离存储 |
 
+CI 在 Linux x64、macOS ARM64 和 Intel 上运行 `npm run verify`（类型检查、隔离单元测试、生产构建和打包白名单），浏览器回归单独在 Linux Chrome 中执行。通过这些检查不等于已验证 macOS 桌面端真实账号登录和端到端聊天。
+
 浏览器／主题脚本目前主要在 Linux 上使用。可用 `CHROME_BIN` 指定 Chrome 可执行文件；主题脚本可用 `VSCODE_THEME_DIR` 指定 VS Code 的 `theme-defaults/themes` 目录，`ZCODE_AUDIT_DIR` 指定报告输出位置。这些环境变量并不代表脚本已在 Windows／macOS 完整验证。
 
 SQLite 宿主测试支持 `--vscode-version 1.106.0`（默认 `stable`）或 `--vscode-executable <可执行文件>`，例如 `npm run test:sqlite-host -- --vscode-version 1.106.0`。Linux 需要图形环境；无桌面时用 `xvfb-run -a npm run test:sqlite-host`。下载缓存位于 `.vscode-test/`，结果位于 `test-results/sqlite-host/`；测试使用独立 HOME、VS Code 用户目录和模拟数据库，结束后清理临时数据，不安装插件。

@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
+import nodeOs from "node:os";
 import * as path from "node:path";
 import type * as vscode from "vscode";
 import { mergeAvailablePickerModels, quotaProviderIsSelectable, ZCodeViewProvider } from "./extension";
-import type { PickerModel } from "./desktop";
+import type { PickerModel, ResolvedRuntime } from "./desktop";
+import { ZCodeClient } from "./zcodeClient";
+import { StartupTiming } from "./startupTiming";
 import type { AvailableModel } from "./zcodeClient";
 import { setTestLanguage, setTestFiles, workspace, window as testWindow, recoveryCalls, recoveryNotices } from "./testSupport/vscode";
 
@@ -49,8 +52,9 @@ function fixture() {
     resolveSessionModelRuntime: (model: { providerId: string; modelId: string }) => Promise<import("./desktop").ResolvedRuntime | null | false>;
   };
   let stagedSessionModel: { providerId: string; modelId: string } | null | undefined;
-  state.client = { currentSessionId: "A", currentMode: () => "build", confirmedModel: () => state.currentModel, confirmedControls: () => ({mode:"build"}), setViewVisible: visible => { visibility.push(visible); }, pollBackgroundRuns: () => { backgroundPolls++; }, dispose: () => {}, editUserQuery: () => response.promise, insertQueuedMessage: () => response.promise, conversationFileChanges: () => response.promise, sendMessage: () => response.promise, setMode: async () => {}, setModel: async () => {}, hasFreshSessionModel: () => false, readAvailableModels: async () => ({ available: [] }), stageSessionModel: model => { stagedSessionModel = model; },
+  const activeClient = { currentSessionId: "A", currentMode: () => "build", confirmedModel: () => state.currentModel, confirmedControls: () => ({mode:"build"}), setViewVisible: (visible: boolean) => { visibility.push(visible); }, pollBackgroundRuns: () => { backgroundPolls++; }, dispose: () => {}, editUserQuery: () => response.promise, insertQueuedMessage: () => response.promise, conversationFileChanges: () => response.promise, sendMessage: () => response.promise, setMode: async () => {}, setModel: async () => {}, hasFreshSessionModel: () => false, readAvailableModels: async () => ({ available: [] }), stageSessionModel: (model: { providerId: string; modelId: string } | null) => { stagedSessionModel = model; },
     activitySince: () => undefined, noteHistoryDelivered: () => {}, queuedMessages: () => [] };
+  state.client = activeClient;
   const pollState = provider as unknown as { runningPoll?: NodeJS.Timeout; dispose: () => void };
   state.post = message => posted.push(message);
   state.indexCurrentSession = () => {};
@@ -65,12 +69,19 @@ function fixture() {
     webview: { cspSource: "file:", asWebviewUri: (uri: unknown) => uri, onDidReceiveMessage: (callback: typeof handler) => { handler = callback; return { dispose() { releasedListeners.push("message"); } }; } },
   };
   provider.resolveWebviewView(view as unknown as vscode.WebviewView);
-  fixtureDisposals.add(() => provider.dispose());
-  const switchToB = () => { state.client.currentSessionId = "B"; state.switchTicket++; };
+  const dispose = () => {
+    fixtureDisposals.delete(dispose);
+    provider.dispose();
+  };
+  fixtureDisposals.add(dispose);
+  const switchToB = () => {
+    state.client.currentSessionId = "B";
+    state.switchTicket++;
+  };
   const setVisible = (visible: boolean) => { view.visible = visible; onVisibilityChange(); };
   const disposeView = () => onViewDispose();
   const stagedModels = () => stagedSessionModel;
-  return { state, posted, response, handler, switchToB, setVisible, disposeView, releasedListeners, provider, view, visibility, pollState, backgroundPolls: () => backgroundPolls, stagedModels, dispose: () => provider.dispose() };
+  return { state, posted, response, handler, switchToB, setVisible, disposeView, releasedListeners, provider, view, visibility, pollState, backgroundPolls: () => backgroundPolls, stagedModels, dispose };
 }
 
 test("Markdown file links open workspace images and reject stale or escaping paths", async () => {
@@ -91,10 +102,10 @@ test("Markdown file links open workspace images and reject stale or escaping pat
     recoveryNotices.length = 0;
     await f.state.onWebviewMessage({ type: "openMarkdownFile", path: image, sessionId: "A" });
     assert.equal(recoveryCalls.at(-1)?.command, "vscode.open");
-    assert.equal((recoveryCalls.at(-1)?.args?.[0] as { fsPath: string }).fsPath, image);
+    assert.equal((recoveryCalls.at(-1)?.args?.[0] as { fsPath: string }).fsPath, fs.realpathSync(image));
     assert.deepEqual(recoveryCalls.at(-1)?.args?.[1], { preview: true });
     await f.state.onWebviewMessage({ type: "openMarkdownFile", path: "chart.png", sessionId: "A" });
-    assert.equal((recoveryCalls.at(-1)?.args?.[0] as { fsPath: string }).fsPath, image);
+    assert.equal((recoveryCalls.at(-1)?.args?.[0] as { fsPath: string }).fsPath, fs.realpathSync(image));
     const opened = recoveryCalls.length;
     const rejected = [outside, path.join(root, "missing.png"), ...(linked ? [path.join(root, "linked.png")] : [])];
     for (const file of rejected) {
@@ -280,6 +291,7 @@ test("model changes before the first question stay silent even if history echoes
   assert.equal(marks.length, 1);
   assert.equal(marks[0].sessionId, "A");
   assert.equal((marks[0].to as { modelId: string }).modelId, "first");
+  f.dispose();
 });
 
 test("a model-switch notice stays with its session while another conversation sends", async () => {
@@ -303,6 +315,7 @@ test("a model-switch notice stays with its session while another conversation se
   assert.equal(marks.length, 1);
   assert.equal(marks[0].sessionId, "A");
   assert.equal((marks[0].to as { modelId: string }).modelId, "A-new");
+  f.dispose();
 });
 
 test("model changes in a truncated restored conversation retain their notice when the loaded tail has no question", async () => {
@@ -320,6 +333,7 @@ test("model changes in a truncated restored conversation retain their notice whe
   assert.equal(marks[0].sessionId, "A");
   assert.equal((marks[0].from as { modelId: string }).modelId, "old");
   assert.equal((marks[0].to as { modelId: string }).modelId, "new");
+  f.dispose();
 });
 
 test("panel visibility pauses background SQLite polling and immediately catches up when shown", () => {
@@ -335,6 +349,7 @@ test("panel visibility pauses background SQLite polling and immediately catches 
   assert.equal(f.backgroundPolls(), 2, "showing the panel did not immediately refresh background status");
   assert.deepEqual(f.visibility, [true, false, true]);
   f.setVisible(false);
+  f.dispose();
 });
 
 test("a disposed webview view is dropped and its listeners are released", () => {
@@ -349,12 +364,14 @@ test("a disposed webview view is dropped and its listeners are released", () => 
   assert.equal(f.visibility.at(-1), false);
   f.setVisible(true);
   assert.equal(f.pollState.runningPoll, undefined, "a stale visibility event revived the poll");
+  f.dispose();
 });
 
 test("resolving a new view releases the previous view's listeners first", () => {
   const f = fixture();
   f.provider.resolveWebviewView(f.view as unknown as vscode.WebviewView);
   assert.deepEqual([...f.releasedListeners].sort(), ["dispose", "message", "visibility"]);
+  f.dispose();
 });
 
 test("every page load receives the session state, even without a new resolveWebviewView", async () => {
@@ -367,6 +384,7 @@ test("every page load receives the session state, even without a new resolveWebv
   // Reload Webviews / renderer recovery: the same view posts "ready" again from a blank page.
   await f.state.onWebviewMessage({ type: "ready" });
   assert.equal(pushes.length, 2, "a reloaded page stayed blank");
+  f.dispose();
 });
 
 test("webview session actions acknowledge only after their operation settles", async () => {
@@ -390,6 +408,7 @@ test("webview session actions acknowledge only after their operation settles", a
   state.deleteSession = async () => { throw new Error("delete failed"); };
   await assert.rejects(f.state.onWebviewMessage({ type: "deleteSession", sessionId: "A", actionRequestId: "delete-2" }), /delete failed/);
   assert.deepEqual(f.posted, [{ type: "session_action_complete", sessionId: "A", actionRequestId: "delete-2" }], "failed operation left the UI pending");
+  f.dispose();
 });
 
 test("question index is re-read from the database only when delivered user rows change", () => {
@@ -412,13 +431,245 @@ test("question index is re-read from the database only when delivered user rows 
   assert.equal(indexes.length, 6);
   assert.deepEqual(indexes[1].questions, [{ id: "q1", text: "FIRST" }, { id: "q2", text: "SECOND" }]);
   assert.equal(indexes[1].sessionId, "A");
+  f.dispose();
 });
+
+test("session refresh distinguishes a failed first load from a stale list", async () => {
+  const f = fixture();
+  const state = f.state as unknown as {
+    client: { currentSessionId?: string; listSessions: (includeArchived?: boolean) => Promise<unknown[]> };
+    sessionListViews: Record<"active" | "archived", {
+      sessions: Array<{ sessionId: string; title: string; archivedAt?: number }>;
+      state: "unknown" | "ready" | "failed";
+      loaded: boolean;
+    }>;
+    refreshSessions: (includeArchived?: boolean, startupList?: unknown, listVisible?: boolean) => Promise<void>;
+  };
+  const ids = (message: { [key: string]: unknown } | undefined) => {
+    const sessions = message?.sessions;
+    return Array.isArray(sessions)
+      ? sessions.map(session => String((session as { sessionId?: string }).sessionId))
+      : [];
+  };
+  state.client.listSessions = async () => { throw new Error("list unavailable"); };
+  await state.refreshSessions(false, undefined, true);
+  assert.equal(f.posted.at(-1)?.notice, "initial");
+  assert.deepEqual(f.posted.at(-1)?.sessions, []);
+
+  const active = { sessionId: "A", title: "Active chat" };
+  const archived = { sessionId: "C", title: "Archived chat", archivedAt: 5 };
+  state.sessionListViews.active = { sessions: [active], state: "ready", loaded: true };
+  state.sessionListViews.archived = { sessions: [archived], state: "ready", loaded: true };
+  const before = f.posted.length;
+  await state.refreshSessions(true);
+  assert.equal(f.posted.length, before, "hidden stale failure replaced the displayed list");
+  await state.refreshSessions(true, undefined, true);
+  assert.equal(f.posted.at(-1)?.notice, "stale");
+  assert.equal(f.posted.at(-1)?.includeArchived, true);
+  assert.deepEqual(ids(f.posted.at(-1)), ["C"]);
+  await state.refreshSessions(false, undefined, true);
+  assert.equal(f.posted.at(-1)?.notice, "stale");
+  assert.equal(f.posted.at(-1)?.includeArchived, false);
+  assert.deepEqual(ids(f.posted.at(-1)), ["A"]);
+
+  const archivedOnly = fixture();
+  const archivedState = archivedOnly.state as unknown as typeof state;
+  archivedState.client.listSessions = async () => { throw new Error("list unavailable"); };
+  archivedState.sessionListViews.archived = { sessions: [archived], state: "ready", loaded: true };
+  await archivedState.refreshSessions(false, undefined, true);
+  assert.equal(archivedOnly.posted.at(-1)?.notice, "initial");
+  assert.equal(archivedOnly.posted.at(-1)?.includeArchived, false);
+  assert.deepEqual(archivedOnly.posted.at(-1)?.sessions, []);
+  const activeOnly = fixture();
+  const activeState = activeOnly.state as unknown as typeof state;
+  activeState.client.listSessions = async () => { throw new Error("list unavailable"); };
+  activeState.sessionListViews.active = { sessions: [active], state: "ready", loaded: true };
+  await activeState.refreshSessions(true, undefined, true);
+  assert.equal(activeOnly.posted.at(-1)?.notice, "initial");
+  assert.equal(activeOnly.posted.at(-1)?.includeArchived, true);
+  assert.deepEqual(activeOnly.posted.at(-1)?.sessions, []);
+
+  let releaseFresh!: () => void;
+  const fresh = new Promise<void>(resolve => { releaseFresh = resolve; });
+  state.client.listSessions = async () => { await fresh; return [{ sessionId: "B", title: "Fresh chat" }]; };
+  const refreshing = state.refreshSessions(false, undefined, true);
+  state.client.listSessions = async () => { throw new Error("newer failure"); };
+  await state.refreshSessions(false, undefined, true);
+  releaseFresh();
+  await refreshing;
+  assert.equal(f.posted.at(-1)?.notice, "stale");
+  assert.deepEqual(ids(f.posted.at(-1)), ["A"]);
+
+  const moved = fixture();
+  const movedState = moved.state as unknown as typeof state & { adoptWorkspace: (workspacePath: string) => void };
+  let workspace = "/work/a";
+  movedState.client.listSessions = async () => workspace === "/work/a"
+    ? [{ sessionId: "A", title: "Directory A" }]
+    : Promise.reject(new Error("directory B unavailable"));
+  movedState.adoptWorkspace("/work/a");
+  await movedState.refreshSessions(false, undefined, true);
+  movedState.adoptWorkspace("/work/b");
+  workspace = "/work/b";
+  await movedState.refreshSessions(false, undefined, true);
+  assert.equal(moved.posted.at(-1)?.notice, "initial");
+  assert.equal(moved.posted.at(-1)?.currentId, "A");
+  assert.deepEqual(moved.posted.at(-1)?.sessions, []);
+  await movedState.refreshSessions(true, undefined, true);
+  assert.equal(moved.posted.at(-1)?.notice, "initial");
+  assert.deepEqual(moved.posted.at(-1)?.sessions, []);
+  archivedOnly.dispose();
+  activeOnly.dispose();
+  moved.dispose();
+});
+
+test("startup status names the phase and reports a long wait without technical details", () => {
+  const f = fixture();
+  const state = f.state as unknown as {
+    startupPhase: "starting" | "restoring" | null;
+    startupPhaseSince: number;
+    postStartupPhase: () => void;
+    clearStartupPhase: () => void;
+  };
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  try {
+    state.startupPhase = "restoring";
+    state.startupPhaseSince = now;
+    state.postStartupPhase();
+    assert.deepEqual(f.posted.at(-1), { type: "status", status: "connecting", phase: "restoring" });
+    now += 8_000;
+    state.postStartupPhase();
+    assert.deepEqual(f.posted.at(-1), { type: "status", status: "connecting", phase: "restoring", waitedSeconds: 8 });
+    state.clearStartupPhase();
+    assert.equal(state.startupPhase, null);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("fixtures remain active across event-loop turns until the test releases them", async () => {
+  const f = fixture();
+  const client = f.state.client;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.client, client);
+  assert.deepEqual(f.releasedListeners, []);
+  f.switchToB();
+  assert.equal(client.currentSessionId, "B");
+  f.dispose();
+  assert.equal(f.state.client, null);
+  assert.deepEqual(f.releasedListeners.sort(), ["dispose", "message", "visibility"]);
+});
+
+const startupRuntime: ResolvedRuntime = {
+  providerId: "configured-provider", providerName: "Configured", kind: "openai-compatible",
+  baseURL: "https://example.test/v1", apiKey: "TEST-ONLY-KEY", modelId: "configured-model",
+  models: {}, source: "custom-provider",
+};
+
+test("startup config write failures stop the notice and report the filesystem error", t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-startup-config-"));
+  t.mock.method(nodeOs, "homedir", () => home);
+  fs.mkdirSync(path.join(home, ".zcode"));
+  fs.writeFileSync(path.join(home, ".zcode", "cli"), "not-a-directory");
+  const f = fixture();
+  const state = f.state as unknown as {
+    beginStartupPhase: (phase: "starting") => void;
+    startupPhase: string | null;
+    startupPhaseTimer?: NodeJS.Timeout;
+    syncStartupConfig: (runtime: ResolvedRuntime, timing: StartupTiming) => void;
+    failStartupPreparation: (error: unknown) => void;
+  };
+  const timing = new StartupTiming("open");
+  try {
+    state.beginStartupPhase("starting");
+    assert.ok(state.startupPhaseTimer);
+    const notices = recoveryNotices.length;
+    assert.throws(() => state.syncStartupConfig(startupRuntime, timing), error => {
+      assert.equal((error as NodeJS.ErrnoException).code, "EEXIST");
+      state.failStartupPreparation(error);
+      return true;
+    });
+    assert.equal(state.startupPhase, null);
+    assert.equal(state.startupPhaseTimer, undefined);
+    assert.equal(recoveryNotices.length, notices + 1);
+    assert.ok(f.posted.some(message => message.type === "session_error" && /EEXIST/.test(String(message.message))));
+  } finally {
+    timing.dispose();
+    f.dispose();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+for (const lateResult of ["success", "failure"] as const) {
+  test(`parallel config failure returns before backend startup and ignores late ${lateResult}`, async t => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-startup-pending-"));
+    t.mock.method(nodeOs, "homedir", () => home);
+    fs.mkdirSync(path.join(home, ".zcode"));
+    fs.writeFileSync(path.join(home, ".zcode", "cli"), "not-a-directory");
+    const pendingStart = deferred();
+    let actualClient: ZCodeClient | undefined;
+    const start = t.mock.method(ZCodeClient.prototype, "start", function (this: ZCodeClient) {
+      actualClient = this;
+      return pendingStart.promise.then(() => undefined);
+    });
+    const originalDispose = ZCodeClient.prototype.dispose;
+    const dispose = t.mock.method(ZCodeClient.prototype, "dispose", function (this: ZCodeClient) {
+      originalDispose.call(this);
+    });
+    const f = fixture();
+    const state = f.state as unknown as {
+      context: { globalStorageUri: { fsPath: string } };
+      client: ZCodeClient | null;
+      startupPhase: string | null;
+      startupPhaseTimer?: NodeJS.Timeout;
+      startWhileLoginRuns: (timing: StartupTiming, started: number, login: Promise<unknown>, launch: unknown) => Promise<void>;
+    };
+    state.context = { globalStorageUri: { fsPath: path.join(home, "storage") } };
+    const timing = new StartupTiming("open");
+    try {
+      const notices = recoveryNotices.length;
+      const startup = state.startWhileLoginRuns(timing, Date.now(),
+        Promise.resolve({ ok: true, runtime: startupRuntime, picker: [] }), {
+          binaryPath: path.join(home, "unused-binary"), nodePath: "", workspacePath: home,
+        });
+      // Give all immediate continuations a turn; the backend promise stays pending.
+      let finished = false;
+      void startup.then(() => { finished = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(start.mock.callCount(), 1);
+      assert.ok(actualClient);
+      assert.equal(finished, true, "configuration failure waited for backend startup");
+      await startup;
+      assert.equal(state.client, null);
+      assert.equal(dispose.mock.callCount(), 1);
+      assert.equal(dispose.mock.calls[0].this, actualClient);
+      assert.equal(state.startupPhase, null);
+      assert.equal(state.startupPhaseTimer, undefined);
+      assert.equal(f.pollState.runningPoll, undefined);
+      assert.equal(recoveryNotices.length, notices + 1);
+      assert.ok(f.posted.some(message => message.type === "session_error" && /EEXIST/.test(String(message.message))));
+      const beforeLateResult = f.posted.length;
+      if (lateResult === "success") pendingStart.resolve();
+      else pendingStart.reject(new Error("late backend startup failure"));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(f.posted.slice(beforeLateResult), []);
+      assert.equal(dispose.mock.callCount(), 1);
+    } finally {
+      pendingStart.resolve();
+      timing.dispose();
+      f.dispose();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
 
 test("late accepted edit cannot rewind a different session's transcript", async () => {
   const f = fixture();
   const edit = f.state.onWebviewMessage({ type: "editLast", sessionId: "A", viewGen: f.state.switchTicket, editRequestId: "attempt-A", commandId: "edit-command-A", rowId: 1, entityId: "user-A", text: "edit-A" });
   f.switchToB(); f.response.resolve(); await edit;
   assert.deepEqual(f.posted, []);
+  f.dispose();
 });
 
 test("editing a question preserves validated conversation references in the backend rewrite", async () => {
@@ -445,6 +696,7 @@ test("editing a question preserves validated conversation references in the back
 
   assert.equal(rewrittenText, "[#Referenced conversation](#sess_11111111-1111-4111-8111-111111111111)\n\nExplain this conversation");
   assert.deepEqual(f.posted, [{ type: "query_rewound", text: rewrittenText, sessionId: "A", viewGen: f.state.switchTicket, editRequestId: "attempt-A", commandId: "edit-command-A", entityId: "user-A", attachments: [] }]);
+  f.dispose();
 });
 
 test("late rejected queue insert cannot mark another session as failed", async () => {
@@ -454,6 +706,7 @@ test("late rejected queue insert cannot mark another session as failed", async (
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(f.posted, [{ type: "queue_rejected", commandId: "command-A", sessionId: "A", text: "insert-A", chips: [], message: "failed in A" }]);
   assert.ok(!f.posted.some(message => message.type === "session_error"));
+  f.dispose();
 });
 
 test("late accepted queue insert is acknowledged to its source session without recovery", async () => {
@@ -463,6 +716,7 @@ test("late accepted queue insert is acknowledged to its source session without r
   f.response.resolve("command-A");
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(f.posted, [{ type: "queue_admitted", commandId: "command-A", sessionId: "A" }]);
+  f.dispose();
 });
 
 test("queued /plan switches its owning session before inserting the task body", async () => {
@@ -477,6 +731,7 @@ test("queued /plan switches its owning session before inserting the task body", 
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(order, ["mode:plan", "insert:Explain the change"]);
   assert.deepEqual(f.posted, [{ type: "queue_admitted", commandId: "plan-queue-A", sessionId: "A" }]);
+  f.dispose();
 });
 
 test("queued /plan mode failure restores controls and its original command draft", async () => {
@@ -493,6 +748,7 @@ test("queued /plan mode failure restores controls and its original command draft
   assert.deepEqual(f.posted[0], { type: "session_controls", mode: "build" });
   assert.equal(f.posted[1].type, "queue_rejected");
   assert.equal(f.posted[1].text, "/plan Explain the change");
+  f.dispose();
 });
 
 test("queue mutations require their exact owning session", async () => {
@@ -510,6 +766,7 @@ test("queue mutations require their exact owning session", async () => {
   f.handler({ type: "queueDelete", queueItemId: "q-A" });
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(calls, ["edit", "delete"]);
+  f.dispose();
 });
 
 test("queue send-now stops after a pending model change loses session ownership", async () => {
@@ -524,6 +781,7 @@ test("queue send-now stops after a pending model change loses session ownership"
   resolveRuntime(null);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(sends, 0, "queued item was sent in the newly selected session");
+  f.dispose();
 });
 
 test("file rewind requires the session that owns its turn target", async () => {
@@ -534,6 +792,7 @@ test("file rewind requires the session that owns its turn target", async () => {
   await f.state.onWebviewMessage({ type: "rewindFiles", sessionId: "A", rowId: 8, entityId: "turn-A" });
   await f.state.onWebviewMessage({ type: "rewindFiles", rowId: 8, entityId: "turn-A" });
   assert.equal(rewinds, 0, "A's file change target reached B");
+  f.dispose();
 });
 
 test("provider quota adapters are gated by the authoritative desktop picker", () => {
@@ -555,6 +814,7 @@ test("queue reorder is scoped to the active session and forwards both queue IDs"
   f.handler({ type: "queueReorder", sessionId: "A", queueItemId: "third", beforeQueueItemId: "first" });
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(calls, [["third", "first"]]);
+  f.dispose();
 });
 
 test("late file list cannot populate the next session's file cards", async () => {
@@ -562,6 +822,7 @@ test("late file list cannot populate the next session's file cards", async () =>
   const loading = f.state.onWebviewMessage({ type: "loadFileChanges", rowId: 1, entityId: "turn-A", turnId: "A" });
   f.switchToB(); f.response.resolve([{ path: "from-A.ts" }]); await loading;
   assert.deepEqual(f.posted, []);
+  f.dispose();
 });
 
 test("queue rejection belongs to that input, preserving the running turn", async () => {
@@ -570,6 +831,7 @@ test("queue rejection belongs to that input, preserving the running turn", async
   f.response.reject(new Error("queue rejected"));
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(f.posted, [{ type: "queue_rejected", commandId: "command-A", sessionId: "A", text: "insert-A", chips: [], message: "queue rejected" }]);
+  f.dispose();
 });
 
 
@@ -579,6 +841,7 @@ test("late rejected send recovers only its original draft and preserves selected
   const sending = f.state.onWebviewMessage({ type: "send", sessionId: "A", commandId: "send-A", text: "draft-A", chips });
   f.switchToB(); f.response.reject(new Error("send failed")); await sending;
   assert.deepEqual(f.posted, [{ type: "send_rejected", sessionId: "A", commandId: "send-A", text: "draft-A", chips, message: "send failed" }]);
+  f.dispose();
 });
 test("late accepted send acknowledges original input without indexing the new session", async () => {
   const f = fixture();
@@ -587,6 +850,7 @@ test("late accepted send acknowledges original input without indexing the new se
   f.switchToB(); f.response.resolve(); await sending;
   assert.deepEqual(f.posted, [{ type: "send_admitted", sessionId: "A", commandId: "send-A" }]);
   assert.equal(indexed, false);
+  f.dispose();
 });
 test("send for a stale session is rejected without calling the new session", async () => {
   const f = fixture();
@@ -596,6 +860,7 @@ test("send for a stale session is rejected without calling the new session", asy
   assert.equal(called, false);
   assert.equal(f.posted[0].type, "send_rejected");
   assert.equal(f.posted[0].sessionId, "A");
+  f.dispose();
 });
 
 test("/plan sends its task only after the owning session enters plan mode", async () => {
@@ -609,6 +874,7 @@ test("/plan sends its task only after the owning session enters plan mode", asyn
   });
   assert.deepEqual(order, ["mode:plan", "send:Explain the change"]);
   assert.deepEqual(f.posted, [{ type: "send_admitted", commandId: "plan-A", sessionId: "A" }]);
+  f.dispose();
 });
 
 test("/plan does not send its task if the session changes during the mode switch", async () => {
@@ -624,6 +890,7 @@ test("/plan does not send its task if the session changes during the mode switch
   assert.equal(f.posted[0].type, "send_rejected");
   assert.equal(f.posted[0].sessionId, "A");
   assert.equal(f.posted[0].text, "/plan Explain the change");
+  f.dispose();
 });
 
 test("/plan mode failure restores the current mode and the complete retry command", async () => {
@@ -639,6 +906,7 @@ test("/plan mode failure restores the current mode and the complete retry comman
   assert.deepEqual(f.posted.slice(0, 1), [{ type: "session_controls", mode: "build" }]);
   assert.equal(f.posted[1].type, "send_rejected");
   assert.equal(f.posted[1].text, "/plan Explain the change");
+  f.dispose();
 });
 
 test("retryLast rejects the original question after the user switches sessions", async () => {
@@ -652,6 +920,7 @@ test("retryLast rejects the original question after the user switches sessions",
     type: "send_rejected", sessionId: "A", text: "QUESTION_FROM_A", chips: [],
     message: "会话已切换，请在当前会话重新发送。",
   });
+  f.dispose();
 });
 
 test("retryLast rechecks session ownership after applying a pending model", async () => {
@@ -673,6 +942,7 @@ test("retryLast rechecks session ownership after applying a pending model", asyn
   assert.equal(sends, 0, "retry sent after the active session changed during model setup");
   assert.ok(f.posted.some(message => message.type === "send_rejected" && message.sessionId === "A"));
   assert.ok(!f.posted.some(message => message.type === "send_admitted"));
+  f.dispose();
 });
 
 for (const language of ["zh-CN", "zh-TW", "en"]) {
@@ -693,6 +963,7 @@ for (const language of ["zh-CN", "zh-TW", "en"]) {
       if (language === "en") assert.match(String(f.posted[0].text), /^Rename session could not be completed:/);
       if (language === "zh-TW") assert.match(String(f.posted[0].text), /^重新命名會話未能完成：/);
       assert.ok(!f.posted.some(message => message.type === "session_error"));
+      f.dispose();
     } finally { setTestLanguage("auto"); }
   });
 }
@@ -707,6 +978,7 @@ test("workspace mention search stays scoped and responses retain request ownersh
  await state.onWebviewMessage({type:"searchWorkspaceFiles",requestId:"search-B",sessionId:"B",text:"settings"});
  assert.deepEqual(f.posted.pop(),{type:"workspace_files",requestId:"search-B",sessionId:"B",files:[{path:"/test/work/.vscode/settings.json",relPath:".vscode/settings.json"}]});
  assert.deepEqual(f.posted,[]); setTestFiles([]);
+  f.dispose();
 });
 
 test("typed file search uses targeted native patterns and cancels stale queries", async () => {
@@ -767,6 +1039,7 @@ test("reasoning changes reject missing or foreign ownership and suppress stale f
   f.state.client.currentSessionId = "A";
   await f.state.onWebviewMessage({type:"setThoughtLevel",sessionId:"A",viewGen:f.state.switchTicket-1,thoughtLevel:"high"});
   assert.deepEqual(calls,["low"]);
+  f.dispose();
 });
 
 test("a model QuickPick result belongs to the chat and switch generation that opened it", async () => {
@@ -809,6 +1082,7 @@ test("edit rejection returns its attempt and command identity for draft-preservi
   f.state.client.editUserQuery=async()=>{throw new Error("EDIT_FAILED");};
   await f.state.onWebviewMessage({type:"editLast",sessionId:"A",viewGen:f.state.switchTicket,editRequestId:"attempt",commandId:"submission",rowId:2,entityId:"question",text:"KEEP_EDIT"});
   assert.deepEqual(f.posted,[{type:"query_edit_rejected",sessionId:"A",viewGen:f.state.switchTicket,editRequestId:"attempt",commandId:"submission",entityId:"question",message:"EDIT_FAILED"}]);
+  f.dispose();
 });
 
 
@@ -827,6 +1101,7 @@ for (const type of ["loadOlder", "loadThrough"]) test(`${type} failures have a r
   assert.deepEqual(f.posted.at(-1), { type: "historyOlder", sessionId: "A", viewGen: f.state.switchTicket,
     requestId: "history-retry", items: [{ id: "earlier", role: "user", text: "EARLIER_TEXT" }], more: false,
     ...(type === "loadThrough" ? { jumpId: "target" } : {}) });
+  f.dispose();
 });
 
 test("history failures and success replies cannot reach a newly selected session", async () => {
@@ -839,6 +1114,7 @@ test("history failures and success replies cannot reach a newly selected session
     else f.response.resolve({ items: [], more: true });
     await action;
     assert.deepEqual(f.posted, []);
+    f.dispose();
   }
 });
 
@@ -854,6 +1130,7 @@ test("queue edit replies retain attempt ownership after a session switch", async
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(f.posted, [{ type: "queue_edit_result", sessionId: "A", queueItemId: "item",
       requestId: "queue-attempt", viewGen, ok: !fail, ...(fail ? { message: "Queue rejected" } : {}) }]);
+    f.dispose();
   }
 });
 
@@ -873,6 +1150,7 @@ for (const control of ["mode", "thought"]) test(`failed ${control} changes resto
     await action;
     assert.deepEqual(f.posted, switchAway ? [] : [{ type: "session_controls", ...confirmed }]);
     assert.equal(recoveryNotices.length, switchAway ? 0 : 1);
+    f.dispose();
   }
 });
 
@@ -889,6 +1167,7 @@ for (const phase of ["resolve", "switch"]) test(`model ${phase} failure restores
   await (f.state as unknown as {selectModel:(provider: string, model: string) => Promise<void>}).selectModel("sample", "rejected");
   assert.deepEqual(f.posted, [{ type: "models", current }]);
   assert.deepEqual(f.state.currentModel, current);
+  f.dispose();
 });
 
 test("choosing a model while generating stages it for quota display", async () => {
@@ -903,4 +1182,5 @@ test("choosing a model while generating stages it for quota display", async () =
     providerId: "deepseek",
     modelId: "deepseek-chat",
   });
+  f.dispose();
 });

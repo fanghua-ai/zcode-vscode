@@ -377,6 +377,7 @@ function mockPlanQuotaApi(t: TestContext, issueToken?: () => unknown, listedKeys
   const originalGet = https.get;
   const originalRequest = https.request;
   const requests: Array<{ method: string; host: string; path: string; headers: Record<string, string>; body?: string }> = [];
+  let holdRequest: ((method: string, requestPath: string, headers: Record<string, string>) => Promise<void>) | undefined;
   const respond = (method: string, host: string, requestPath: string, headers: Record<string, string>, body: string, callback: (response: unknown) => void) => {
     requests.push({ method, host, path: requestPath, headers, ...(body ? { body } : {}) });
     let payload: unknown;
@@ -412,20 +413,31 @@ function mockPlanQuotaApi(t: TestContext, issueToken?: () => unknown, listedKeys
     const request = new EventEmitter() as import("events").EventEmitter & { setTimeout: () => void; destroy: () => void };
     request.setTimeout = () => {};
     request.destroy = () => {};
-    process.nextTick(() => respond("GET", url.hostname, url.pathname + url.search, options?.headers ?? {}, "", callback));
+    const headers = options?.headers ?? {};
+    const requestPath = url.pathname + url.search;
+    const gate = holdRequest?.("GET", requestPath, headers);
+    const send = () => process.nextTick(() => respond("GET", url.hostname, requestPath, headers, "", callback));
+    if (gate) void gate.then(send, send);
+    else send();
     return request;
   }) as unknown as typeof https.get;
-  https.request = ((options: import("https").RequestOptions, callback: (response: unknown) => void) => {
+  const post = (options: import("https").RequestOptions, callback: (response: unknown) => void) => {
     const request = new EventEmitter() as import("events").EventEmitter & { setTimeout: () => void; destroy: () => void; write: (data: string) => void; end: () => void };
     let body = "";
     request.setTimeout = () => {};
     request.destroy = () => {};
     request.write = (data: string) => { body += data; };
-    request.end = () => process.nextTick(() => respond(String(options.method ?? "GET"), String(options.hostname ?? options.host ?? ""), String(options.path ?? "/"), options.headers as Record<string, string> ?? {}, body, callback));
+    request.end = () => {
+      const headers = options.headers as Record<string, string> ?? {};
+      const requestPath = String(options.path ?? "/");
+      const send = () => process.nextTick(() => respond(String(options.method ?? "GET"), String(options.hostname ?? options.host ?? ""), requestPath, headers, body, callback));
+      void Promise.resolve(holdRequest?.(String(options.method ?? "GET"), requestPath, headers)).then(send, send);
+    };
     return request;
-  }) as unknown as typeof https.request;
+  };
+  https.request = post as unknown as typeof https.request;
   t.after(() => { https.get = originalGet; https.request = originalRequest; });
-  return requests;
+  return { requests, hold(next: typeof holdRequest) { holdRequest = next; } };
 }
 
 for (const appVersion of ["3.14.4", "3.16.2"]) {
@@ -450,7 +462,7 @@ for (const family of ["bigmodel", "zai"] as const) {
       } }));
       const keys = [{ name: teamPlan ? "zcode-team-api-key" : "zcode-api-key", apiKey: "TEST-OLD-KEY-ID", keyType: teamPlan ? 2 : 1 }];
       let issued = 0;
-      const requests = mockPlanQuotaApi(t, usesProjectTokens(appVersion) ? () => ({ code: 200, data: {
+      const { requests } = mockPlanQuotaApi(t, usesProjectTokens(appVersion) ? () => ({ code: 200, data: {
         accessToken: `TEST-PAT-${++issued}`, tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
       } }) : undefined, keys);
       const initial = await resolveRuntime({ preferredProviderId: providerId, preferredModelId: "test", appVersion });
@@ -504,7 +516,7 @@ for (const teamPlan of [false, true]) {
 test(`legacy ${teamPlan ? "team" : "personal"} login never falls back to a rejected key or installs a result after account change`, async t => {
   const dir = fixture(t), file = path.join(dir, "credentials.json");
   fs.writeFileSync(file, JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
-  mockPlanQuotaApi(t);
+  void mockPlanQuotaApi(t);
   const https = require("https") as typeof import("https");
   const get = https.get;
   let mode = "normal";
@@ -542,7 +554,7 @@ for (const family of ["bigmodel", "zai"] as const) {
     const dir = fixture(t), file = path.join(dir, "credentials.json");
     const credentials = { [`oauth:${family}:access_token`]: "TEST-OAUTH" };
     fs.writeFileSync(file, JSON.stringify(credentials));
-    const requests = mockPlanQuotaApi(t);
+    const planApi = mockPlanQuotaApi(t); const { requests } = planApi;
     const team = teamPlan ? { organizationId: "org-current", projectId: "project-current" } : undefined;
     const resolve = (rejected?: string) => tryPlanOAuth(family, team, "3.14.4", rejected);
     const lists = () => requests.filter(r => r.path.endsWith("/api_keys")).length;
@@ -566,6 +578,24 @@ for (const family of ["bigmodel", "zai"] as const) {
     assert.equal(lists(), 4);
     await tryPlanOAuth(family, { organizationId: "org-current", projectId: "project-other" }, "3.14.4");
     assert.equal(lists(), 5, "another project must not reuse the first project's login");
+    elapsed += 31_000;
+    const started = new Set<string>();
+    let releaseExchanges!: () => void;
+    const overlapping = new Promise<void>(resolve => { releaseExchanges = resolve; });
+    planApi.hold(async (_method, requestPath, headers) => {
+      if (!requestPath.endsWith("/api_keys")) return;
+      started.add(headers["bigmodel-project"] || "personal");
+      if (started.size === 2) releaseExchanges();
+      await overlapping;
+    });
+    const personal = tryPlanOAuth(family, undefined, "3.14.4");
+    const teamAuthPromise = tryPlanOAuth(family, { organizationId: "org-current", projectId: "project-concurrent" }, "3.14.4");
+    for (let i = 0; i < 40 && started.size < 2; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual([...started].sort(), ["personal", "project-concurrent"]);
+    const [personalAuth, teamAuth] = await Promise.all([personal, teamAuthPromise]);
+    assert.ok(personalAuth?.apiKey && teamAuth?.apiKey);
+    assert.notEqual(personalAuth.apiKey, teamAuth.apiKey);
+    planApi.hold(undefined);
     fs.writeFileSync(file, "{}");
     assert.equal(await resolve(), null, "signing out must not reuse cached credentials");
   });
@@ -577,7 +607,7 @@ for (const family of ["bigmodel", "zai"] as const) {
     const dir = fixture(t), file = path.join(dir, "credentials.json");
     const credentials = { [`oauth:${family}:access_token`]: "TEST-OAUTH" };
     fs.writeFileSync(file, JSON.stringify(credentials));
-    const requests = mockPlanQuotaApi(t);
+    const planApi = mockPlanQuotaApi(t); const { requests } = planApi;
     const providerId = `account:${family}-start-plan`;
     const resolve = () => resolveProviderRequestAuth(providerId, "3.16.2");
     const [first, concurrent] = await Promise.all([resolve(), resolve()]);
@@ -596,7 +626,7 @@ for (const family of ["bigmodel", "zai"] as const) {
     test(`${family} ${kind} quota uses the selected OAuth account and scope`, async t => {
       const dir = fixture(t);
       fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ [`oauth:${family}:access_token`]: `TEST-${family.toUpperCase()}-OAUTH` }));
-      const requests = mockPlanQuotaApi(t);
+      const planApi = mockPlanQuotaApi(t); const { requests } = planApi;
       const team = kind === "team-coding-plan" ? { organizationId: "org-current", projectId: "project-current" } : undefined;
       const quota = await fetchPlanQuota({ family, kind, ...(team ? { team } : {}) });
 
@@ -706,7 +736,7 @@ for (const family of ["bigmodel", "zai"] as const) {
       const credentials = { [`oauth:${family}:access_token`]: "TEST-OAUTH" };
       fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify(credentials));
       let issued = 0;
-      const requests = mockPlanQuotaApi(t, () => ({ code: "200", data: {
+      const { requests } = mockPlanQuotaApi(t, () => ({ code: "200", data: {
         accessToken: `TEST-PAT-${++issued}`, tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
       } }));
       const team = teamPlan ? { organizationId: "org-current", projectId: "project-current" } : undefined;
@@ -748,7 +778,7 @@ for (const data of [
       "oauth:bigmodel:access_token": "TEST-OAUTH",
       "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:old:api-key": "TEST-OLD-KEY",
     }));
-    const requests = mockPlanQuotaApi(t, () => ({ code: 200, data }));
+    const { requests } = mockPlanQuotaApi(t, () => ({ code: 200, data }));
     assert.equal(await tryPlanOAuth("bigmodel", undefined, "3.16.2"), null);
     assert.equal(requests.some(r => r.path.includes("/copy/")), false);
     assert.deepEqual(await fetchPlanQuota({ family: "bigmodel", kind: "individual-coding-plan" }, "3.16.2"), []);
@@ -771,7 +801,7 @@ for (const version of ["3.14.4", "3.15.1", "3.16.2"]) {
       "oauth:zai:access_token": "TEST-OAUTH",
       [`account-provider:coding-plan:${providerId}:account:old:api-key`]: "TEST-LEGACY-ACCOUNT-KEY",
     }));
-    const requests = mockPlanQuotaApi(t, () => ({ code: 200, data: {
+    const { requests } = mockPlanQuotaApi(t, () => ({ code: 200, data: {
       enable: true, accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
     } }));
     const result = await resolveRuntime({ preferredProviderId: providerId, preferredModelId: "glm-test", appVersion: version });
@@ -791,7 +821,7 @@ test("PAT refresh failures do not reuse the last token and can recover on the ne
   const dir = fixture(t);
   fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
   let fail = false;
-  mockPlanQuotaApi(t, () => fail ? { code: 403, data: {} } : { code: 0, data: {
+  void mockPlanQuotaApi(t, () => fail ? { code: 403, data: {} } : { code: 0, data: {
     accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
   } });
   assert.equal((await tryPlanOAuth("bigmodel", undefined, "3.16.2"))?.apiKey, "TEST-PAT");
@@ -807,7 +837,7 @@ test("PAT refresh failures do not reuse the last token and can recover on the ne
 test("PAT creation uses the dedicated Coding Plan key and usage scene", async t => {
   const dir = fixture(t);
   fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
-  const requests = mockPlanQuotaApi(t, () => ({ code: 200, data: {
+  const { requests } = mockPlanQuotaApi(t, () => ({ code: 200, data: {
     accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
   } }), []);
   const result = await tryPlanOAuth("bigmodel", { organizationId: "org-current", projectId: "project-current" }, "3.16.2");
@@ -820,7 +850,7 @@ test("PAT creation uses the dedicated Coding Plan key and usage scene", async t 
 test("a team outside customerInfo cannot obtain a project token", async t => {
   const dir = fixture(t);
   fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
-  const requests = mockPlanQuotaApi(t);
+  const planApi = mockPlanQuotaApi(t); const { requests } = planApi;
   assert.equal(await tryPlanOAuth("bigmodel", { organizationId: "org-other", projectId: "project-other" }, "3.16.2"), null);
   assert.equal(requests.length, 1);
 });

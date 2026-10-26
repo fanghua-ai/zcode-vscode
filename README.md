@@ -19,6 +19,8 @@
 
 ![输入区示意](https://raw.githubusercontent.com/fanghua-ai/zcode-vscode/main/media/composer-guide.png)
 
+如果图片没有出现，通常是访问 GitHub 的网络连接异常。可以稍后刷新页面，或查看下面的分区说明。
+
 | 位置 | 用途 |
 |------|------|
 | 输入框上方 | 排队消息和目标；排队项可调整顺序、编辑、删除或立即发送。 |
@@ -39,11 +41,11 @@
 
 ### 适配范围
 
-**Linux** 已测试，目前使用基本正常；**Windows** 已由作者实际测试，但仍发现过会话互不可见的适配问题；**macOS** 暂未实测，可能存在尚未发现的问题。Windows 和 macOS 的代码均已有适配，仍需在具体安装环境中验证。
+**Linux** 已测试，目前使用基本正常；**Windows** 已由作者实际测试，但仍发现过会话互不可见的适配问题；**macOS ARM64 和 Intel** 已通过 GitHub CI 的类型检查、完整单元测试、构建和打包检查，以及 VS Code 最低支持版 1.106.0 与当前稳定版中的 SQLite 扩展宿主回归。macOS 的真实账号登录、端到端聊天和界面体验仍待验证。[完整验证记录](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917427) · [SQLite 宿主验证记录](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917462)
 
-本版本已在 **ZCode 桌面端 3.12.3 和 3.14.4** 上验证；3.14.4 已完成真实会话切换与停止回归。更早的桌面版本不支持，未列出的版本仍需验证兼容性。
+本版本支持 **ZCode 桌面端 3.12.3–3.16.3**。已验证 3.12.3、3.14.4 和 3.16.3；3.14.4 已完成真实会话切换与停止回归，3.16.2 起适配了会话列表协议变化。更早或更新的桌面版本不在支持范围内。
 
-2.0.2 进一步适配桌面端 **3.16.2** 的 Coding Plan 鉴权和自定义 API 配置。3.16.2 已通过隔离配置下的真实运行时会话切换、停止和附件回归；Z.AI 个人套餐仍需真实账号验证，macOS 仍未实测。
+2.0.2 进一步适配桌面端 **3.16.2** 的 Coding Plan 鉴权和自定义 API 配置。3.16.2 已通过隔离配置下的真实运行时会话切换、停止和附件回归；Z.AI 个人套餐仍需真实账号验证；macOS 的 CI 验证不包含桌面端真实账号聊天。
 
 桌面端更新后协议可能变化，建议确认扩展兼容性后再更新。
 
@@ -56,7 +58,7 @@
 | # | 条件 | 如何确认 |
 |---|------|----------|
 | 1 | VS Code **1.106 或更高**，已安装本扩展并 **Reload Window** | 帮助 → 关于 |
-| 2 | 已安装 **ZCode 桌面端 3.12.3 或 3.14.4**，且能找到 `zcode.cjs` | 见下方[探测路径](#zcodecjs-探测顺序) |
+| 2 | 已安装 **ZCode 桌面端 3.12.3–3.16.3**，且能找到 `zcode.cjs` | 见下方[探测路径](#zcodecjs-探测顺序) |
 | 3 | 桌面端 **已经登录过** | 存在 `~/.zcode/v2/setting.json` 和 `~/.zcode/v2/credentials.json` |
 | 4 | 当前桌面选择里有 **还能用的模型凭据**（个人或团队项目，且有额度） | 桌面端能正常开一个新对话 |
 
@@ -227,7 +229,7 @@ macOS 可再查 `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`。Win
 | `Provider … has no usable API key` | 选中的供应商在当前登录里没有密钥 | 桌面端切回有密钥的项目，或换模型 |
 | `ZCode startup failed` / `ZCode process exited` | 子进程立刻退出 | 日志 stderr；确认 `binaryPath` 指向 `.cjs`，`cmd` 是 VS Code 的运行时 |
 | `无法定位 CLI ZCode Built-in Provider Config` | 桌面更新后 app-server 找不到内置模型配置 | 确认桌面已打开过一次；扩展会带上 `ZCODE_BUILTIN_PROVIDER_*` 环境变量。若仍失败，检查 `/opt/ZCode/resources/config/provider/zcode-builtin.json`（macOS 在 `ZCode.app/Contents/Resources/config/provider/`） |
-| `Unrecognized key` / `Method not found` / `not in the workspace model registry` | 桌面端版本和本扩展不匹配 | 把 ZCode 桌面升到当前最新，并安装对应的本扩展 vsix |
+| `Unrecognized key` / `Method not found` / `-32602` | 桌面端升级后 app-server 协议发生变化 | 确认桌面端在 3.12.3–3.16.3 内，并安装匹配的扩展版本后重新连接 |
 | `余额不足` / 类似额度错误 | 当前桌面选择的套餐没额度 | 桌面端换有额度的项目，再「重新读取登录」 |
 | `当前 VS Code 运行环境不支持原生 SQLite` | 扩展宿主缺少所需的 `node:sqlite` 模块 | 更新 VS Code 后重试；数据库读取和写入都需要原生 SQLite |
 | 历史里归档会话跑到「活动」 | 读不了桌面的 `tasks-index.sqlite`（少见） | 看日志里 sqlite / archive；VS Code 过旧时能力会降级，一般仍能聊 |
@@ -280,6 +282,8 @@ Chat with the ZCode agent from the VS Code secondary side bar (the right-hand ch
 
 ![Composer layout](https://raw.githubusercontent.com/fanghua-ai/zcode-vscode/main/media/composer-guide.en.png)
 
+If the image does not appear, the connection to GitHub is usually unavailable. Refresh the page later, or use the section guide below.
+
 | Location | Purpose |
 |----------|---------|
 | Above the composer | Queued messages and goals. Reorder, edit, delete, or send a queued message immediately. |
@@ -300,11 +304,11 @@ For development and contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). This 
 
 ### Compatibility
 
-**Linux** has been tested and is currently working well. **Windows** has been tested by the author, but session visibility issues have still been found. **macOS** has not been tested on a real machine and may have undiscovered issues. Both Windows and macOS have platform adaptations, which still need verification in each installation environment.
+**Linux** has been tested and is currently working well. **Windows** has been tested by the author, but session visibility issues have still been found. **macOS ARM64 and Intel** have passed type checks, the full unit suite, builds and package checks in GitHub CI, plus SQLite regression tests inside real VS Code extension hosts on the minimum supported version 1.106.0 and the current stable version. Real-account sign-in, end-to-end chat and the UI experience on macOS still need verification. [Full verification](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917427) · [SQLite host verification](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917462)
 
-This version has been verified with **ZCode desktop 3.12.3 and 3.14.4**, including real session-switching and stop-behavior regression checks on 3.14.4. Earlier desktop versions are unsupported; unlisted versions still require compatibility testing.
+This version supports **ZCode desktop 3.12.3-3.16.3**. Versions 3.12.3, 3.14.4, and 3.16.3 have been verified; 3.14.4 completed real session-switching and stop-behavior checks, and the session-list protocol change starting in 3.16.2 is handled. Earlier or newer desktop versions are outside the supported range.
 
-Version 2.0.2 also adapts Coding Plan authentication and custom API configuration for desktop **3.16.2**. Its actual runtime has passed session-switching, stop, and attachment regressions with isolated fixtures. Z.AI personal plans still need real-account validation; macOS remains untested.
+Version 2.0.2 also adapts Coding Plan authentication and custom API configuration for desktop **3.16.2**. Its actual runtime has passed session-switching, stop, and attachment regressions with isolated fixtures. Z.AI personal plans still need real-account validation; macOS CI does not cover real-account desktop chat.
 
 Desktop updates may change the protocol. Check extension compatibility before updating.
 
@@ -317,7 +321,7 @@ Before starting a chat, check the following:
 | # | Requirement | How to check |
 |---|-------------|--------------|
 | 1 | VS Code **1.106 or newer**, with this extension installed and the window reloaded | Help → About |
-| 2 | **ZCode desktop 3.12.3 or 3.14.4**, with `zcode.cjs` found | See [discovery order](#zcodecjs-discovery-order) below |
+| 2 | **ZCode desktop 3.12.3-3.16.3**, with `zcode.cjs` found | See [discovery order](#zcodecjs-discovery-order) below |
 | 3 | You have **signed in to the desktop app at least once** | `~/.zcode/v2/setting.json` and `~/.zcode/v2/credentials.json` exist |
 | 4 | The current desktop selection has **usable model credentials** (an individual or team project that still has quota) | The desktop app can start a new chat |
 
@@ -479,7 +483,7 @@ Error cards provide recovery steps and direct actions for models, connections an
 | `Provider … has no usable API key` | The selected provider has no key in the current sign-in | Switch back to a project that has a key, or change the model |
 | `ZCode startup failed` / `ZCode process exited` | The child process exited immediately | Read stderr in the log; confirm `binaryPath` points at the `.cjs` file and `cmd` is the VS Code runtime |
 | `无法定位 CLI ZCode Built-in Provider Config` | After a desktop update, app-server cannot find the built-in model config | Open the desktop app once; the extension sets `ZCODE_BUILTIN_PROVIDER_*`. If it still fails, check `/opt/ZCode/resources/config/provider/zcode-builtin.json` (on macOS, `ZCode.app/Contents/Resources/config/provider/`) |
-| `Unrecognized key` / `Method not found` / `not in the workspace model registry` | The desktop version and this extension do not match | Update the ZCode desktop to the current latest, and install the matching extension vsix |
+| `Unrecognized key` / `Method not found` / `-32602` | A desktop update changed the app-server protocol | Use desktop 3.12.3-3.16.3, install the matching extension, and reconnect |
 | `余额不足` or a similar quota error | The plan selected in the desktop app has no quota | Switch to a project that has quota, then “重新读取登录” |
 | `当前 VS Code 运行环境不支持原生 SQLite` | This VS Code runtime does not support native SQLite | Update VS Code and retry |
 | An archived session shows under “活动” (Active) in history | The desktop `tasks-index.sqlite` could not be read (uncommon) | Check sqlite / archive in the log; a very old VS Code degrades this, and chat usually still works |

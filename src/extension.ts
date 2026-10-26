@@ -313,8 +313,33 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private fileSearchCancellation?: vscode.CancellationTokenSource;
   private recentFiles: string[] = [];
   private diagnosticStatus = "disconnected";
+  private startupPhase: "starting" | "restoring" | null = null;
+  private startupPhaseSince = 0;
+  private startupPhaseTimer: NodeJS.Timeout | undefined;
+  private sessionListRequest = 0;
+  private sessionListViews: Record<"active" | "archived", {
+    sessions: SessionSummary[];
+    state: "unknown" | "ready" | "failed";
+    loaded: boolean;
+  }> = {
+    active: { sessions: [], state: "unknown", loaded: false },
+    archived: { sessions: [], state: "unknown", loaded: false },
+  };
   private recentIssues: Array<{at: string; category: IssueCategory}> = [];
   private pendingChip?: ContextChip;
+
+  private resetSessionListCache(): void {
+    this.sessions = [];
+    this.sessionListViews = {
+      active: { sessions: [], state: "unknown", loaded: false },
+      archived: { sessions: [], state: "unknown", loaded: false },
+    };
+  }
+
+  private adoptWorkspace(next: string): void {
+    if (this.workspacePath && !sameWorkspacePath(this.workspacePath, next)) this.resetSessionListCache();
+    this.workspacePath = next;
+  }
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.context.subscriptions.push(
@@ -550,6 +575,33 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     if (isSlowWindowsStartup(process.platform, snapshot)) {
       void this.offerDefenderExclusion(Number(snapshot["session/resume"]));
     }
+  }
+
+  private beginStartupPhase(phase: "starting" | "restoring"): void {
+    this.startupPhase = phase;
+    this.startupPhaseSince = Date.now();
+    this.postStartupPhase();
+    if (this.startupPhaseTimer) clearInterval(this.startupPhaseTimer);
+    this.startupPhaseTimer = setInterval(() => this.postStartupPhase(), 1000);
+    this.startupPhaseTimer.unref?.();
+  }
+
+  private postStartupPhase(): void {
+    if (!this.startupPhase) return;
+    const waitedSeconds = Math.floor((Date.now() - this.startupPhaseSince) / 1000);
+    this.post({
+      type: "status",
+      status: "connecting",
+      phase: this.startupPhase,
+      ...(waitedSeconds >= 8 ? { waitedSeconds } : {}),
+    });
+  }
+
+  private clearStartupPhase(): void {
+    this.startupPhase = null;
+    if (!this.startupPhaseTimer) return;
+    clearInterval(this.startupPhaseTimer);
+    this.startupPhaseTimer = undefined;
   }
 
   /** Explain the measured Defender cost of a cold plugin scan; the user decides. */
@@ -1012,7 +1064,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         await this.newSession();
         break;
       case "listSessions":
-        await this.refreshSessions(!!msg.includeArchived);
+        await this.refreshSessions(!!msg.includeArchived, undefined, msg.listVisible === true);
         break;
       case "switchSession":
         if (msg.sessionId) await this.switchSession(msg.sessionId);
@@ -1555,12 +1607,17 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   async quickSwitchSession(): Promise<void> {
     await this.refreshSessions();
-    if (this.sessions.length === 0) {
+    const active = this.sessionListViews.active;
+    if (active.state === "failed" && !active.loaded) {
+      vscode.window.showInformationMessage(t("会话列表加载失败"));
+      return;
+    }
+    if (active.sessions.length === 0) {
       vscode.window.showInformationMessage(t("此工作区还没有会话。"));
       return;
     }
     const picked = await vscode.window.showQuickPick(
-      this.sessions.map((s) => ({
+      active.sessions.map((s) => ({
         label: s.title || t("未命名"),
         description: s.model?.modelId,
         detail: s.sessionId,
@@ -1662,7 +1719,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       await this.startZCode({ resumeSessionId: sessionId });
       return;
     }
-    if (this.client.currentSessionId === sessionId) return;
+    if (this.client.currentSessionId === sessionId && this.client.sessionAttached) return;
     const client = this.client;
     const timing = new StartupTiming("switch", true);
     this.timing = timing;
@@ -1895,6 +1952,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       timing.add("locateBinary", Date.now() - locateStarted);
       const message = userFacingError(e);
       logError("Could not locate ZCode app-server", e);
+      this.clearStartupPhase();
       this.showStartupError(message);
       this.post({ type: "session_error", message });
       return;
@@ -1908,9 +1966,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
     }
     workspacePath = preferredWorkspacePath(workspacePath, readV2Settings()?.recentProjects);
-    this.workspacePath = workspacePath;
+    this.adoptWorkspace(workspacePath);
 
-    this.post({ type: "status", status: "resolving_credentials" });
+    this.beginStartupPhase("starting");
 
     const loginStarted = Date.now();
     this.desktopAppVersion = desktopVersion(binaryPath);
@@ -1944,6 +2002,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     timing.add("resolveRuntime", Date.now() - loginStarted);
     timing.note("loginNetwork", loginNetwork);
     if (!resolved.ok || !resolved.runtime) {
+      this.clearStartupPhase();
       this.post({
         type: "setup",
         reason: resolved.reason,
@@ -1961,16 +2020,20 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     if (resolved.warning) {
       vscode.window.showWarningMessage(`ZCode: ${resolved.warning}`);
     }
-    const configStarted = Date.now();
-    syncCliConfig(runtime, readV2Config());
-    timing.add("syncCliConfig", Date.now() - configStarted);
+    try {
+      this.syncStartupConfig(runtime, timing);
+    } catch (error) {
+      this.failStartupPreparation(error);
+      return;
+    }
 
-    this.post({ type: "status", status: "connecting" });
     this.disposeClient();
 
     const remembered =
       opts?.resumeSessionId ||
       (opts?.createNew ? undefined : this.context.workspaceState.get<string>(LAST_SESSION_KEY));
+
+    this.beginStartupPhase(remembered ? "restoring" : "starting");
 
     const client = new ZCodeClient({
       binaryPath,
@@ -2010,6 +2073,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (this.client !== client) return;
       const message = userFacingError(e);
       logError("ZCode startup failed", e);
+      this.clearStartupPhase();
       this.showStartupError(message);
       this.post({ type: "session_error", message });
     }
@@ -2062,7 +2126,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       newSessionDefaults?: NewSessionDefaults;
     }
   ): Promise<void> {
-    this.post({ type: "status", status: "connecting" });
+    this.beginStartupPhase(launch.remembered ? "restoring" : "starting");
     this.disposeClient();
     const client = new ZCodeClient({
       binaryPath: launch.binaryPath,
@@ -2082,13 +2146,17 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     client.setViewVisible(this.view?.visible === true);
     client.setTiming(timing);
     this.startRunningPoll();
+    // Observe rejection immediately, even when configuration failure returns first.
     const startup = client.start({
       createNew: launch.createNew,
       resumeSessionId: launch.remembered,
       applyModel: !!launch.createNew,
       newSessionDefaults: launch.newSessionDefaults,
       chooseResume: (listed, rejected) => this.chooseStartupSession(listed, launch.remembered, rejected),
-    });
+    }).then(
+      () => ({ status: "fulfilled" as const }),
+      reason => ({ status: "rejected" as const, reason })
+    );
     const settled = loginPromise.then((resolved) => {
       timing.add("resolveRuntime", Date.now() - loginStarted);
       timing.note("loginNetwork", resolved.exchangedLogin === true);
@@ -2100,17 +2168,27 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (!resolved.ok || !resolved.runtime) return false;
       this.runtime = resolved.runtime;
       if (resolved.warning) vscode.window.showWarningMessage(`ZCode: ${resolved.warning}`);
-      const configStarted = Date.now();
-      syncCliConfig(resolved.runtime, readV2Config());
-      timing.add("syncCliConfig", Date.now() - configStarted);
+      this.syncStartupConfig(resolved.runtime, timing);
       client.setDefaultRuntime(resolved.runtime);
       return true;
     });
-    const [started, ready] = await Promise.allSettled([startup, settled]);
+    const ready = await settled.then(
+      value => ({ status: "fulfilled" as const, value }),
+      reason => ({ status: "rejected" as const, reason })
+    );
     if (this.client !== client) return;
-    if (ready.status === "rejected" || ready.value === false) {
+    if (ready.status === "rejected") {
+      // Config failed while the backend may still be starting. Stop this
+      // attempt immediately; its later result must not replace the error.
+      this.disposeClient();
+      this.failStartupPreparation(ready.reason);
+      return;
+    }
+    if (ready.value === false) {
       const resolved = await loginPromise.catch(() => null);
-      if (this.client === client) this.disposeClient();
+      if (this.client !== client) return;
+      this.clearStartupPhase();
+      this.disposeClient();
       this.post({
         type: "setup",
         reason: resolved?.reason,
@@ -2121,9 +2199,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.pushNewSessionDefaults();
       return;
     }
+    const started = await startup;
+    if (this.client !== client) return;
     if (started.status === "rejected") {
       const message = userFacingError(started.reason);
       logError("ZCode startup failed", started.reason);
+      this.clearStartupPhase();
       this.showStartupError(message);
       this.post({ type: "session_error", message });
       return;
@@ -2138,6 +2219,23 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       await vscode.commands.executeCommand("workbench.action.openSettings", `@id:zcode.${action}`);
     } else if (action === "pickModel") await this.quickSelectModel();
     else await this.startZCode({ force: true });
+  }
+
+  private syncStartupConfig(runtime: ResolvedRuntime, timing: StartupTiming): void {
+    const started = Date.now();
+    try {
+      syncCliConfig(runtime, readV2Config());
+    } finally {
+      timing.add("syncCliConfig", Date.now() - started);
+    }
+  }
+
+  private failStartupPreparation(error: unknown): void {
+    const message = userFacingError(error);
+    logError("ZCode startup preparation failed", error);
+    this.clearStartupPhase();
+    this.showStartupError(message);
+    this.post({ type: "session_error", message });
   }
 
   private showStartupError(message: string, recoveryOverride?: RecoveryAction): void {
@@ -2159,6 +2257,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const ticket = this.switchTicket;
     if (!client || !sessionId) return;
     const isCurrent = () => client === this.client && sessionId === client.currentSessionId && ticket === this.switchTicket;
+    this.clearStartupPhase();
     this.post({ type: "session_ready", sessionId, title: client.currentTitle || "新会话", viewGen: ticket });
     this.paintTitle(client.currentTitle);
     if (opts?.forceHistory || !client.historyDelivered(sessionId)) {
@@ -2182,13 +2281,18 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async refreshSessions(includeArchived = false, startupList?: SessionSummary[]): Promise<void> {
+  private async refreshSessions(includeArchived = false, startupList?: SessionSummary[], listVisible = false): Promise<void> {
     const client = this.client;
     const ticket = this.switchTicket;
     if (!client) return;
+    const view = includeArchived ? "archived" : "active";
+    const workspacePath = this.workspacePath;
+    const request = ++this.sessionListRequest;
+    const currentRequest = () => client === this.client && ticket === this.switchTicket
+      && request === this.sessionListRequest && sameWorkspacePath(workspacePath, this.workspacePath);
     try {
       const serverList = startupList ?? await client.listSessions(true);
-      if (client !== this.client || ticket !== this.switchTicket) return;
+      if (!currentRequest()) return;
       const indexStarted = Date.now();
       const archiveTimes = loadSessionArchiveTimes(serverList.map(s => s.sessionId));
       const listed = serverList.map(s => archiveTimes.has(s.sessionId)
@@ -2201,7 +2305,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       const archived = new Set(flags.archived);
       const deleted = new Set(flags.deleted);
       const overridden = loadOverriddenTitles(this.workspacePath);
-      this.sessions = listed
+      const displayed = listed
         .map((s) => {
           const title = overridden[s.sessionId] || s.title;
           const model = s.model || this.sessionModelFor(s.sessionId);
@@ -2217,11 +2321,18 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           ...s,
           archivedAt: s.archivedAt ?? (archived.has(s.sessionId) ? 1 : undefined),
         }));
+      const other = view === "active" ? "archived" : "active";
+      const shown = new Set(displayed.map(session => session.sessionId));
+      this.sessionListViews[other].sessions = this.sessionListViews[other].sessions
+        .filter(session => !shown.has(session.sessionId));
+      this.sessionListViews[view] = { sessions: displayed, state: "ready", loaded: true };
+      this.sessions = displayed;
       this.post({
         type: "sessions",
-        sessions: this.sessions,
-        currentId: this.client.currentSessionId,
+        sessions: this.sessionListViews[view].sessions,
+        currentId: client.currentSessionId,
         includeArchived,
+        notice: "ready",
       });
       let indexed = 0;
       for (const s of listed) {
@@ -2240,8 +2351,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           updatedAt: s.updatedAt,
           archived: archived.has(s.sessionId) || !!s.archivedAt,
           mode:
-            s.sessionId === this.client.currentSessionId
-              ? this.client.currentMode()
+            s.sessionId === client.currentSessionId
+              ? client.currentMode()
               : undefined,
         });
         indexed++;
@@ -2250,7 +2361,20 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.timing?.add("sessionListIndex", Date.now() - indexStarted);
       this.timing?.addCount("sessionListIndexCount", indexed);
     } catch (e) {
+      if (!currentRequest()) return;
       logWarn("listSessions failed", e);
+      const cached = this.sessionListViews[view];
+      cached.state = "failed";
+      // The webview keeps one list. A hidden failure must not replace the
+      // page currently on screen, and a page with no cache cannot borrow the other.
+      if (!listVisible) return;
+      this.post({
+        type: "sessions",
+        sessions: cached.loaded ? cached.sessions : [],
+        currentId: this.client?.currentSessionId,
+        includeArchived,
+        notice: cached.loaded ? "stale" : "initial",
+      });
     }
   }
 
@@ -2604,6 +2728,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.client.pollBackgroundRuns();
     // An unsupported runtime cannot read session storage; avoid repeatedly retrying at the normal rate.
     this.runningPoll = setInterval(() => this.client?.pollBackgroundRuns(), nativeSqliteAvailable() ? 1500 : 15000);
+    this.runningPoll.unref?.();
   }
 
   private pendingOpenSettings = false;
@@ -2705,6 +2830,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   dispose(): void {
     this.fileSearchCancellation?.cancel();this.fileSearchCancellation?.dispose();
     this.releaseViewListeners();
+    this.clearStartupPhase();
     this.disposeClient();
   }
 }
@@ -2743,6 +2869,7 @@ export type WebviewIn = {
   modelId?: string;
   restart?: boolean;
   includeArchived?: boolean;
+  listVisible?: boolean;
   requestId?: string;
   actionRequestId?: string;
   optionId?: string;

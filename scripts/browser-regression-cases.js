@@ -2395,6 +2395,41 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(document.getElementById('thought-chip').getAttribute('aria-label').includes('Low')||document.getElementById('thought-chip').getAttribute('aria-label').includes('低'),'reasoning rollback did not restore the confirmed choice');
   document.getElementById('plan-indicator').click();const request=sent.filter(item=>item.type==='setMode').at(-1);check(request?.mode==='build'&&request.sessionId==='A'&&request.viewGen===gen,'leaving plan used an unconfirmed permission or lost ownership');
  });
+await test('startup status separates service startup from restoring the last chat',async()=>{
+ reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});
+ const label=document.getElementById('conn-label');
+ const original=Date.now;let now=original();Date.now=()=>now;
+ try{
+  emit({type:'status',status:'connecting',phase:'starting'});
+  check(label.textContent==='正在启动服务','service startup was not named');
+  emit({type:'status',status:'connecting',phase:'restoring',waitedSeconds:8});
+  check(label.textContent.includes('正在恢复上次会话')&&label.textContent.includes('已等待 8 秒')&&label.textContent.includes('草稿会保留'),'long restore did not explain the wait and preserved draft');
+  now+=1000;await new Promise(resolve=>setTimeout(resolve,1100));check(label.textContent.includes('已等待 9 秒'),'visible startup wait did not advance');
+  emit({type:'session_ready',sessionId:'A',viewGen:gen});
+  check(label.textContent==='已连接','connected session kept the startup wait');
+ }finally{Date.now=original;}
+});
+await test('session list failures stay inside the list and remain distinct from an empty workspace',()=>{
+ reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});
+ document.getElementById('btn-sessions').click();
+ emit({type:'sessions',includeArchived:false,currentId:'A',sessions:[],notice:'initial'});
+ const first=document.getElementById('session-list-notice');
+ check(!first.hidden&&first.textContent.includes('会话列表加载失败')&&!!first.querySelector('button'),'first failure looked like an empty workspace or had no retry');
+ check(!document.querySelector('#overlay-list').textContent.includes('没有匹配项'),'first failure used the empty-result message');
+ first.querySelector('button').click();
+ const firstRetry=sent.at(-1);
+ check(firstRetry?.type==='listSessions'&&firstRetry.includeArchived===false&&firstRetry.listVisible===true,'first failure did not retry the visible list');
+ emit({type:'sessions',includeArchived:false,currentId:'A',sessions:[{sessionId:'A',title:'上次会话'}],notice:'stale'});
+ const notice=document.getElementById('session-list-notice');
+ check(!notice.hidden&&notice.textContent.includes('刷新失败，当前显示上次结果')&&document.querySelector('#overlay-list').textContent.includes('上次会话'),'stale refresh replaced the previous result or hid the notice');
+ notice.querySelector('button').click();
+ const staleRetry=sent.at(-1);
+ check(staleRetry?.type==='listSessions'&&staleRetry.includeArchived===false&&staleRetry.listVisible===true,'session notice did not retry');
+ emit({type:'sessions',includeArchived:true,currentId:'A',sessions:[],notice:'initial'});
+ check(!document.querySelector('#overlay-list').textContent.includes('上次会话')&&document.getElementById('session-list-notice').textContent.includes('会话列表加载失败'),'archived first failure kept the active page');
+ emit({type:'sessions',includeArchived:false,currentId:'A',sessions:[{sessionId:'A',title:'上次会话'}],notice:'ready'});
+ check(document.getElementById('session-list-notice').hidden,'successful refresh left the failure notice');
+});
 await test('selected reply text falls back to the extension clipboard',async()=>{
  reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'copy-q',role:'user',text:'Question'},{id:'copy-a',role:'assistant',text:'Selected answer'}]});
  const prose=messages.querySelector('.message.assistant .md');

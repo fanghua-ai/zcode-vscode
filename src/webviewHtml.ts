@@ -1904,6 +1904,19 @@ export function getWebviewHtml(
   }
   .oi-sub { font-size: 11px; color: var(--z-muted); margin-top: 2px; }
   .overlay-empty { padding: 16px; color: var(--z-muted); font-size: 12px; }
+  .session-list-notice {
+    display: flex; align-items: center; gap: 8px;
+    margin: 2px 4px 8px; padding: 8px 10px; border-radius: 8px;
+    background: color-mix(in srgb, var(--z-warning) 12%, transparent);
+    color: var(--vscode-foreground); font-size: 11px; line-height: 1.4;
+  }
+  .session-list-notice[hidden] { display: none; }
+  .session-list-notice span { flex: 1; min-width: 0; }
+  .session-list-notice button {
+    flex: 0 0 auto; border: 0; border-radius: 6px; padding: 3px 7px;
+    background: transparent; color: var(--z-accent); font: inherit; font-size: 11px; cursor: pointer;
+  }
+  .session-list-notice button:hover { background: var(--vscode-toolbar-hoverBackground); }
   #setup-recovery { padding:0 12px 10px; }
   #setup-hint { padding: 0 12px 8px; font-size: 12px; color: var(--z-muted); line-height: 1.4; }
 
@@ -2126,6 +2139,9 @@ export function getWebviewHtml(
         <button type="button" id="tab-archived" class="tab-btn">${t("Archived")}</button>
       </div>
       <input id="overlay-search" placeholder="${t("Filter…")}">
+      <div id="session-list-notice" class="session-list-notice" hidden role="status">
+        <span></span><button type="button" data-i18n-key="重试">${t("重试")}</button>
+      </div>
       <div id="overlay-list"></div>
     </div>
   </div>

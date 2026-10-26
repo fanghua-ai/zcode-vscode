@@ -303,6 +303,9 @@ let currentAssistantEl: HTMLElement | null = null;
 let overlayMode: "sessions" | "models" | "mode" | "thought" | null = null;
 let showArchived = false;
 let sessions: Session[] = [];
+let sessionListNotice: "ready" | "stale" | "initial" = "ready";
+let startupWaitTimer = 0;
+let startupWait: { key: string; startedAt: number } | null = null;
 type SessionAction = "rename" | "archive" | "unarchive" | "delete";
 const pendingSessionActions = new Map<string, { action: SessionAction; requestId: string }>();
 let sessionActionRequestSequence = 0;
@@ -832,6 +835,37 @@ function setConnStatus(kind: "idle" | "busy" | "error" | "warn", text?: string):
   connStatus.title = label;
 }
 
+function clearStartupWait(): void {
+  if (startupWaitTimer) window.clearInterval(startupWaitTimer);
+  startupWaitTimer = 0;
+  startupWait = null;
+}
+
+function showStartupWait(phase: string, waitedSeconds = 0): void {
+  const key = phase === "restoring" ? "正在恢复上次会话" : "正在启动服务";
+  const base = t(key);
+  const waited = waitedSeconds >= 8 ? t("已等待 {0} 秒 · 草稿会保留", { 0: waitedSeconds }) : "";
+  const label = waited ? `${base} · ${waited}` : base;
+  setConnStatus("busy", label);
+  connLabel.dataset.i18nKey = key;
+  connLabel.dataset.i18nValues = JSON.stringify(waitedSeconds >= 8 ? { 0: waitedSeconds } : {});
+  connStatus.title = label;
+}
+
+function beginStartupWait(phase: string, waitedSeconds = 0): void {
+  const startedAt = Date.now() - Math.max(0, waitedSeconds) * 1000;
+  if (!startupWait || startupWait.key !== phase) {
+    clearStartupWait();
+    startupWait = { key: phase, startedAt };
+  } else startupWait.startedAt = startedAt;
+  const paint = () => {
+    if (!startupWait) return;
+    showStartupWait(startupWait.key, Math.floor((Date.now() - startupWait.startedAt) / 1000));
+  };
+  paint();
+  if (!startupWaitTimer) startupWaitTimer = window.setInterval(paint, 1000);
+}
+
 function setGenerating(generating: boolean, preserveCompletionReveal = false): void {
   if (!generating && !holdStreams) finishAssistantRendering();
   const wasGenerating = isGenerating;
@@ -854,6 +888,7 @@ function setGenerating(generating: boolean, preserveCompletionReveal = false): v
     if (!preserveCompletionReveal) revealAfterCompletionArmed = false;
     stopWorkTicker();
     resolveOpenPrompts();
+    clearStartupWait();
     setConnStatus("idle", t("已连接"));
     workingIndicator()?.remove();
   }
@@ -4940,12 +4975,21 @@ function openOverlay(mode: "sessions" | "models" | "mode" | "thought"): void {
     document.getElementById("tab-active")?.classList.add("active");
     document.getElementById("tab-archived")?.classList.remove("active");
     if (isGenerating && currentSessionId) runningSessions.add(currentSessionId);
-    post({ type: "listSessions", includeArchived: false });
+    post({ type: "listSessions", includeArchived: false, listVisible: true });
     rebuildOverlay("");
     overlaySearch.focus();
     return;
   }
   openPicker(mode);
+}
+
+function paintSessionListNotice(): void {
+  const notice = document.getElementById("session-list-notice");
+  if (!notice) return;
+  const failed = overlayMode === "sessions" && (sessionListNotice === "stale" || sessionListNotice === "initial");
+  notice.hidden = !failed;
+  const label = notice.querySelector("span");
+  if (label) setUiLabel(label, sessionListNotice === "initial" ? "会话列表加载失败" : "刷新失败，当前显示上次结果");
 }
 
 function pickerAnchor(mode: "models" | "mode" | "thought"): HTMLElement {
@@ -5014,6 +5058,7 @@ function rebuildOverlay(query: string): void {
   const listEl =
     overlayMode === "sessions" ? overlayList : popoverList;
   listEl.innerHTML = "";
+  paintSessionListNotice();
 
   if (overlayMode === "sessions") {
     const ranked = [...sessions].sort((a, b) => {
@@ -5078,7 +5123,13 @@ function rebuildOverlay(query: string): void {
   }
 
   if (overlayItems.length === 0) {
-    listEl.innerHTML = `<div class="overlay-empty">${t("Nothing matches.")}</div>`;
+    if (overlayMode === "sessions" && sessionListNotice === "initial") {
+      listEl.innerHTML = "";
+      placePicker();
+      return;
+    }
+    const key = "Nothing matches.";
+    listEl.innerHTML = `<div class="overlay-empty" data-i18n-key="${escapeText(key)}">${t(key)}</div>`;
     placePicker();
     return;
   }
@@ -7106,6 +7157,8 @@ function applyInterfaceLanguage(language: string, setting: LanguageSetting): voi
   input.placeholder = command ? commandDescription(command) : composerPlaceholder();
   for (const fold of messagesEl.querySelectorAll<HTMLElement>(".work-fold")) paintWorkFold(fold);
   refreshEmptyGreeting();
+  if (startupWait) showStartupWait(startupWait.key, Math.floor((Date.now() - startupWait.startedAt) / 1000));
+  paintSessionListNotice();
   if (overlayMode) rebuildOverlay(overlaySearch.value);
   placePicker();
 }
@@ -7117,13 +7170,13 @@ document.getElementById("tab-active")?.addEventListener("click", () => {
   showArchived = false;
   document.getElementById("tab-active")?.classList.add("active");
   document.getElementById("tab-archived")?.classList.remove("active");
-  post({ type: "listSessions", includeArchived: false });
+  post({ type: "listSessions", includeArchived: false, listVisible: true });
 });
 document.getElementById("tab-archived")?.addEventListener("click", () => {
   showArchived = true;
   document.getElementById("tab-archived")?.classList.add("active");
   document.getElementById("tab-active")?.classList.remove("active");
-  post({ type: "listSessions", includeArchived: true });
+  post({ type: "listSessions", includeArchived: true, listVisible: true });
 });
 document.getElementById("btn-new")!.addEventListener("click", () => {
   post({ type: "newSession" });
@@ -7150,6 +7203,9 @@ document.addEventListener("mousedown", (e) => {
   closePicker();
 });
 document.getElementById("overlay-close")!.addEventListener("click", closeOverlay);
+document.querySelector("#session-list-notice button")?.addEventListener("click", () => {
+  post({ type: "listSessions", includeArchived: showArchived, listVisible: true });
+});
 overlay.addEventListener("click", (e) => {
   if (e.target === overlay) closeOverlay();
 });
@@ -7181,6 +7237,7 @@ window.addEventListener("message", (event) => {
   switch (msg.type) {
     case "session_ready":
       hideSetup();
+      clearStartupWait();
       if (
         msg.sessionId &&
         conversationSessionId &&
@@ -7261,6 +7318,7 @@ window.addEventListener("message", (event) => {
       break;
     case "sessions":
       sessions = msg.sessions ?? [];
+      if (msg.notice === "initial" || msg.notice === "stale" || msg.notice === "ready") sessionListNotice = msg.notice;
       mentions.refresh();
       currentSessionId = msg.currentId || currentSessionId;
       {
@@ -7496,6 +7554,7 @@ window.addEventListener("message", (event) => {
       break;
     case "setup":
       sessionConnected = false;
+      clearStartupWait();
       setStatus("warn", msg.reason || t("Setup needed"));
       updateComposerActions();
       showSetup(msg.reason || t("Setup needed"), msg.hint || "", msg.picker || []);
@@ -7534,7 +7593,11 @@ window.addEventListener("message", (event) => {
       }
       else if (msg.status === "connecting" || msg.status === "resolving_credentials") {
         sessionConnected = false;
-        setStatus("busy", msg.status === "resolving_credentials" ? t("读取登录") : t("连接中"));
+        if (msg.phase === "starting" || msg.phase === "restoring") beginStartupWait(msg.phase, Number(msg.waitedSeconds) || 0);
+        else {
+          clearStartupWait();
+          setStatus("busy", msg.status === "resolving_credentials" ? t("读取登录") : t("连接中"));
+        }
         updateComposerActions();
       } else if (msg.status === "completedSuccess" || msg.status === "completedInterrupted") {
         const revealStart = msg.status === "completedSuccess" && revealAfterCompletionArmed && stickToBottom;
@@ -7553,6 +7616,7 @@ window.addEventListener("message", (event) => {
         }
       } else if (msg.status === "exited") {
         sessionConnected = false;
+        clearStartupWait();
         setGenerating(false);
         removePendingEditPens();
         settleWorkFolds("interrupted");
@@ -7560,6 +7624,7 @@ window.addEventListener("message", (event) => {
         setStatus("error", t("ZCode process exited"));
         if (!messagesEl.lastElementChild?.classList.contains("error")) addErrorMessage(msg.message || "ZCode process exited");
       } else if (msg.status === "error") {
+        clearStartupWait();
         setGenerating(false);
         removePendingEditPens();
         settleWorkFolds("interrupted");
@@ -7576,6 +7641,7 @@ window.addEventListener("message", (event) => {
       break;
     case "session_error":
       if (holdStreams) break;
+      clearStartupWait();
       setGenerating(false);
       removePendingEditPens();
       settleWorkFolds("interrupted");

@@ -41,7 +41,7 @@ const FIELD_KINDS = {
   dataUrl: "dataUrl", uris: "fileUris", fileName: "string", language: "string", chrome: "settingsObject",
   defaults: "settingsObject", chromeKey: "string", enabled: "boolean", text: "longString",
   sessionId: "string", providerId: "string", modelId: "string", restart: "boolean",
-  includeArchived: "boolean", requestId: "string", actionRequestId: "string", optionId: "string",
+  includeArchived: "boolean", listVisible: "boolean", requestId: "string", actionRequestId: "string", optionId: "string",
   mode: "string", planMode: "boolean", recoveryText: "longString", thoughtLevel: "string",
   viewGen: "number", title: "string", commit: "boolean", action: "string", content: "formAnswer",
   reason: "longString", path: "path", fileChange: "fileChange", previewCandidates: "stringList",
