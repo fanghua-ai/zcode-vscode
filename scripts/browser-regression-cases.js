@@ -6,7 +6,7 @@
  const check=(c,m)=>{if(!c)throw new Error(m)};
  let auditAborted=false;
  const test=async(name,fn)=>{if(auditAborted){tests.push({name,pass:true,skipped:true});return;}document.body.dataset.auditTest=name;let timer;try{await Promise.race([Promise.resolve().then(fn),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('scenario timed out after 15 seconds')),15000);})]);tests.push({name,pass:true});}catch(e){const error=e instanceof Error?e.message:String(e);tests.push({name,pass:false,error});if(error.includes('scenario timed out'))auditAborted=true;}finally{clearTimeout(timer);}};
- let gen=100;const reset=(sessionId='A')=>{emit({type:'view_reset',clear:true,viewGen:++gen});emit({type:'session_ready',sessionId,viewGen:gen,title:'自定义会话头发发布'});emit({type:'history',sessionId,viewGen:gen,items:[]});emit({type:'stream_release'});document.getElementById('input').value='';document.getElementById('input').dispatchEvent(new Event('input'));document.querySelectorAll('#attachments .ctx-chip button').forEach(button=>button.click());document.getElementById('active-command')?.click();window.sent.length=0;};
+ let gen=100;const reset=(sessionId='A')=>{emit({type:'view_reset',clear:true,viewGen:++gen});emit({type:'session_ready',sessionId,viewGen:gen,title:'自定义会话头发发布'});emit({type:'history',sessionId,viewGen:gen,items:[]});emit({type:'stream_release'});document.getElementById('input').value='';document.getElementById('input').dispatchEvent(new Event('input'));document.querySelectorAll('#attachments .ctx-chip button, #selected-skills button').forEach(button=>button.click());document.getElementById('active-command')?.click();window.sent.length=0;};
  const input=document.getElementById('input');const sendBtn=document.getElementById('send-btn');const messages=document.getElementById('messages');const type=text=>{input.value=text;input.dispatchEvent(new Event('input'));};
 
 
@@ -628,6 +628,7 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
  await test('running history keeps an intermediate answer inside later thinking',()=>{reset();emit({type:'history',sessionId:'A',viewGen:gen,activeSince:Date.now()-4000,items:[{id:'mid-q',role:'user',text:'MID_Q'},{id:'mid-a',role:'assistant',turnId:'mid-task',text:'',running:true,steps:[{kind:'reasoning',text:'MID_ONE',partId:'mid-1'},{kind:'text',text:'MID_REPLY',partId:'mid-text'},{kind:'reasoning',text:'MID_TWO',partId:'mid-2'}]}]});const body=messages.querySelector('.work-fold-body');const order=[...body.children].map(node=>node.classList.contains('work-note')?node.textContent:node.classList.contains('message')?node.dataset.copyText:'');check(order.filter(Boolean).join('|')==='MID_ONE|MID_REPLY|MID_TWO','intermediate answer left the running fold');check(!messages.querySelector(':scope > .message.assistant'),'intermediate answer rendered below the fold');});
  await test('finishing history keeps the live work duration',()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});const started=Date.now()-12000;emit({type:'history',sessionId:'A',viewGen:gen,activeSince:started,items:[{id:'live-q',role:'user',text:'LIVE_Q'},{id:'live-thought',role:'assistant',turnId:'live-task',text:'',running:true,work:{text:'LIVE_THOUGHT'},steps:[{kind:'reasoning',text:'LIVE_THOUGHT'}]}]});emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'live-q',role:'user',text:'LIVE_Q'},{id:'live-thought',role:'assistant',turnId:'live-task',text:'',work:{text:'LIVE_THOUGHT'},steps:[{kind:'reasoning',text:'LIVE_THOUGHT'}]},{id:'live-answer',role:'assistant',turnId:'live-task',text:'LIVE_ANSWER',steps:[{kind:'text',text:'LIVE_ANSWER'}]}]});const label=messages.querySelector('.work-fold-label').textContent;check(label.startsWith('已工作 ')&&label!=='已工作','finished turn dropped the live duration');});
  await test('settled work keeps its duration when the completion redraw has no server time',()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});const started=Date.now()-12000;emit({type:'history',sessionId:'A',viewGen:gen,activeSince:started,items:[{id:'done-q',role:'user',text:'DONE_Q'},{id:'done-thought',role:'assistant',turnId:'done-task',text:'',running:true,work:{text:'DONE_THOUGHT'},steps:[{kind:'reasoning',text:'DONE_THOUGHT'}]}]});emit({type:'status',sessionId:'A',status:'completedSuccess'});const frozen=messages.querySelector('.work-fold').dataset.durationMs;check(!!frozen&&messages.querySelector('.work-fold-label').textContent.startsWith('已工作 '),'settle did not freeze the live duration');const finished=[{id:'done-q',role:'user',text:'DONE_Q'},{id:'done-thought',role:'assistant',turnId:'done-task',text:'',work:{text:'DONE_THOUGHT'},steps:[{kind:'reasoning',text:'DONE_THOUGHT'}]},{id:'done-answer',role:'assistant',turnId:'done-task',text:'DONE_ANSWER',steps:[{kind:'text',text:'DONE_ANSWER'}]}];emit({type:'history',sessionId:'A',viewGen:gen,items:finished});const fold=messages.querySelector('.work-fold');check(fold.dataset.durationMs===frozen&&fold.querySelector('.work-fold-label').textContent.startsWith('已工作 ')&&fold.querySelector('.work-fold-label').textContent!=='已工作','completion redraw dropped the settled duration');emit({type:'history',sessionId:'A',viewGen:gen,items:finished});check(messages.querySelector('.work-fold').dataset.durationMs===frozen,'later redraw grew the finished duration');});
+ await test('late turn timing refresh replaces the generic work label with elapsed time',()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});const initial=[{id:'late-q',role:'user',text:'LATE_Q'},{id:'late-work',role:'assistant',turnId:'late-turn',text:'',steps:[{kind:'reasoning',text:'LATE_THOUGHT'}]}];emit({type:'history',sessionId:'A',viewGen:gen,items:initial});check(messages.querySelector('.work-fold-label').textContent==='已工作','missing timing did not use the generic label');emit({type:'history',sessionId:'A',viewGen:gen,items:initial.map(item=>item.id==='late-work'?{...item,createdAt:1000,endedAt:121000,workDurationMs:65000}:item)});check(messages.querySelector('.work-fold-label').textContent==='已工作 1 分 5 秒','late turn timing was not rendered');});
  await test('work after an inserted prompt restarts its clock from the insert',()=>{
   reset();
   const T0=Date.now()-27*60000,T1=Date.now()-3*60000,T2=Date.now();
@@ -681,6 +682,105 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(!menu.classList.contains('open'),'blur did not close the menu');
   input.focus();
   check(menu.classList.contains('open'),'refocusing a / draft did not reopen the menu');
+ });
+ await test('catalog refresh preserves the highlighted slash item by identity',()=>{
+  reset('slash-refresh-selection');
+  emit({type:'session_ready',sessionId:'slash-refresh-selection',viewGen:gen,slashCommands:[]});
+  emit({type:'skill_catalog',sessionId:'slash-refresh-selection',skills:[{name:'alpha',description:'',path:'/alpha/SKILL.md'},{name:'beta',description:'',path:'/beta/SKILL.md'}]});
+  input.focus();type('/');input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+  check(document.querySelector('#slash-menu .active .slash-name')?.textContent==='beta','beta was not highlighted');
+  emit({type:'skill_catalog',sessionId:'slash-refresh-selection',skills:[{name:'new',description:'',path:'/new/SKILL.md'},{name:'alpha',description:'',path:'/alpha/SKILL.md'},{name:'beta',description:'',path:'/beta/SKILL.md'}]});
+  check(document.querySelector('#slash-menu .active .slash-name')?.textContent==='beta','refresh changed the highlighted skill');
+  input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(document.querySelector('#selected-skills button')?.textContent.includes('beta'),'Enter selected a different skill after refresh');
+  document.querySelector('#selected-skills button').click();type('/');input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+  emit({type:'skill_catalog',sessionId:'slash-refresh-selection',skills:[{name:'new',description:'',path:'/new/SKILL.md'},{name:'beta',description:'',path:'/beta/SKILL.md'}]});
+  check(document.querySelector('#slash-menu .active .slash-name')?.textContent==='new','removed selection did not fall back to the first item');
+ });
+ await test('multiple skills remain visible and survive draft switching and send failure',()=>{
+  reset('skills-owner');
+  emit({type:'skill_catalog',sessionId:'skills-owner',skills:[{name:'alpha',description:'first',path:'/My Skills/alpha/SKILL.md'},{name:'beta',description:'second',path:'C:\\Skills\\beta\\SKILL.md'}]});
+  const choose=name=>{input.focus();type('/'+name);input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));};
+  input.focus();type('/alpha');const option=document.querySelector('#slash-menu .slash-item.skill');
+  check(option?.querySelector('.slash-icon')?.textContent==='$'&&option.querySelector('.slash-name')?.textContent==='alpha','skill menu repeated the dollar sign');
+  choose('alpha');type('What is this? /beta');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(input.value==='What is this? '&&document.querySelectorAll('#selected-skills button').length===2,'multiple skills or existing prompt text were not retained');
+  check(document.getElementById('selected-skills').parentElement===document.getElementById('active-command').parentElement,'skills are not in the command toolbar');
+  emit({type:'view_reset',viewGen:++gen});emit({type:'session_ready',sessionId:'other-skill-owner',viewGen:gen});
+  check(document.querySelectorAll('#selected-skills button').length===0,'skills leaked to another session');
+  emit({type:'view_reset',viewGen:++gen});emit({type:'session_ready',sessionId:'skills-owner',viewGen:gen});emit({type:'history',sessionId:'skills-owner',viewGen:gen,items:[]});emit({type:'stream_release'});
+  check(document.querySelectorAll('#selected-skills button').length===2,'skills did not restore with the draft');
+  emit({type:'addChip',chip:{path:'/test/example.ts',relPath:'example.ts'}});
+  sendBtn.click();const request=sent.find(message=>message.type==='send');
+  check(request?.text.includes('[$alpha](</My Skills/alpha/SKILL.md>)')&&request.text.includes('[$beta](C:/Skills/beta/SKILL.md)')&&request.chips.length===1,'serialized skill paths or file reference missing: '+JSON.stringify(request?.text));
+  let bubble=[...messages.querySelectorAll('.message.user:not(.queued)')].at(-1);
+  check(bubble.querySelectorAll('.skill-ref-chip').length===2&&bubble.querySelector('.user-chips')?.textContent.includes('example.ts')&&!bubble.textContent.includes('SKILL.md'),'sent message did not render skills with the file reference');
+  emit({type:'send_rejected',commandId:request.commandId,sessionId:'skills-owner',message:'rejected'});
+  check(input.value==='What is this?'&&document.querySelectorAll('#selected-skills button').length===2,'send failure did not restore skills');
+  document.querySelector('#selected-skills button').click();
+  check(document.querySelectorAll('#selected-skills button').length===1,'skill removal did not work');
+  sendBtn.click();const retry=sent.filter(message=>message.type==='send').at(-1);
+  check(!retry.text.includes('[$alpha]')&&retry.text.includes('[$beta]'),'removed skill was still submitted');
+ });
+ await test('multiple skill labels remain reachable in the command toolbar',()=>{
+  reset('skills-layout');const skills=Array.from({length:6},(_,index)=>({name:'long-skill-'+index,description:'',path:'/skills/'+index+'/SKILL.md'}));
+  emit({type:'skill_catalog',sessionId:'skills-layout',skills});
+  for(const skill of skills){input.focus();type('/'+skill.name);input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));const row=document.getElementById('selected-skills'),item=row.querySelector('button:last-child'),box=row.getBoundingClientRect(),rect=item.getBoundingClientRect();check(rect.right<=box.right+1&&rect.left>=box.left-1,'newly selected skill is not visible');}
+  const row=document.getElementById('selected-skills'),last=row.querySelector('button:last-child'),bounds=row.getBoundingClientRect();
+  check(row.clientWidth>0&&row.scrollWidth>row.clientWidth,'multiple skill labels cannot be scrolled');
+  row.scrollLeft=row.scrollWidth;const lastBounds=last.getBoundingClientRect();
+  check(lastBounds.right<=bounds.right+1&&lastBounds.left>=bounds.left-1,'last skill is not reachable');
+  const sendBounds=sendBtn.getBoundingClientRect(),cardBounds=document.querySelector('.composer-card').getBoundingClientRect();
+  check(sendBounds.width>0&&sendBounds.right<=cardBounds.right,'skill labels hid the send button');
+  last.click();check(row.querySelectorAll('button').length===5,'scrolled skill label cannot be removed');
+ });
+ await test('skill-only requests can be queued and recovered after rejection',()=>{
+  reset('skills-queue');emit({type:'skill_catalog',sessionId:'skills-queue',skills:[{name:'alpha',description:'',path:'/skills/alpha/SKILL.md'}]});
+  input.focus();type('/alpha');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  emit({type:'status',sessionId:'skills-queue',status:'running'});sendBtn.click();
+  const request=sent.find(message=>message.type==='insert');
+  check(request?.text==='[$alpha](/skills/alpha/SKILL.md)'&&document.querySelector('#queue-zone .skill-ref-chip'),'skill-only draft was not queued visibly');
+  emit({type:'queue_rejected',commandId:request.queueItemId,sessionId:'skills-queue',message:'rejected'});
+  check(document.querySelector('#selected-skills button')?.textContent.includes('alpha'),'rejected queue lost the selected skill');
+ });
+ await test('restored user messages render skills inline with their question',()=>{
+  reset('skills-history');
+  emit({type:'history',sessionId:'skills-history',viewGen:gen,items:[{id:'skill-history',role:'user',text:'[example.ts](./example.ts)\n\n[$alpha](/skills/alpha/SKILL.md)\n\nExplain this'}]});
+  const bubble=messages.querySelector('.message.user');
+  check(bubble?.querySelector('.user-chips')?.textContent.includes('example.ts')&&bubble.querySelector('.user-body .skill-ref-chip')?.textContent==='alpha'&&bubble.querySelector('.user-body')?.textContent.includes('Explain this'),'restored skill message lost its label or question');
+  check(!bubble.textContent.includes('SKILL.md'),'restored skill path leaked into the message');
+ });
+ await test('skills and multiple subagents share composer chips and render after sending',()=>{
+  reset('agent-owner');
+  emit({type:'skill_catalog',sessionId:'agent-owner',skills:[{name:'alpha',description:'',path:'/skills/alpha/SKILL.md'}]});
+  emit({type:'subagent_catalog',sessionId:'agent-owner',agents:[{name:'Explore',description:'Search',source:'built-in'},{name:'demo:reviewer',description:'Review',source:'plugin'}]});
+  const choose=query=>{input.focus();type(query);input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));};
+  choose('/alpha');choose('/@Explore');choose('/@demo:reviewer');
+  check(document.querySelectorAll('#selected-skills button').length===3,'combined selections missing');
+  type('Check the changes');sendBtn.click();const request=sent.find(message=>message.type==='send');
+  check(request?.text==='[$alpha](/skills/alpha/SKILL.md)\n\n@Explore @demo:reviewer Check the changes','subagent prompt was not serialized correctly: '+JSON.stringify(request?.text));
+  const bubble=[...messages.querySelectorAll('.message.user:not(.queued)')].at(-1);
+  check(bubble.querySelectorAll('.skill-ref-chip').length===1&&bubble.querySelectorAll('.agent-ref-chip').length===2&&!bubble.textContent.includes('SKILL.md'),'sent references did not render inline');
+  emit({type:'send_rejected',commandId:request.commandId,sessionId:'agent-owner',message:'rejected'});
+  check(input.value==='Check the changes'&&document.querySelectorAll('#selected-skills button').length===3,'rejected send lost selected subagents');
+ });
+ await test('commands refuse selected capabilities without losing the draft',()=>{
+  reset('goal-capability');
+  emit({type:'session_ready',sessionId:'goal-capability',viewGen:gen,slashCommands:[{name:'goal',description:'goal',inputHint:'/goal [objective]'}]});
+  emit({type:'skill_catalog',sessionId:'goal-capability',skills:[{name:'alpha',description:'',path:'/skills/alpha/SKILL.md'}]});
+  input.focus();type('/alpha');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  type('/goal');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('目标');sendBtn.click();
+  check(!sent.some(message=>message.type==='send'||message.type==='insert'),'goal with a skill was submitted as text');
+  check(input.value==='目标'&&document.querySelector('#selected-skills button'),'blocked goal lost its draft');
+ });
+ await test('ordinary mentions stay plain in submitted messages',()=>{
+  reset('plain-mention');type('通知 @someone');sendBtn.click();
+  const bubble=[...messages.querySelectorAll('.message.user:not(.queued)')].at(-1);
+  check(bubble?.textContent.includes('@someone')&&!bubble.querySelector('.agent-ref-chip'),'ordinary mention was rendered as a subagent');
+ });
+ await test('opening the slash menu refreshes the active reference catalog',()=>{
+  reset('refresh-catalog');input.focus();type('/');
+  check(sent.some(message=>message.type==='refreshReferenceCatalog'&&message.sessionId==='refresh-catalog'),'catalog refresh was not requested');
  });
  await test('goal verification timeline renders as a pass or fail marker',()=>{
   reset();

@@ -207,7 +207,7 @@ try {
     emit({type:'ui_language',language:'en',setting:'en'});
     check(document.documentElement.lang === 'en','document language did not change');
     check(document.getElementById('language-label').textContent === 'Interface language','language label was not translated');
-    check(document.getElementById('input').placeholder === 'Ask ZCode, @ to add context, / to choose capabilities','composer placeholder was not translated');
+    check(document.getElementById('input').placeholder === 'Ask ZCode, @ to add context, / to choose commands or capabilities','composer placeholder was not translated');
     check(document.getElementById('conn-label').textContent === 'Stopped','existing status was not translated');
     check(messages.querySelector('.work-fold-label')?.textContent === 'Worked 1m 5s','work fold did not change language');
     check(permissionTitle.textContent===literalTool+' requires approval','dynamic permission label was reverse-matched or untranslated');

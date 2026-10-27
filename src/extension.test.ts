@@ -377,6 +377,8 @@ test("resolving a new view releases the previous view's listeners first", () => 
 test("every page load receives the session state, even without a new resolveWebviewView", async () => {
   const f = fixture();
   const pushes: Array<{ forceHistory?: boolean } | undefined> = [];
+  const refreshed: string[] = [];
+  Object.assign(f.state.client, { refreshSkillCatalog: () => refreshed.push("skills"), refreshSubagentCatalog: () => refreshed.push("agents") });
   f.state.pushSessionState = async opts => { pushes.push(opts); f.state.pushedEpoch = f.state.webviewEpoch; };
   await f.state.onWebviewMessage({ type: "ready" });
   assert.equal(pushes.length, 1);
@@ -384,6 +386,7 @@ test("every page load receives the session state, even without a new resolveWebv
   // Reload Webviews / renderer recovery: the same view posts "ready" again from a blank page.
   await f.state.onWebviewMessage({ type: "ready" });
   assert.equal(pushes.length, 2, "a reloaded page stayed blank");
+  assert.deepEqual(refreshed, ["skills", "agents", "skills", "agents"]);
   f.dispose();
 });
 

@@ -48,7 +48,7 @@ test("initial webview renders the selected language before its first message", (
   const webview = { cspSource: "test:", asWebviewUri: () => "test:webview.js" } as unknown as Webview;
   const html = getWebviewHtml(webview, {} as Uri, "test-nonce", { locale: "en", setting: "auto", vscodeLanguage: "en" });
   assert.match(html, /<html lang="en" data-ui-language="en" data-language-setting="auto"/);
-  assert.ok(html.includes('placeholder="Ask ZCode, @ to add context, / to choose capabilities"'));
+  assert.ok(html.includes('placeholder="Ask ZCode, @ to add context, / to choose commands or capabilities"'));
   assert.ok(html.includes('id="btn-settings" title="Settings"'));
   assert.ok(html.includes('>Follow VS Code</option>'));
   assert.ok(html.indexOf("New chat defaults") < html.indexOf("Interface"));

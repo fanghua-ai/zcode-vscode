@@ -7,7 +7,7 @@ import { readImageAttachments, IMAGE_MAX_BYTES, IMAGE_MAX_COUNT, IMAGE_MIMES, ty
 import { greetingKey, nextGreetingDelay } from "../greeting";
 import { EMPTY_LOGO } from "./emptyLogo";
 import { t, setUiLanguage, getUiLanguage, resolveUiLanguage, relocalizeUiText, type LanguageSetting } from "../i18n";
-import { ComposerDrafts, type ComposerDraft } from "../composerDrafts";
+import { ComposerDrafts, type ComposerDraft, type SkillReference, type AgentReference } from "../composerDrafts";
 import { renderMarkdown } from "./markdown";
 import { localMarkdownFileLink } from "../markdownFileLink";
 import { QuestionAnswers } from "../userInput";
@@ -18,6 +18,9 @@ import {
   ContextChip,
   chipLabel,
   chipTitle,
+  markdownLinkRef,
+  extractLeadingSkills,
+  extractLeadingAgents,
   parsePromptDisplay,
   buildPrompt,
   stripSessionReferences,
@@ -370,20 +373,23 @@ const composerDrafts = new ComposerDrafts(vscode.getState()?.composerDrafts);
 let draftSessionId = typeof vscode.getState()?.draftSessionId === "string" ? String(vscode.getState()!.draftSessionId) : "";
 let explicitChips: ContextChip[] = [];
 let explicitSessionRefs: SessionReference[] = [];
+let selectedSkills: SkillReference[] = [];
+let selectedAgents: AgentReference[] = [];
 let imageDrafts: DraftImage[] = [];
 const pendingInputs = new Map<string, { sessionId: string; draft: ComposerDraft }>();
 
 function persistComposerDraft(): void {
   const text = activeCommand ? `/${activeCommand} ${input.value}` : input.value;
-  composerDrafts.set(draftSessionId, text, explicitChips, imageDrafts, explicitSessionRefs);
+  composerDrafts.set(draftSessionId, text, explicitChips, imageDrafts, explicitSessionRefs, selectedSkills, selectedAgents);
   vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId });
 }
 
 function restoreComposerDraft(draft: ComposerDraft): void {
-  const persisted = /^\/([a-zA-Z][a-zA-Z0-9_-]*) ([\s\S]*)$/.exec(draft.text);
+  const restored = draft.skills?.length ? { text: draft.text, skills: draft.skills } : extractLeadingSkills(draft.text);
+  const persisted = /^\/([a-zA-Z][a-zA-Z0-9_-]*) ([\s\S]*)$/.exec(restored.text);
   const known = !!persisted && slashCommands.some(item => item.name === persisted[1]);
   activeCommand = persisted && (known || !slashCommands.length) ? persisted[1] : undefined;
-  input.value = activeCommand ? persisted![2] : draft.text;
+  input.value = activeCommand ? persisted![2] : restored.text;
   if (activeCommand) {
     const entry = slashCommands.find(item => item.name === activeCommand);
     input.placeholder = entry ? commandDescription(entry) : composerPlaceholder();
@@ -391,10 +397,13 @@ function restoreComposerDraft(draft: ComposerDraft): void {
   updateActiveCommandChip();
   explicitChips = draft.chips;
   explicitSessionRefs = draft.sessionRefs ?? [];
+  selectedSkills = restored.skills;
+  selectedAgents = draft.agents ?? [];
   imageDrafts = draft.images ?? [];
   renderImageDrafts();
   resizeComposerInput();
   renderComposerChips();
+  renderSelectedSkills();
   updateComposerActions();
 }
 
@@ -424,7 +433,9 @@ function prepareComposerSwitch(): void {
 function recoverInput(msg: { commandId?: string; sessionId?: string; text?: string; chips?: ContextChip[]; sessionRefs?: SessionReference[]; attachments?: ImageAttachment[] }): void {
   const pending = msg.commandId ? pendingInputs.get(msg.commandId) : undefined;
   const owner = pending ? (pending.sessionId || msg.sessionId || "") : msg.sessionId;
-  const failed = pending?.draft ?? (typeof msg.text === "string" ? { text: msg.text, chips: msg.chips ?? [], sessionRefs: msg.sessionRefs ?? [], images: readImageAttachments(msg.attachments).map(image => ({...image,id:crypto.randomUUID(),sessionId:owner || "",status:"ready" as const})) } : undefined);
+  const recoveredText = typeof msg.text === "string" ? extractLeadingSkills(msg.text) : undefined;
+  const recoveredAgents = recoveredText ? extractLeadingAgents(recoveredText.text) : undefined;
+  const failed = pending?.draft ?? (recoveredText && recoveredAgents ? { ...recoveredText, ...recoveredAgents, chips: msg.chips ?? [], sessionRefs: msg.sessionRefs ?? [], images: readImageAttachments(msg.attachments).map(image => ({...image,id:crypto.randomUUID(),sessionId:owner || "",status:"ready" as const})) } : undefined);
   if (msg.commandId) pendingInputs.delete(msg.commandId);
   if (owner === undefined || !failed) return;
   persistComposerDraft();
@@ -495,7 +506,7 @@ function imageResult(msg: any): void {
     const attachment = readImageAttachments([msg.attachment])[0];
     images[index] = attachment ? { ...images[index], ...attachment, status: "ready" } : { ...images[index], status: "error" };
   }
-  composerDrafts.set(owner, draft.text, draft.chips, images, draft.sessionRefs);
+  composerDrafts.set(owner, draft.text, draft.chips, images, draft.sessionRefs, draft.skills, draft.agents);
   if (owner === draftSessionId) {
     imageDrafts = composerDrafts.get(owner).images ?? [];
     renderImageDrafts(); updateComposerActions();
@@ -510,7 +521,7 @@ async function cacheThumbnail(dataUrl: string, owner: string, id: string): Promi
     persistComposerDraft(); const draft = composerDrafts.get(owner); const item = draft.images?.find(image => image.id === id);
     if (!item) return;
     cacheDraftPreview(id, dataUrl);
-    item.thumbnail = thumbnail; composerDrafts.set(owner, draft.text, draft.chips, draft.images, draft.sessionRefs);
+    item.thumbnail = thumbnail; composerDrafts.set(owner, draft.text, draft.chips, draft.images, draft.sessionRefs, draft.skills, draft.agents);
     if (owner === draftSessionId) { imageDrafts = draft.images ?? []; renderImageDrafts(); }
     vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize() });
     return true;
@@ -915,7 +926,7 @@ function ensureWorkingIndicator(): void {
 }
 
 function composerHasText(): boolean {
-  return input.value.trim().length > 0 || imageDrafts.length > 0;
+  return input.value.trim().length > 0 || imageDrafts.length > 0 || selectedSkills.length > 0 || selectedAgents.length > 0;
 }
 
 function updateComposerActions(): void {
@@ -1976,32 +1987,31 @@ function addUserMessage(
   const shownSessionRefs = sessionRefs.length ? sessionRefs : parsed.sessionRefs;
   el.dataset.sessionRefs = JSON.stringify(shownSessionRefs);
   el.dataset.retryText = parsed.sessionRefs.length ? text : chips.length || sessionRefs.length ? buildPrompt(text, chips, sessionRefs) : text;
+  const parsedSkills = parsed.chips.filter(chip => chip.label.startsWith("$"));
   const shown = chips.length
     ? chips
         .filter((c) => !c.hidden)
         .map((c) => ({ label: chipLabel(c), title: chipTitle(c) }))
+        .concat(parsedSkills.length ? parsed.chips : [])
     : parsed.chips;
-  const body = chips.length ? text : parsed.body;
+  const body = chips.length && !parsedSkills.length ? text : parsed.body;
   const sessionRefHtml = shownSessionRefs.map(reference =>
     `<span class="ctx-chip session-ref-chip" title="${escapeText(reference.title)}">${SESSION_REF_ICON}<span>${escapeText(reference.title)}</span></span>`
   ).join("");
-  const chipHtml = shown.length || sessionRefHtml
-    ? `<div class="user-chips">${shown
-        .map(
-          (c) =>
-            `<span class="ctx-chip" title="${escapeText(c.title)}"><span>${escapeText(
-              c.label
-            )}</span></span>`
-        )
-        .join("")}${sessionRefHtml}</div>`
+  const skillHtml = skillRefsHtml(shown);
+  const fileHtml = shown.filter(c => !c.label.startsWith("$")).map(c =>
+    `<span class="ctx-chip" title="${escapeText(c.title)}"><span>${escapeText(c.label)}</span></span>`
+  ).join("");
+  const chipHtml = fileHtml || sessionRefHtml
+    ? `<div class="user-chips">${fileHtml}${sessionRefHtml}</div>`
     : "";
   const queuedUi = queued
     ? `<div class="queued-tag">${t("排队中，当前回复结束后发送")}</div>`
     : "";
   const commandParts = queued ? undefined : splitCommandBody(body);
   const bodyHtml = commandParts
-    ? `${commandParts.badge}${escapeText(commandParts.rest)}`
-    : escapeText(body);
+    ? `${commandParts.badge}${renderUserText(commandParts.rest)}`
+    : renderUserText(body);
   const actions = queued
     ? `<div class="queued-actions">
         <button type="button" data-qact="now" title="${t("立即发送")}" aria-label="${t("立即发送")}">${lucideIcon("chevronsUp")}</button>
@@ -2009,7 +2019,7 @@ function addUserMessage(
         <button type="button" data-qact="delete" title="${t("删除")}" aria-label="${t("删除")}">${lucideIcon("trash2")}</button>
       </div>`
     : "";
-  el.innerHTML = `${queuedUi}${chipHtml}<div class="user-body">${bodyHtml}</div>${actions}`;
+  el.innerHTML = `${queuedUi}${chipHtml}<div class="user-body">${skillHtml}${skillHtml && bodyHtml ? " " : ""}${bodyHtml}</div>${actions}`;
   renderUserImages(el, images, attachmentTarget);
   if (!queued) {
     if (createdAt && createdAt > 0) el.dataset.sentAt = String(createdAt);
@@ -2537,7 +2547,7 @@ function cancelUserEdit(el: HTMLElement): void {
   const parsed = parsePromptDisplay(text);
   const body = document.createElement("div");
   body.className = "user-body";
-  body.textContent = parsed.body || text;
+  body.innerHTML = renderSubmittedBody(text);
   ta?.replaceWith(body);
   disarmEditImageRemoval(el);
   el.querySelector(".user-actions")?.remove();
@@ -2597,11 +2607,11 @@ function applyQueryRewind(el: HTMLElement, text: string, attachments: ImageAttac
   const ta = el.querySelector(".user-edit");
   const body = document.createElement("div");
   body.className = "user-body";
-  body.textContent = parsed.body || text;
+  body.innerHTML = renderSubmittedBody(text);
   if (ta) ta.replaceWith(body);
   else {
     const existing = el.querySelector(".user-body");
-    if (existing) existing.textContent = parsed.body || text;
+    if (existing) existing.innerHTML = renderSubmittedBody(text);
   }
   disarmEditImageRemoval(el);
   el.dataset.images = JSON.stringify(attachments);
@@ -3165,7 +3175,7 @@ function finishQueuedEdit(el: HTMLElement, text: string): void {
   const ta = el.querySelector(".queued-edit");
   const body = document.createElement("div");
   body.className = "user-body";
-  body.textContent = text;
+  body.innerHTML = renderSubmittedBody(text);
   ta?.replaceWith(body);
   const actions = el.querySelector(".queued-actions");
   if (actions) {
@@ -6068,7 +6078,7 @@ function syncQueuedMessages(): void {
     node.dataset.images = JSON.stringify(item.attachments ?? []);
     renderUserImages(node, item.attachments ?? []);
     if (item.sourceCommandId) node.dataset.sourceCommandId = item.sourceCommandId;
-    if (!node.querySelector(".queued-edit")) node.querySelector(".user-body")!.textContent = parsePromptDisplay(item.text).body;
+    if (!node.querySelector(".queued-edit")) node.querySelector(".user-body")!.innerHTML = renderSubmittedBody(item.text);
     if (queuedEditDrafts.has(queuedEditKey(currentSessionId, item.queueItemId))) beginQueuedEdit(node);
     node.querySelectorAll<HTMLButtonElement>("button").forEach(button => { button.disabled = false; });
     paintQueuedEdit(node);
@@ -6121,6 +6131,82 @@ function renderComposerChips(): void {
 }
 
 const SESSION_REF_ICON = '<svg class="session-ref-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 3.5h10a1.5 1.5 0 0 1 1.5 1.5v5a1.5 1.5 0 0 1-1.5 1.5H8l-3.5 2v-2H3A1.5 1.5 0 0 1 1.5 10V5A1.5 1.5 0 0 1 3 3.5Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg>';
+const SKILL_ICON = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m3 13 7-7 2 2-7 7H3v-2ZM3 2v3M1.5 3.5h3M10.5 1v3M9 2.5h3M13 4.5v3M11.5 6h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const AGENT_ICON = lucideIcon("brain", { size: 14 });
+
+function skillRefsHtml(chips: Array<{ label: string; title: string }>): string {
+  return chips.filter(chip => chip.label.startsWith("$")).map(chip =>
+    `<span class="skill-ref-chip" title="${escapeText(chip.title)}">${SKILL_ICON}<span>${escapeText(chip.label.slice(1))}</span></span>`
+  ).join(" ");
+}
+
+function renderSubmittedBody(text: string): string {
+  const parsed = parsePromptDisplay(text);
+  const skills = skillRefsHtml(parsed.chips);
+  const body = renderUserText(parsed.body);
+  return `${skills}${skills && body ? " " : ""}${body}`;
+}
+
+function renderUserText(text: string): string {
+  const known = new Set([...slashAgents.map(agent => agent.name), ...selectedAgents.map(agent => agent.name)].map(name => name.toLowerCase()));
+  let html = "", rest = text;
+  for (;;) {
+    const match = /^@([A-Za-z0-9][A-Za-z0-9._:-]{0,255})(?=\s|$)/.exec(rest);
+    if (!match || !known.has(match[1].toLowerCase())) break;
+    html += `<span class="agent-ref-chip" title="${escapeText(match[0])}">${AGENT_ICON}<span>${escapeText(match[0])}</span></span>`;
+    rest = rest.slice(match[0].length);
+    const whitespace = /^\s+/.exec(rest)?.[0] ?? "";
+    html += escapeText(whitespace);
+    rest = rest.slice(whitespace.length);
+  }
+  return html + escapeText(rest);
+}
+
+function renderSelectedSkills(reveal?: { kind: "skill" | "agent"; key: string }): void {
+  const row = document.getElementById("selected-skills")!;
+  const previousScroll = row.scrollLeft;
+  let target: HTMLElement | undefined;
+  row.replaceChildren();
+  for (const skill of selectedSkills) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "toolbar-btn selected-skill";
+    button.title = `${t("移除")} · $${skill.name}`;
+    button.setAttribute("aria-label", button.title);
+    button.innerHTML = `<span class="chip-icon">${SKILL_ICON}</span><span class="chip-close">${CLOSE}</span><span class="skill-label">${escapeText(skill.name)}</span>`;
+    if (reveal?.kind === "skill" && reveal.key === skill.path) target = button;
+    button.addEventListener("click", () => {
+      selectedSkills = selectedSkills.filter(item => item.path !== skill.path);
+      renderSelectedSkills();
+      persistComposerDraft();
+      updateComposerActions();
+    });
+    row.appendChild(button);
+  }
+  for (const agent of selectedAgents) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "toolbar-btn selected-skill selected-agent";
+    button.title = `${t("移除")} · @${agent.name}`;
+    button.setAttribute("aria-label", button.title);
+    button.innerHTML = `<span class="chip-icon">${AGENT_ICON}</span><span class="chip-close">${CLOSE}</span><span class="skill-label">${escapeText(agent.name)}</span>`;
+    if (reveal?.kind === "agent" && reveal.key.toLowerCase() === agent.name.toLowerCase()) target = button;
+    button.addEventListener("click", () => {
+      selectedAgents = selectedAgents.filter(item => item.name !== agent.name);
+      renderSelectedSkills();
+      persistComposerDraft();
+      updateComposerActions();
+    });
+    row.appendChild(button);
+  }
+  row.hidden = !selectedSkills.length && !selectedAgents.length;
+  row.scrollLeft = previousScroll;
+  if (target) {
+    const bounds = row.getBoundingClientRect(), item = target.getBoundingClientRect();
+    if (item.right > bounds.right) row.scrollLeft += item.right - bounds.right;
+    else if (item.left < bounds.left) row.scrollLeft -= bounds.left - item.left;
+  }
+}
 
 function makeSessionReferenceEl(reference: SessionReference, removable: boolean): HTMLElement {
   const chip = document.createElement("div");
@@ -6200,7 +6286,11 @@ function sendMessage(immediate = false): void {
   mentions.close();
   const body = input.value.trim();
   const planShortcut = activeCommand === "plan";
-  if (planShortcut && (imageDrafts.length || explicitChips.length || explicitSessionRefs.length)) {
+  if (activeCommand && (selectedSkills.length || selectedAgents.length)) {
+    showToast(t("命令暂不支持技能或子智能体引用，请先移除后重试。"));
+    return;
+  }
+  if (planShortcut && (imageDrafts.length || explicitChips.length || explicitSessionRefs.length || selectedSkills.length || selectedAgents.length)) {
     showToast(t("Plan 命令暂不支持图片或上下文引用，请先移除后重试。"));
     return;
   }
@@ -6214,7 +6304,9 @@ function sendMessage(immediate = false): void {
   }
   // Most active commands keep their slash prefix; /plan is a composer mode
   // shortcut and sends only its task body after the host switches the session.
-  const text = planShortcut ? body : activeCommand ? `/${activeCommand} ${body}`.trim() + (body ? "" : " ") : body;
+  const prompt = planShortcut ? body : activeCommand ? `/${activeCommand} ${body}`.trim() + (body ? "" : " ") : body;
+  const agentPrompt = [...selectedAgents.map(agent => `@${agent.name}`), prompt].filter(Boolean).join(" ");
+  const text = [...selectedSkills.map(skillReferenceMarkdown), agentPrompt].filter(Boolean).join("\n\n");
   if (!text.trim() && !imageDrafts.length) return;
   if (imageDrafts.length > IMAGE_MAX_COUNT) { showToast(t("最多添加 8 张图片。")); return; }
   if (imageDrafts.some(image => image.status !== "ready")) { showToast(t("请等待图片添加完成，或移除失败的图片。")); return; }
@@ -6223,8 +6315,8 @@ function sendMessage(immediate = false): void {
   const chips = activeChips();
   const refs = explicitSessionRefs.map(reference => ({ ...reference }));
   const commandId = crypto.randomUUID();
-  const recoveryText = planShortcut ? `/plan ${body}` : text;
-  pendingInputs.set(commandId, { sessionId: draftSessionId, draft: { text: recoveryText, chips: explicitChips.map(chip => ({ ...chip })), sessionRefs: refs, images } });
+  const recoveryText = planShortcut ? `/plan ${body}` : prompt;
+  pendingInputs.set(commandId, { sessionId: draftSessionId, draft: { text: recoveryText, chips: explicitChips.map(chip => ({ ...chip })), sessionRefs: refs, images, skills: selectedSkills.map(skill => ({ ...skill })), agents: selectedAgents.map(agent => ({ ...agent })) } });
   if (planShortcut) {
     planEnabled = true;
     applySessionControls({ mode: "plan", baseMode, planEnabled: true, thoughtEnabled, thoughtLevel: currentThought, thoughtLevels });
@@ -6233,7 +6325,10 @@ function sendMessage(immediate = false): void {
   clearActiveCommand();
   explicitChips = [];
   explicitSessionRefs = [];
+  selectedSkills = [];
+  selectedAgents = [];
   renderComposerChips();
+  renderSelectedSkills();
   imageDrafts = [];
   renderImageDrafts();
   persistComposerDraft();
@@ -6448,6 +6543,15 @@ const mentions = fileMentions(input, document.getElementById("composer")!, () =>
   });
 
 let slashCommands: Array<{ name: string; description: string; inputHint: string }> = [];
+type SlashSkill = { name: string; description: string; path: string };
+type SlashAgent = { name: string; description: string; source: string };
+type SlashMenuEntry =
+  | { kind: "command"; command: (typeof slashCommands)[number] }
+  | { kind: "skill"; skill: SlashSkill }
+  | { kind: "agent"; agent: SlashAgent };
+let slashSkills: SlashSkill[] = [];
+let slashAgents: SlashAgent[] = [];
+let referenceMenuOpen = false;
 /** Goal state from the v4 stream: drives the status strip and iteration markers. */
 type WebviewGoal = { objective: string; status: string; iteration: number; timeUsedSeconds: number; activeRunStartedAtMs?: number | null; localTickFrom?: number; verifications: Array<{ anchorTurnId?: string; anchorRowId?: number; iteration: number; passed: boolean }> };
 type GoalVerification = WebviewGoal["verifications"][number];
@@ -6666,7 +6770,7 @@ function restoreGoalHistoryMarks(): void {
 /** Active composer command (e.g. "goal"): shown as a toolbar chip, sent as a /prefix. */
 let activeCommand: string | undefined;
 function composerPlaceholder(): string {
-  return t("向 ZCode 提问，@ 添加上下文，/ 选择能力");
+  return t("向 ZCode 提问，@ 添加上下文，/ 选择命令或能力");
 }
 /** Live model-switch separators kept until the transcript's own timeline part covers them. */
 let modelMarks: Array<{ fromText?: string; toText: string; toId: string; anchorJump: string; anchorText: string }> = [];
@@ -6708,51 +6812,141 @@ function splitCommandBody(body: string): { badge: string; rest: string } | undef
   return { badge, rest: match[2] };
 }
 
-function slashMatches(): typeof slashCommands {
-  // The menu covers command-name completion only; once parameters begin the
-  // input stops matching and the menu closes. A bare "/" still opens it.
-  const match = /^\/([a-zA-Z][a-zA-Z0-9_-]*)?$/.exec(input.value.trim());
-  if (!match) return [];
-  const query = (match[1] ?? "").toLowerCase();
-  return slashCommands.filter(command => command.name.toLowerCase().startsWith(query));
+function slashToken(): { start: number; end: number; typed: string } | undefined {
+  if (input.selectionStart !== input.selectionEnd) return;
+  const end = input.selectionStart;
+  const match = /(?:^|\s)\/([a-zA-Z0-9@$._:-]*)$/.exec(input.value.slice(0, end));
+  if (!match) return;
+  return { start: match.index + (match[0].startsWith("/") ? 0 : 1), end, typed: match[1].toLowerCase() };
+}
+
+function slashMatches(): SlashMenuEntry[] {
+  if (activeCommand) return [];
+  const token = slashToken();
+  if (!token) return [];
+  const { typed } = token;
+  const skillQuery = typed.replace(/^\$/, "");
+  const agentQuery = typed.replace(/^@/, "");
+  const isWholeInput = !input.value.slice(0, token.start).trim() && !input.value.slice(token.end).trim();
+  const commands = /^[\$@]/.test(typed) || !isWholeInput ? [] : slashCommands.filter(command =>
+    command.name.toLowerCase().startsWith(typed));
+  return [
+    ...commands
+      .map(command => ({ kind: "command" as const, command })),
+    ...(typed.startsWith("@") ? [] : slashSkills)
+      .filter(skill => skill.name.toLowerCase().startsWith(skillQuery))
+      .map(skill => ({ kind: "skill" as const, skill })),
+    ...(typed.startsWith("$") ? [] : slashAgents)
+      .filter(agent => agent.name.toLowerCase().startsWith(agentQuery))
+      .map(agent => ({ kind: "agent" as const, agent })),
+  ];
 }
 
 function closeSlashMenu(): void {
   slashIndex = 0;
+  referenceMenuOpen = false;
   document.getElementById("slash-menu")?.classList.remove("open");
 }
 
-function renderSlashMenu(): void {
+function slashEntryKey(entry: SlashMenuEntry): string {
+  return entry.kind === "command" ? `command:${entry.command.name.toLowerCase()}`
+    : entry.kind === "skill" ? `skill:${entry.skill.path}` : `agent:${entry.agent.name.toLowerCase()}`;
+}
+
+function selectedSlashKey(): string | undefined {
+  if (!document.getElementById("slash-menu")?.classList.contains("open")) return undefined;
+  const entry = slashMatches()[slashIndex];
+  return entry ? slashEntryKey(entry) : undefined;
+}
+
+function renderSlashMenu(preserveKey?: string): void {
   const menu = document.getElementById("slash-menu");
   if (!menu) return;
+  if (slashToken() && document.activeElement === input && sessionConnected && currentSessionId && !referenceMenuOpen) {
+    referenceMenuOpen = true;
+    post({ type: "refreshReferenceCatalog", sessionId: currentSessionId });
+  }
   const items = slashMatches();
   if (!items.length || document.activeElement !== input) {
-    closeSlashMenu();
+    menu.classList.remove("open");
+    if (!slashToken() || document.activeElement !== input) referenceMenuOpen = false;
     return;
   }
-  slashIndex = Math.min(Math.max(slashIndex, 0), items.length - 1);
+  if (preserveKey !== undefined) {
+    const index = items.findIndex(item => slashEntryKey(item) === preserveKey);
+    slashIndex = index < 0 ? 0 : index;
+  } else slashIndex = Math.min(Math.max(slashIndex, 0), items.length - 1);
   menu.replaceChildren();
-  items.forEach((command, index) => {
+  let section: SlashMenuEntry["kind"] | undefined;
+  items.forEach((entry, index) => {
+    if (entry.kind !== section) {
+      section = entry.kind;
+      const heading = document.createElement("div");
+      heading.className = "slash-heading";
+      heading.textContent = t(entry.kind === "command" ? "命令" : entry.kind === "skill" ? "技能" : "子智能体");
+      menu.appendChild(heading);
+    }
     const item = document.createElement("button");
     item.type = "button";
-    item.className = "slash-item" + (index === slashIndex ? " active" : "");
+    item.className = `slash-item ${entry.kind}` + (index === slashIndex ? " active" : "");
     item.setAttribute("role", "option");
     item.setAttribute("aria-selected", String(index === slashIndex));
     const icon = document.createElement("span");
     icon.className = "slash-icon";
-    icon.innerHTML = COMMAND_ICONS[command.name] ?? COMMAND_ICON;
+    if (entry.kind === "command") icon.innerHTML = COMMAND_ICONS[entry.command.name] ?? COMMAND_ICON;
+    else if (entry.kind === "skill") { icon.classList.add("skill"); icon.textContent = "$"; }
+    else icon.innerHTML = AGENT_ICON;
     const name = document.createElement("span");
-    name.className = "slash-name"; name.textContent = `/${command.name}`;
+    name.className = "slash-name";
     const hint = document.createElement("span");
-    hint.className = "slash-hint"; hint.textContent = command.inputHint;
     const desc = document.createElement("span");
-    desc.className = "slash-desc"; desc.textContent = commandDescription(command);
+    desc.className = "slash-desc";
+    if (entry.kind === "command") {
+      name.textContent = `/${entry.command.name}`;
+      hint.className = "slash-hint";
+      hint.textContent = entry.command.inputHint;
+      desc.textContent = commandDescription(entry.command);
+    } else if (entry.kind === "skill") {
+      name.textContent = entry.skill.name;
+      hint.className = "slash-hint";
+      desc.textContent = entry.skill.description;
+    } else {
+      name.textContent = entry.agent.name;
+      hint.className = "slash-hint";
+      const source = entry.agent.source === "built-in" ? t("内置") : entry.agent.source === "workspace" ? t("工作区") : entry.agent.source === "plugin" ? t("插件") : t("用户");
+      desc.textContent = [source, entry.agent.description].filter(Boolean).join(" · ");
+    }
     item.append(icon, name, hint, desc);
     // pointerdown keeps the composer focus so the draft state stays intact.
-    item.addEventListener("pointerdown", event => { event.preventDefault(); applySlashCommand(command); });
+    item.addEventListener("pointerdown", event => { event.preventDefault(); applySlashMenuEntry(entry); });
     menu.appendChild(item);
   });
   menu.classList.add("open");
+}
+
+function skillReferenceMarkdown(skill: SkillReference): string {
+  return markdownLinkRef(`$${skill.name}`, skill.path);
+}
+
+function applySlashMenuEntry(entry: SlashMenuEntry): void {
+  if (entry.kind === "command") {
+    applySlashCommand(entry.command);
+    return;
+  }
+  const token = slashToken();
+  if (!token) return;
+  if (entry.kind === "skill") {
+    if (!selectedSkills.some(skill => skill.path === entry.skill.path)) selectedSkills.push({ name: entry.skill.name, path: entry.skill.path });
+  } else if (!selectedAgents.some(agent => agent.name.toLowerCase() === entry.agent.name.toLowerCase())) {
+    selectedAgents.push({ name: entry.agent.name });
+  }
+  input.setRangeText("", token.start, token.end, "end");
+  closeSlashMenu();
+  renderSelectedSkills(entry.kind === "skill" ? { kind: "skill", key: entry.skill.path } : { kind: "agent", key: entry.agent.name });
+  resizeComposerInput();
+  updateComposerActions();
+  persistComposerDraft();
+  input.focus();
 }
 
 /** Picking a command clears the composer: the body typed next is the parameter,
@@ -6870,7 +7064,7 @@ input.addEventListener("keydown", (e) => {
     }
     if ((e.key === "Tab" || e.key === "Enter") && items[slashIndex]) {
       e.preventDefault();
-      applySlashCommand(items[slashIndex]);
+      applySlashMenuEntry(items[slashIndex]);
       return;
     }
     if (e.key === "Escape") {
@@ -6921,7 +7115,7 @@ planIndicator.addEventListener("click", () => {
 });
 
 input.addEventListener("blur", closeSlashMenu);
-input.addEventListener("focus", renderSlashMenu);
+input.addEventListener("focus", () => renderSlashMenu());
 
 titleEl.addEventListener("focus", () => beginTitleEdit());
 titleEl.addEventListener("keydown", (e) => {
@@ -7108,7 +7302,7 @@ function applyInterfaceLanguage(language: string, setting: LanguageSetting): voi
   setUiLanguage(resolveUiLanguage(language, "en"));
   document.documentElement.lang = language;
   languageSelect.value = setting;
-  renderImageDrafts(); refreshImageLabels(); renderComposerChips();
+  renderImageDrafts(); refreshImageLabels(); renderComposerChips(); renderSelectedSkills();
   refreshPendingAction();
   // Refresh only extension-owned controls. Chat text, question choices, tool
   // input/output, drafts and session names remain untouched.
@@ -7225,6 +7419,7 @@ window.addEventListener("message", (event) => {
   }
   switch (msg.type) {
     case "session_ready":
+      if (msg.sessionId !== currentSessionId) { slashSkills = []; slashAgents = []; }
       hideSetup();
       clearStartupWait();
       if (
@@ -7251,6 +7446,28 @@ window.addEventListener("message", (event) => {
       sessionConnected = true;
       updateComposerActions();
       setStatus("idle", "");
+      renderSlashMenu();
+      break;
+    case "skill_catalog":
+      if (msg.sessionId !== currentSessionId) break;
+      {
+      const selected = selectedSlashKey();
+      slashSkills = Array.isArray(msg.skills)
+        ? msg.skills.filter((skill: { name?: unknown; description?: unknown; path?: unknown }) =>
+          typeof skill?.name === "string" && skill.name.length > 0 &&
+          typeof skill?.description === "string" && typeof skill?.path === "string")
+        : [];
+      renderSlashMenu(selected);
+      }
+      break;
+    case "subagent_catalog":
+      if (msg.sessionId !== currentSessionId) break;
+      {
+      const selected = selectedSlashKey();
+      slashAgents = Array.isArray(msg.agents) ? msg.agents.filter((agent: SlashAgent) =>
+        typeof agent?.name === "string" && typeof agent?.description === "string" && typeof agent?.source === "string") : [];
+      renderSlashMenu(selected);
+      }
       break;
     case "goal_state": {
       if (holdStreams) break;
@@ -7664,7 +7881,7 @@ window.addEventListener("message", (event) => {
     case "file_added": {
       persistComposerDraft(); const draft = composerDrafts.get(msg.sessionId);
       if (!draft.chips.some(chip => chip.path === msg.chip.path)) draft.chips.push(msg.chip);
-      composerDrafts.set(msg.sessionId, draft.text, draft.chips, draft.images, draft.sessionRefs);
+      composerDrafts.set(msg.sessionId, draft.text, draft.chips, draft.images, draft.sessionRefs, draft.skills, draft.agents);
       if (msg.sessionId === draftSessionId) { explicitChips = draft.chips; renderComposerChips(); }
       vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize() }); break;
     }

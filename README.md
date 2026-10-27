@@ -26,7 +26,7 @@
 | 输入框上方 | 排队消息和目标；排队项可调整顺序、编辑、删除或立即发送。 |
 | 顶部数字轨道 | 跳转历史问题；右侧三横线可折叠或恢复对话。 |
 | 输入框上沿 | 添加图片或文件、查看引用和连接状态。 |
-| 输入区 | 编写问题；`@` 引用工作区文件或会话，`/` 选择能力。 |
+| 输入区 | 编写问题；`@` 引用工作区文件或会话，`/` 搜索命令、技能和子智能体。 |
 | 左下角 | 切换模型、权限和推理强度；紧凑模式用盾牌图标表示权限，并可收起控件。 |
 | 右下角 | 双环显示上下文和额度概况；发送、立即插入与停止按钮随运行状态切换。 |
 | 下方额度栏 | 展开后查看上下文、5 小时与每周额度的比例和详情；第三方 API 可通过 `zcode.quotaAdapters` 映射显示。 |
@@ -101,7 +101,7 @@ code --install-extension zcode-desktop-chat-<版本>.vsix --force
 
 输入框上方显示手动加入的文件引用标签；选区引用带行号，可点击 × 移除。引用格式与桌面端相同，例如 `[main.ts](./src/main.ts#L12-L34)`。
 
-悬浮引用标签可查看完整路径、整个文件或选中片段，以及未保存修改提示。整文件引用在发送时读取最新编辑器内容；选区引用保留添加时的快照。图片分析卡片默认收起，展开后可分别查看参数和完整结果。
+输入 `/` 可搜索当前会话的命令、技能和子智能体；用上下键移动，Tab 或 Enter 选择。技能和子智能体可多次选择，在输入区下方显示并点击移除。悬浮引用标签可查看完整路径、整个文件或选中片段，以及未保存修改提示。整文件引用在发送时读取最新编辑器内容；选区引用保留添加时的快照。图片分析卡片默认收起，展开后可分别查看参数和完整结果。
 
 问询卡片在回答、拒绝或停止后会缩成工作区内的摘要行，点击可查看原问题和选择；完成后的选项不能重复提交。
 
@@ -110,7 +110,7 @@ code --install-extension zcode-desktop-chat-<版本>.vsix --force
 - **把选区加入对话** — 钉住选区
 - **把当前文件加入对话** — 钉住文件
 
-在输入框输入 `@` 可搜索当前会话工作区的文件和会话，文件排在前面、会话排在后面；继续输入文件名、路径或会话标题筛选。用上下键选择、Enter／Tab 添加引用，Escape 关闭。文件引用显示在输入框上方；会话引用显示为独立标签，并随草稿和发送失败恢复保留。文件搜索包括 `.vscode` 等隐藏配置文件，跳过 `.git`、依赖和构建目录；支持模糊匹配并优先显示最近打开的文件；输入查询后直接在整个工作区进行定向搜索，不再依赖最初列出的文件。最多展示 40 条文件结果，同一查询缓存约 15 秒；每种搜索模式最多取 5,000 个候选，空查询列出最多 1,000 个文件。失败时可点击重试或按 Enter。含空格的文件名可用 `@"文件 名"` 搜索。能力和技能选择暂未加入。
+在输入框输入 `@` 可搜索当前会话工作区的文件和会话，文件排在前面、会话排在后面；继续输入文件名、路径或会话标题筛选。用上下键选择、Enter／Tab 添加引用，Escape 关闭。文件引用显示在输入框上方；会话引用显示为独立标签，并随草稿和发送失败恢复保留。文件搜索包括 `.vscode` 等隐藏配置文件，跳过 `.git`、依赖和构建目录；支持模糊匹配并优先显示最近打开的文件；输入查询后直接在整个工作区进行定向搜索，不再依赖最初列出的文件。最多展示 40 条文件结果，同一查询缓存约 15 秒；每种搜索模式最多取 5,000 个候选，空查询列出最多 1,000 个文件。失败时可点击重试或按 Enter。含空格的文件名可用 `@"文件 名"` 搜索。技能和子智能体不在此 @ 菜单中；请用 / 搜索。
 
 从 VS Code 文件树拖入文件也可加入引用。跨工作区文件使用相对实际会话根目录的路径；未保存的文件会携带当前内容，过大的未保存文件请选中所需片段。
 
@@ -289,7 +289,7 @@ If the image does not appear, the connection to GitHub is usually unavailable. R
 | Above the composer | Queued messages and goals. Reorder, edit, delete, or send a queued message immediately. |
 | Number rail | Jump to an earlier question; the three-line control collapses or restores conversations. |
 | Top of the composer | Add images or files, review references, and check the connection state. |
-| Prompt area | Write a question; `@` references workspace files or conversations, and `/` selects a capability. |
+| Prompt area | Write a question; `@` references workspace files or conversations, and `/` searches commands, skills, and subagents. |
 | Bottom left | Switch model, permission mode, and reasoning effort. Compact mode shows permission as a shield icon and can collapse the controls. |
 | Bottom right | Two rings summarize context and quota; send, insert-now, and stop controls vary with the running state. |
 | Quota strip | Expand for context, five-hour, and weekly quota details; map third-party API readings with `zcode.quotaAdapters`. |
@@ -509,6 +509,6 @@ Include the following (do not send the contents of `credentials.json` or any API
 - The full sidebar message (a screenshot is fine)
 - The **ZCode: Show Log** section from startup through the error (home-directory user names can be redacted)
 
-Type `@` to search workspace files and conversations, with files first and conversations after them. Continue with a filename, path, or conversation title; use Up/Down and Enter/Tab to add a reference, or Escape to dismiss the menu. File references appear above the composer. Conversation references appear as separate chips and are retained with drafts and rejected-send recovery. File search includes hidden configuration files and skips Git, dependency and build directories. Fuzzy matching prefers recent files. Typed queries search the whole workspace directly rather than relying on the initial listing. Up to 40 file results are shown, with a 15-second query cache, up to 5,000 candidates per pattern and 1,000 files for an empty query. Retry failed searches by clicking Retry or pressing Enter. Use `@"file name"` for names containing spaces. Capability and skill menus are not included.
+Type `@` to search workspace files and conversations, with files first and conversations after them. Continue with a filename, path, or conversation title; use Up/Down and Enter/Tab to add a reference, or Escape to dismiss the menu. File references appear above the composer. Conversation references appear as separate chips and are retained with drafts and rejected-send recovery. File search includes hidden configuration files and skips Git, dependency and build directories. Fuzzy matching prefers recent files. Typed queries search the whole workspace directly rather than relying on the initial listing. Up to 40 file results are shown, with a 15-second query cache, up to 5,000 candidates per pattern and 1,000 files for an empty query. Retry failed searches by clicking Retry or pressing Enter. Use `@"file name"` for names containing spaces. Skills and subagents are not in this @ menu; use / to search for them.
 
-Hover over a file reference to see its full path, scope and unsaved-change status. Whole-file references use the current editor buffer when sent; selected passages retain their captured snapshot. Image-analysis cards start collapsed and show parameters and full results when expanded.
+Type `/` to search the current session’s commands, skills, and subagents, then use Up/Down and Tab or Enter to choose. Select multiple skills and subagents, and click their labels below the input to remove them. Hover over a file reference to see its full path, scope and unsaved-change status. Whole-file references use the current editor buffer when sent; selected passages retain their captured snapshot. Image-analysis cards start collapsed and show parameters and full results when expanded.

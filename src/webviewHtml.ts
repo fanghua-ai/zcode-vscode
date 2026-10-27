@@ -892,7 +892,25 @@ export function getWebviewHtml(
     color:var(--vscode-foreground); cursor:pointer; text-align:left;
   }
   .slash-item.active, .slash-item:hover { background:var(--vscode-list-hoverBackground); }
+  .slash-item.skill, .slash-item.agent { grid-template-rows:auto; }
+  .slash-item.skill .slash-desc, .slash-item.agent .slash-desc { grid-column:3; }
+  .slash-item.skill .slash-hint, .slash-item.agent .slash-hint { display:none; }
+  .slash-heading { color:var(--z-muted); font-size:11px; padding:6px 8px; }
+  .slash-heading:not(:first-child) { margin-top:3px; border-top:1px solid color-mix(in srgb, var(--vscode-foreground) 9%, transparent); padding-top:8px; }
   .slash-icon { display:grid; place-items:center; width:15px; height:15px; color:var(--z-muted); align-self:center; }
+  .slash-icon.skill { font-size:11px; font-weight:700; }
+  #selected-skills { display:flex; align-items:center; flex:1 1 0; min-width:24px; overflow-x:auto; scrollbar-width:thin; }
+  #selected-skills[hidden] { display:none; }
+  .selected-skill, .skill-ref-chip, .agent-ref-chip { display:inline-flex; align-items:center; gap:4px; color:var(--vscode-textLink-foreground, var(--z-accent)); font-weight:600; }
+  #selected-skills .selected-skill { flex:0 0 auto; gap:2px; max-width:min(132px, 100%); color:var(--vscode-foreground); font-weight:600; }
+  .selected-skill .skill-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .selected-skill .chip-icon, .selected-skill .chip-close { display:grid; place-items:center; flex:none; }
+  .selected-skill .chip-icon { color:var(--z-accent); }
+  .selected-skill .chip-close { display:none; }
+  .selected-skill:hover .chip-icon, .selected-skill:focus-visible .chip-icon { display:none; }
+  .selected-skill:hover .chip-close, .selected-skill:focus-visible .chip-close { display:grid; }
+  .selected-skill svg, .skill-ref-chip svg, .agent-ref-chip svg, .slash-item.agent svg { width:14px; height:14px; flex:none; }
+  .skill-ref-chip { margin-right:5px; }
   #active-command, #plan-indicator {
     display:inline-flex; align-items:center; gap:2px;
     color:var(--vscode-foreground); font-weight:600;
@@ -2099,7 +2117,7 @@ export function getWebviewHtml(
       </div>
       <div id="image-drafts"></div>
       <div id="input-area">
-        <textarea id="input" rows="1" placeholder="${t("向 ZCode 提问，@ 添加上下文，/ 选择能力")}"></textarea>
+        <textarea id="input" rows="1" placeholder="${t("向 ZCode 提问，@ 添加上下文，/ 选择命令或能力")}"></textarea>
       </div>
       <div class="composer-toolbar">
         <div class="toolbar-left">
@@ -2109,6 +2127,7 @@ export function getWebviewHtml(
           <button type="button" id="controls-toggle" class="toolbar-btn" title="${t("展开权限和推理")}" aria-label="${t("展开权限和推理")}" aria-expanded="false"><svg viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M4.5 2.5 8 6 4.5 9.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
           <button type="button" id="plan-indicator" class="toolbar-btn" hidden></button>
           <button type="button" id="active-command" class="toolbar-btn active-command" hidden></button>
+          <div id="selected-skills" hidden></div>
         </div>
         <button type="button" id="context-meter" class="context-meter" title="${t("上下文窗口")}" aria-label="${t("上下文窗口")}" aria-controls="usage-panel" aria-expanded="false"><span class="usage-ring" id="context-ring-tip"><svg class="context-ring" viewBox="0 0 20 20" aria-hidden="true"><circle class="context-track" cx="10" cy="10" r="7"></circle><circle class="context-value" cx="10" cy="10" r="7"></circle></svg></span><span class="usage-ring" id="five-hour-ring-tip"><svg class="five-hour-ring" viewBox="0 0 20 20" aria-hidden="true"><circle class="context-track" cx="10" cy="10" r="7"></circle><circle class="five-hour-value" cx="10" cy="10" r="7"></circle></svg></span><svg class="usage-chevron" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         <button type="button" id="insert-now-btn" class="send" title="${t("立即发送（打断当前回复）")}" aria-label="${t("立即发送")}"></button>

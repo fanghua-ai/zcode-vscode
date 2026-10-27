@@ -18,6 +18,16 @@ test("native image-analysis output decodes text-content and JSON-string layers w
  assert.equal(formatImageAnalysisOutput('literal \\n path'), 'literal \\n path');
 });
 
+test("image-analysis summary marker and double-encoded text render as readable analysis", () => {
+ const text="1) First row: **ZCode team plan**\n\n2) Yes — the note appears at the card's top right.";
+ const raw='**analyze_image_result_summary:** '+JSON.stringify([{text:JSON.stringify(text)}]);
+ const builtin=`**Z.ai Built-in Tool: analyze_image**\n\`\`\`json\n{"imageSource":"image"}\n\`\`\`\n**Output:**\n${raw}`;
+ const segment=splitZaiBuiltin(builtin)[0];
+ assert.equal(formatImageAnalysisOutput(raw),text);
+ assert.equal(segment.kind,"tool");
+ if(segment.kind==="tool") assert.equal(segment.outputText,text);
+});
+
 test("Chinese builtin headers split the tool from the surrounding prose", () => {
   const body = '\n\n**输入：**\n```json\n{"imageSource":"https://example.invalid/shot.png"}\n```\n**输出：**\n**analyze_image_result_summary:** '+JSON.stringify([{text:"画面正常"}]);
   const colon = splitZaiBuiltin("先看第二段。**🌐 Z.ai 内置工具：analyze_image**"+body+"\n\n曲线完整。");

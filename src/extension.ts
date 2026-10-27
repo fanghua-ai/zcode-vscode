@@ -917,6 +917,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         }
         break;
       }
+      case "refreshReferenceCatalog":
+        if (msg.sessionId && msg.sessionId === this.client?.currentSessionId) {
+          this.client.refreshSkillCatalog();
+          this.client.refreshSubagentCatalog();
+        }
+        break;
       case "ready":
         // The page posts "ready" once per load. A reload without a new
         // resolveWebviewView (Reload Webviews, renderer recovery) is still a
@@ -929,7 +935,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         this.flushOpenSettings();
         if (this.starting) await this.starting;
         if (!this.client) await this.startZCode();
-        else if (this.pushedEpoch !== this.webviewEpoch) await this.pushSessionState({ forceHistory: true });
+        else if (this.pushedEpoch !== this.webviewEpoch) {
+          await this.pushSessionState({ forceHistory: true });
+          this.client?.refreshSkillCatalog();
+          this.client?.refreshSubagentCatalog();
+        }
         this.pushEditorContext();
         if (this.pendingChip) {
           this.post({ type: "addChip", chip: this.pendingChip });
@@ -2614,6 +2624,21 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           slashCommands: data.slashCommands ?? [],
         });
         this.paintTitle(data.title);
+        break;
+      }
+      case "skill_catalog": {
+        const data = event.data as {
+          sessionId: string;
+          skills?: Array<{ name: string; description: string; path: string }>;
+        };
+        if (data.sessionId === this.client?.currentSessionId) {
+          this.post({ type: "skill_catalog", sessionId: data.sessionId, skills: data.skills ?? [] });
+        }
+        break;
+      }
+      case "subagent_catalog": {
+        const data = event.data as { sessionId: string; agents: Array<{ name: string; description: string; source: string }> };
+        if (data.sessionId === this.client?.currentSessionId) this.post({ type: "subagent_catalog", ...data });
         break;
       }
       case "assistant_text":

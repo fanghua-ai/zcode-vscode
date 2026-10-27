@@ -6,7 +6,12 @@ export interface ComposerDraft {
   chips: ContextChip[];
   sessionRefs?: SessionReference[];
   images?: DraftImage[];
+  skills?: SkillReference[];
+  agents?: AgentReference[];
 }
+
+export interface SkillReference { name: string; path: string }
+export interface AgentReference { name: string }
 
 function copy(draft: ComposerDraft): ComposerDraft {
   return {
@@ -14,6 +19,8 @@ function copy(draft: ComposerDraft): ComposerDraft {
     chips: draft.chips.map(chip => ({ ...chip })),
     ...(draft.sessionRefs?.length ? { sessionRefs: draft.sessionRefs.map(reference => ({ ...reference })) } : {}),
     ...(draft.images?.length ? {images:draft.images.map(image=>({...image}))} : {}),
+    ...(draft.skills?.length ? { skills: draft.skills.map(skill => ({ ...skill })) } : {}),
+    ...(draft.agents?.length ? { agents: draft.agents.map(agent => ({ ...agent })) } : {}),
   };
 }
 
@@ -33,7 +40,13 @@ export class ComposerDrafts {
       const sessionRefs = Array.isArray(draft.sessionRefs) ? draft.sessionRefs.filter((reference): reference is SessionReference =>
         !!reference && typeof reference === "object" && typeof reference.sessionId === "string" && /^sess_[A-Za-z0-9_-]+$/.test(reference.sessionId) && typeof reference.title === "string" && !!reference.title.trim()
       ).map(reference => ({ sessionId: reference.sessionId, title: reference.title })) : [];
-      this.set(id, draft.text, chips, draftImages(draft.images), sessionRefs);
+      const skills = Array.isArray(draft.skills) ? draft.skills.filter((skill): skill is SkillReference =>
+        !!skill && typeof skill.name === "string" && !!skill.name && typeof skill.path === "string" && !!skill.path
+      ) : [];
+      const agents = Array.isArray(draft.agents) ? draft.agents.filter((agent): agent is AgentReference =>
+        !!agent && typeof agent.name === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(agent.name)
+      ) : [];
+      this.set(id, draft.text, chips, draftImages(draft.images), sessionRefs, skills, agents);
     }
   }
 
@@ -41,7 +54,7 @@ export class ComposerDrafts {
     return copy(this.drafts.get(id) ?? { text: "", chips: [] });
   }
 
-  set(id: string, text: string, chips: ContextChip[], images: DraftImage[] = [], sessionRefs: SessionReference[] = []): void {
+  set(id: string, text: string, chips: ContextChip[], images: DraftImage[] = [], sessionRefs: SessionReference[] = [], skills: SkillReference[] = [], agents: AgentReference[] = []): void {
     const uniqueRefs = sessionRefs.filter((reference, index, all) =>
       /^sess_[A-Za-z0-9_-]+$/.test(reference.sessionId) && !!reference.title.trim() && all.findIndex(other => other.sessionId === reference.sessionId) === index
     ).map(reference => ({ ...reference }));
@@ -50,8 +63,10 @@ export class ComposerDrafts {
       chips: chips.filter(chip => !chip.implicit).map(chip => ({ ...chip })),
       ...(uniqueRefs.length ? { sessionRefs: uniqueRefs } : {}),
       ...(images.length ? {images:images.map(image=>({...image}))} : {}),
+      ...(skills.length ? { skills: skills.map(skill => ({ ...skill })) } : {}),
+      ...(agents.length ? { agents: agents.map(agent => ({ ...agent })) } : {}),
     };
-    if (!text && !draft.chips.length && !images.length && !uniqueRefs.length) this.drafts.delete(id);
+    if (!text && !draft.chips.length && !images.length && !uniqueRefs.length && !skills.length && !agents.length) this.drafts.delete(id);
     else this.drafts.set(id, draft);
   }
 
@@ -72,7 +87,11 @@ export class ComposerDrafts {
     }
     const images = [...(current.images ?? [])];
     for (const image of failed.images ?? []) if (!images.some(existing=>existing.id===image.id)) images.push({...image});
-    this.set(id, text, chips, images, sessionRefs);
+    const skills = [...(current.skills ?? [])];
+    for (const skill of failed.skills ?? []) if (!skills.some(existing => existing.path === skill.path)) skills.push({ ...skill });
+    const agents = [...(current.agents ?? [])];
+    for (const agent of failed.agents ?? []) if (!agents.some(existing => existing.name.toLowerCase() === agent.name.toLowerCase())) agents.push({ ...agent });
+    this.set(id, text, chips, images, sessionRefs, skills, agents);
     return this.get(id);
   }
 
@@ -80,7 +99,7 @@ export class ComposerDrafts {
     if (id) {
       const pending = this.get("");
       this.drafts.delete("");
-      if (pending.text || pending.chips.length || pending.sessionRefs?.length || pending.images?.length) this.recover(id, pending);
+      if (pending.text || pending.chips.length || pending.sessionRefs?.length || pending.images?.length || pending.skills?.length || pending.agents?.length) this.recover(id, pending);
     }
     return this.get(id);
   }

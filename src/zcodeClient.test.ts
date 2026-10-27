@@ -70,6 +70,46 @@ function isolatedHome(t: TestContext): string {
   return root;
 }
 
+test("a late skill catalog response does not replace a newer refresh", async () => {
+  const { client, state, events } = fixture();
+  const requests: Array<(value: unknown) => void> = [];
+  state.sendRequest = async () => new Promise(resolve => requests.push(resolve));
+  try {
+    client.refreshSkillCatalog();
+    client.refreshSkillCatalog();
+    requests[1]({ skills: [{ name: "new", description: "", path: "/new/SKILL.md" }] });
+    await new Promise(resolve => setImmediate(resolve));
+    requests[0]({ skills: [{ name: "old", description: "", path: "/old/SKILL.md" }] });
+    await new Promise(resolve => setImmediate(resolve));
+    const catalogs = events.filter(event => event.type === "skill_catalog");
+    assert.equal(catalogs.length, 1);
+    assert.equal((catalogs[0].data as { skills: Array<{ name: string }> }).skills[0].name, "new");
+  } finally { client.dispose(); }
+});
+
+test("subagent suggestions use the active session plugin catalog", { timeout: 3000 }, async () => {
+  let publish!: (event: ZCodeEvent) => void;
+  const complete = new Promise<ZCodeEvent>(resolve => { publish = resolve; });
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", onEvent: event => {
+    const data = event.data as { agents?: Array<{ name: string }> };
+    if (event.type === "subagent_catalog" && data.agents?.some(agent => agent.name === "demo:reviewer")) publish(event);
+  } });
+  const state = client as unknown as Internals;
+  state.sessionId = "A";
+  state.sendRequest = async (method, params) => {
+    assert.equal(method, "plugins/referenceCatalog");
+    assert.equal((params as { sessionId: string }).sessionId, "A");
+    return { plugins: [{ enabled: true, subagentNames: ["demo:reviewer"] }] };
+  };
+  client.refreshSubagentCatalog();
+  const event = await complete;
+  const data = event.data as { sessionId: string; agents: Array<{ name: string }> };
+  assert.equal(data.sessionId, "A");
+  assert.ok(data.agents.some(agent => agent.name === "reviewer"));
+  assert.ok(data.agents.some(agent => agent.name === "Explore"));
+  client.dispose();
+});
+
 test("an explicitly disabled session model cannot fall back to a stale CLI provider key", async t => {
   const root = isolatedHome(t);
   const configDir = path.join(root, ".zcode", "v2");
@@ -946,6 +986,83 @@ test("restored work folds receive the desktop active duration instead of elapsed
       assert.ok(typeof item.rowId === "number");
       assert.equal(item.running, false);
     }
+  } finally { client.dispose(); }
+});
+
+test("running turn timing updates preserve streamed text events", async () => {
+  const { client, state, events } = fixture();
+  const frame = (fromSeq: number, toSeq: number, payload: unknown) => ({
+    topic: "conversation/A", subscriptionId: "running-header", fromSeq, toSeq, payload,
+  });
+  state.sendRequest = async method => {
+    if (method === "v4/conversation/subscribe") {
+      state.handleConversationFrame(frame(0, 1, { kind: "snapshot", snapshot: {
+        logEpoch: "epoch", seq: 1, control: { phase: "running" }, rows: { window: [
+          { rowId: 1, kind: "turnHeader", turnId: "turn", state: "running", activeMs: 10 },
+          { rowId: 2, kind: "userInput", turnId: "turn", entityId: "question", origin: "realUser", text: "问题" },
+          { rowId: 3, kind: "assistantText", turnId: "turn", text: "起", state: "streaming" },
+        ] },
+      } }));
+      return { ack: { subscriptionId: "running-header", logEpoch: "epoch" } };
+    }
+    return {};
+  };
+  try {
+    await client.prepareViewChange();
+    await state.subscribeConversation();
+    client.endViewChange();
+    events.length = 0;
+    state.handleConversationFrame(frame(1, 2, { kind: "deltas", deltas: [
+      { op: "row.upserted", row: { rowId: 1, kind: "turnHeader", turnId: "turn", state: "running", activeMs: 20 } },
+      { op: "row.upserted", row: { rowId: 3, kind: "assistantText", turnId: "turn", text: "起始", state: "streaming" } },
+    ] }));
+    assert.ok(events.some(event => event.type === "assistant_text_delta" && (event.data as { fullText?: string }).fullText === "起始"));
+    assert.ok(!events.some(event => event.type === "transcript_sync"));
+  } finally { client.dispose(); }
+});
+
+test("a late completed turn header republishes the transcript with its work duration", async () => {
+  const { client, state, events } = fixture();
+  const frame = (fromSeq: number, toSeq: number, payload: unknown) => ({
+    topic: "conversation/A", subscriptionId: "late-header", fromSeq, toSeq, payload,
+  });
+  state.sendRequest = async method => {
+    if (method === "v4/conversation/subscribe") {
+      state.handleConversationFrame(frame(0, 1, { kind: "snapshot", snapshot: {
+        logEpoch: "epoch", seq: 1, rows: { window: [
+          { rowId: 2, kind: "userInput", turnId: "turn", entityId: "question", origin: "realUser", text: "问题" },
+          { rowId: 3, kind: "reasoning", turnId: "turn", text: "思考", state: "complete" },
+        ] },
+      } }));
+      return { ack: { subscriptionId: "late-header", logEpoch: "epoch" } };
+    }
+    return {};
+  };
+  try {
+    await client.prepareViewChange();
+    await state.subscribeConversation();
+    client.endViewChange();
+    const before = events.filter(event => event.type === "transcript_sync").length;
+    state.handleConversationFrame(frame(1, 2, { kind: "deltas", deltas: [
+      { op: "row.appended", row: { rowId: 1, kind: "turnHeader", turnId: "turn", state: "completedSuccess",
+        startedAt: 1000, endedAt: 121000, activeMs: 65000 } },
+    ] }));
+    const updates = events.filter(event => event.type === "transcript_sync").slice(before);
+    assert.equal(updates.length, 1, "completed timing update did not redraw history");
+    const items = (updates[0].data as { items?: HistoryItem[] }).items ?? [];
+    const work = items.find(item => item.role === "assistant");
+    assert.equal(work?.workDurationMs, 65000);
+    assert.equal(work?.endedAt, 121000);
+
+    const beforeCorrection = events.filter(event => event.type === "transcript_sync").length;
+    state.handleConversationFrame(frame(2, 3, { kind: "deltas", deltas: [
+      { op: "row.upserted", row: { rowId: 1, kind: "turnHeader", turnId: "turn", state: "completedSuccess",
+        startedAt: 1000, endedAt: 126000, activeMs: 70000 } },
+    ] }));
+    const corrections = events.filter(event => event.type === "transcript_sync").slice(beforeCorrection);
+    assert.equal(corrections.length, 1, "corrected turn timing did not redraw history");
+    const corrected = (corrections[0].data as { items?: HistoryItem[] }).items ?? [];
+    assert.equal(corrected.find(item => item.role === "assistant")?.workDurationMs, 70000);
   } finally { client.dispose(); }
 });
 

@@ -1,5 +1,17 @@
 # 更新日志 / Changelog
 
+## 2.1.4 — 2026-10-27
+
+### 中文
+- 修复工作耗时信息晚到后仍只显示“已工作”的问题。
+- 修复图片分析结果显示为转义 JSON 文本的问题。
+- 在输入 `/` 时提供技能和子智能体建议；可选择多个引用，并在输入区管理。
+
+### English
+- Refresh completed work durations when turn timing arrives after the initial transcript.
+- Render image-analysis results as readable text instead of escaped JSON.
+- Show ZCode skills and subagents in the slash menu and manage multiple references in the composer.
+
 ## 2.1.3 — 2026-10-26
 
 ### 中文

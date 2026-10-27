@@ -2,7 +2,7 @@
   "name": "zcode-desktop-chat",
   "displayName": "ZCode Chat",
   "description": "在 VS Code 右侧边栏里和 ZCode 智能体对话，复用桌面端的登录、模型和会话。Chat with the ZCode agent in the VS Code secondary side bar using the desktop app's account, models, and sessions.",
-  "version": "2.1.3",
+  "version": "2.1.4",
   "publisher": "fanghua",
   "author": "fanghua",
   "license": "MIT",
@@ -26,9 +26,8 @@
     }
   },
   "categories": [
-    "Machine Learning",
-    "Chat",
-    "Other"
+    "AI",
+    "Chat"
   ],
   "keywords": [
     "zcode",

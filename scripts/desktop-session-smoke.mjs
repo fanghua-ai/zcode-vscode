@@ -86,8 +86,10 @@ try {
   const models=await client.readAvailableModels();if(models.current)assert.equal(models.current.providerId,'fake');
   await client.sendMessage('Session regression test '+round);
   const deadline=Date.now()+15000;
-  while(Date.now()<deadline&&!events.some(event=>event.type==='assistant_text_delta'&&event.data.fullText?.includes('Image received.')))await new Promise(resolve=>setTimeout(resolve,100));
-  assert.ok(events.some(event=>event.type==='assistant_text_delta'&&event.data.fullText?.includes('Image received.')),'real backend did not deliver model output: '+JSON.stringify(events.slice(-10)));
+  const received=()=>events.some(event=>event.type==='assistant_text_delta'&&event.data.fullText?.includes('Image received.') ||
+    event.type==='transcript_sync'&&event.data.sessionId===session&&event.data.items?.some(item=>item.role==='assistant'&&item.text?.includes('Image received.')));
+  while(Date.now()<deadline&&!received())await new Promise(resolve=>setTimeout(resolve,100));
+  assert.ok(received(),'real backend did not deliver model output: '+JSON.stringify(events.slice(-10)));
   events.length=0;
  }
 

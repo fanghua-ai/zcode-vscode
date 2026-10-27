@@ -86,7 +86,7 @@ function splitOutputProse(raw: string): {output:string;rest:string} {
   return {output:raw,rest:""};
 }
 
-function parseBuiltinBody(body: string): {
+function parseBuiltinBody(body: string, toolName: string): {
   input: string;
   output: string;
   rest: string;
@@ -119,7 +119,9 @@ function parseBuiltinBody(body: string): {
   }
   return {
     input,
-    output: formatZaiToolOutput(outputRaw),
+    output: toolName === "analyze_image"
+      ? formatImageAnalysisOutput(outputRaw)
+      : formatZaiToolOutput(outputRaw),
     rest,
     complete,
   };
@@ -143,7 +145,7 @@ export function splitZaiBuiltin(text: string): ZaiSegment[] {
     const name = m[1].trim();
     const bodyStart = start + m[0].length;
     const nextStart = i + 1 < matches.length ? (matches[i + 1].index ?? text.length) : text.length;
-    const parsed = parseBuiltinBody(text.slice(bodyStart, nextStart));
+    const parsed = parseBuiltinBody(text.slice(bodyStart, nextStart), name);
     parts.push({
       kind: "tool",
       toolName: name,
@@ -187,7 +189,10 @@ export function prettifyToolIo(text: string): string {
 /** The image service can wrap its textual result in a JSON text-content array,
  * then encode the text itself as another JSON string. Decode only valid layers. */
 export function formatImageAnalysisOutput(raw: string): string {
-  let value: unknown = raw;
+  let value: unknown = raw.replace(
+    new RegExp(`^\\s*${SUMMARY_MARK_RE.source}\\s*`, "i"),
+    ""
+  ).trim();
   for (let depth = 0; depth < 4; depth++) {
     if (typeof value === "string") {
       const text = value;

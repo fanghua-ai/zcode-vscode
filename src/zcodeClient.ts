@@ -43,6 +43,7 @@ import {
 } from "./conversation";
 import { parseGoalCommand, type GoalCommand } from "./goalCommand";
 import { sameSessionModel, type NewSessionDefaults } from "./newSessionDefaults";
+import { localSubagents, mergeSubagentCatalog } from "./subagentCatalog";
 
 export interface ZCodeRequest {
   id: string | number;
@@ -149,6 +150,12 @@ export interface AvailableModel {
   disabledReason?: string;
 }
 
+export interface SkillCatalogEntry {
+  name: string;
+  description: string;
+  path: string;
+}
+
 interface SessionSnapshot {
   runtime?: { stateRevision?: number; eventSeq?: number };
   slashCommands?: Array<{ name?: string; description?: string; inputHint?: string; source?: string }>;
@@ -248,6 +255,8 @@ export interface SessionControls {
 export interface ZCodeEvent {
   type:
     | "session_ready"
+    | "skill_catalog"
+    | "subagent_catalog"
     | "session_error"
     | "sync_status"
     | "assistant_text"
@@ -873,6 +882,70 @@ export class ZCodeClient {
     return workspaceObject(this.opts.workspacePath);
   }
 
+  private skillCatalogRequest = 0;
+  private subagentCatalogRequest = 0;
+  private subagentCatalogGeneration = -1;
+
+  private async publishSkillCatalog(sessionId: string, generation: number, request: number): Promise<void> {
+    const isCurrent = () => !this.disposed && this.sessionId === sessionId && this.sessionGeneration === generation && this.skillCatalogRequest === request;
+    try {
+      const response = await this.sendRequest("skills/referenceCatalog", {
+        workspace: this.ws(),
+        sessionId,
+      }, 15_000) as { skills?: unknown };
+      if (!isCurrent()) return;
+      const skills: SkillCatalogEntry[] = [];
+      for (const value of Array.isArray(response?.skills) ? response.skills : []) {
+        if (!value || typeof value !== "object") continue;
+        const item = value as { name?: unknown; description?: unknown; path?: unknown };
+        const name = typeof item.name === "string" ? item.name.trim() : "";
+        const skillPath = typeof item.path === "string" ? item.path.trim() : "";
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name) || !skillPath) continue;
+        skills.push({
+          name,
+          description: typeof item.description === "string" ? item.description : "",
+          path: skillPath,
+        });
+      }
+      this.opts.onEvent({ type: "skill_catalog", data: { sessionId, skills } });
+    } catch (error) {
+      if (!isCurrent()) return;
+      const message = error instanceof Error ? error.message : String(error);
+      if (/ZCode error -32601\b/.test(message)) {
+        logDebug("ZCode runtime does not expose a skill reference catalog", { sessionId });
+      } else {
+        logWarn("Could not read the ZCode skill catalog", error);
+      }
+      this.opts.onEvent({ type: "skill_catalog", data: { sessionId, skills: [] } });
+    }
+  }
+
+  refreshSkillCatalog(): void {
+    if (this.sessionId) void this.publishSkillCatalog(this.sessionId, this.sessionGeneration, ++this.skillCatalogRequest);
+  }
+
+  refreshSubagentCatalog(): void {
+    const sessionId = this.sessionId;
+    if (!sessionId) return;
+    const generation = this.sessionGeneration;
+    const request = ++this.subagentCatalogRequest;
+    const isCurrent = () => !this.disposed && this.sessionId === sessionId && this.sessionGeneration === generation && this.subagentCatalogRequest === request;
+    void (async () => {
+      const local = await localSubagents(this.opts.workspacePath);
+      if (!isCurrent()) return;
+      if (this.subagentCatalogGeneration !== generation) {
+        this.subagentCatalogGeneration = generation;
+        this.opts.onEvent({ type: "subagent_catalog", data: { sessionId, agents: mergeSubagentCatalog(local, []) } });
+      }
+      try {
+        const result = await this.sendRequest("plugins/referenceCatalog", { workspace: this.ws(), sessionId }, 15_000) as { plugins?: unknown };
+        if (isCurrent()) this.opts.onEvent({ type: "subagent_catalog", data: { sessionId, agents: mergeSubagentCatalog(local, result?.plugins) } });
+      } catch (error) {
+        if (isCurrent()) logDebug("Could not read plugin subagent catalog", error instanceof Error ? error.message : String(error));
+      }
+    })().catch(error => logWarn("Could not read local subagent catalog", error));
+  }
+
   async listSessions(includeArchived = false): Promise<SessionSummary[]> {
     const started = Date.now();
     const timeoutMs = this.resumeRequests > 0 || this.lateResumes.size > 0
@@ -1259,6 +1332,8 @@ export class ZCodeClient {
     await this.emitSessionControls();
     await this.subscribeConversation();
     this.startPlanQuota();
+    this.refreshSkillCatalog();
+    this.refreshSubagentCatalog();
   }
 
   private async applyNewSessionDefaults(defaults: NewSessionDefaults): Promise<void> {
@@ -1825,9 +1900,17 @@ export class ZCodeClient {
       return !old || old.marker?.fromProvider !== row.marker.fromProvider || old.marker?.fromModel !== row.marker.fromModel
         || old.marker?.toProvider !== row.marker.toProvider || old.marker?.toModel !== row.marker.toModel;
     });
+    // The completion header can arrive after its reasoning and answer rows.
+    // Redraw then so a work fold does not stay on its generic label.
+    const turnHeaderChanged = replica.rows.some(row => {
+      if (row.kind !== "turnHeader" || row.state === "running" || row.state === "prewarming") return false;
+      const old = previous.find(item => item.rowId === row.rowId);
+      return !old || old.state !== row.state || old.startedAt !== row.startedAt
+        || old.endedAt !== row.endedAt || old.activeMs !== row.activeMs;
+    });
     // Structural corrections replace the transcript; ordinary streamed text
     // updates exactly one stable row without rebuilding the view.
-    if (snapshot || finishedGoalMarker || compactMarkerChanged || modelMarkerChanged || goalCheckRecorded || previous.some(row => !replica.rows.some(next => next.rowId === row.rowId)) ||
+    if (snapshot || finishedGoalMarker || compactMarkerChanged || modelMarkerChanged || turnHeaderChanged || goalCheckRecorded || previous.some(row => !replica.rows.some(next => next.rowId === row.rowId)) ||
         replica.rows.some(row => row.kind === "userInput" && !previous.some(old => old.rowId === row.rowId))) {
       this.publishTranscript();
       this.publishProjectionStatus(true);
