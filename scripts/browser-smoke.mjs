@@ -284,13 +284,15 @@ try {
     document.body.setAttribute('data-smoke','passed');
   } catch(error) {
     document.body.setAttribute('data-smoke','failed');
+    document.body.setAttribute('data-smoke-error', String(error.stack));
     const errorReport=document.createElement('pre');
     errorReport.id='smoke-error';errorReport.textContent=String(error.stack);document.body.append(errorReport);
   }
   </script></body>`);
   const regressions = await readFile(new URL("./browser-regression-cases.js", import.meta.url), "utf8");
   const mathFontFixture = pathToFileURL(path.resolve("node_modules/katex/dist/fonts/KaTeX_Main-Regular.woff2")).href;
-  html = html.replace("</body>", () => `<script nonce="${nonce}">const mathFontFixture=${JSON.stringify(mathFontFixture)};\n${regressions.replaceAll("</script>", "<\\/script>")}</script></body>`);
+  const truncatedImageFixture = await readFile("src/testFixtures/image-analysis-truncated.txt", "utf8");
+  html = html.replace("</body>", () => `<script nonce="${nonce}">const mathFontFixture=${JSON.stringify(mathFontFixture)};const truncatedImageFixture=${JSON.stringify(truncatedImageFixture).replaceAll("<", "\\u003c")};\n${regressions.replaceAll("</script>", "<\\/script>")}</script></body>`);
   const file = path.join(root, "test.html");
   await writeFile(file, html);
   const result = spawnSync(process.env.CHROME_BIN || "google-chrome", [

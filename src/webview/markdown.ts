@@ -97,8 +97,7 @@ const streamingRenderer = new marked.Renderer();
 streamingRenderer.code = (code) => renderCode(code, true);
 
 export function renderMarkdown(text: string, streaming = false): string {
-  const closed = closeOpenFences(text);
-  const html = marked.parse(closed, {
+  const html = marked.parse(text, {
     async: false,
     renderer: streaming ? streamingRenderer : renderer,
   }) as string;
@@ -106,12 +105,6 @@ export function renderMarkdown(text: string, streaming = false): string {
     ADD_ATTR: ["target", "rel", "data-copy", "class"],
     ADD_TAGS: ["button"],
   });
-}
-
-function closeOpenFences(text: string): string {
-  const ticks = text.match(/```/g)?.length ?? 0;
-  if (ticks % 2 === 1) return `${text}\n\`\`\``;
-  return text;
 }
 
 function escapeHtml(text: string): string {

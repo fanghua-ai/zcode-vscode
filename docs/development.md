@@ -11,6 +11,8 @@ npm run verify
 
 `verify` 依次检查宿主及 webview 类型、运行单元测试、生产构建，并审计待打包文件。普通构建不需要桌面登录。真实聊天需要安装、登录 ZCode 桌面端；兼容范围和运行时设置见 [README](../README.md)。
 
+依赖审计需分别查看 `npm audit` 和 `npm audit --omit=dev`。截至 2026-10-28，运行时依赖无告警；完整审计的三项高危条目来自同一条 `@vscode/vsce → @azure/identity → @azure/msal-node` 开发工具链，[上游公告](https://github.com/advisories/GHSA-xcx6-jx8p-x3h5) 涉及授权码登录流程。这些包不进入 VSIX，当前 VSCE 的 Azure 登录链也未使用授权码凭据。现有 Identity 版本尚未接受修复版 MSAL 7.1；保留兼容依赖，待上游更新后刷新锁文件并复查，避免用强制降级或跨大版本覆盖代替兼容性验证。
+
 `npm test` 为测试子进程设置临时 HOME、USERPROFILE、AppData 和 XDG 目录，并移除继承的 `ZCODE_CREDENTIAL_SECRET`，结束后清理临时文件，不修改调用者环境。涉及桌面配置、凭据、默认模型和会话库的用例必须显式创建隔离夹具或提供模拟状态；协议用例应在模拟快照中提供所需模型。检查事件时按目标类型筛选，避免无关事件的有无或顺序影响断言。
 
 `npm test` 同时执行 CHANGELOG 门禁（`src/changelogGuard.ts`），因此 `verify` 和打包都会自动检查最新段落：中文与 English 分组各出现一次且都有条目，不能包含明确的测试覆盖、测试数量、本地测试包约定或作者实测过程。允许“测试连接按钮”等用户功能描述。日常开发允许首段使用 `未发布 / Unreleased`；已标明版本的段落必须与 `package.json` 一致，并使用有效的 `YYYY-MM-DD` 日期。`npm run package` 会额外要求首段为正式的版本与日期，拒绝尚未整理的 Unreleased。历史段落不追溯检查，中英文是否准确对应仍由人工评审；报错附带条目行号和原因。

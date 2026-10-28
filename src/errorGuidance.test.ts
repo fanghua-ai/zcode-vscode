@@ -21,6 +21,9 @@ const cases: Array<[string,string,string]> = [
   ["ECONNRESET","network","retry"],
   ["ZCode process exited","network","retry"],
   ["EPERM: permission denied","access","retry"],
+  ["会话同步失败：无法读取快照","synchronization","retry"],
+  ["會話同步失敗：無法讀取快照","synchronization","retry"],
+  ["Session sync failed: snapshot unavailable","synchronization","retry"],
   ["Unexpected failure: <script>中文原始诊断</script>","general","pickModel"],
 ];
 test("common diagnostics map to actionable recovery instead of log-only errors",()=>{
@@ -29,6 +32,8 @@ test("common diagnostics map to actionable recovery instead of log-only errors",
   assert.match(errorGuidance("No available model").hint,/重新选择.*重试/);
   assert.match(errorGuidance("ZCode error -32602: Unrecognized key: \"newField\"").hint,/3\.12\.3–3\.16\.3/);
   assert.notEqual(errorGuidance("会话同步失败").category,"compatibility");
+  assert.equal(errorGuidance("会话同步失败：401 Unauthorized").category,"login");
+  assert.equal(errorGuidance("Session sync failed: ZCode error -32602: Invalid params").category,"compatibility");
   assert.notEqual(errorGuidance("Model API returned invalid params").category,"compatibility");
   assert.match(errorGuidance('ZCode error -32602: Invalid params').hint,/参数有误/);
 });

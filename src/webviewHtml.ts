@@ -726,22 +726,16 @@ export function getWebviewHtml(
   .tool-status { flex-shrink: 0; }
   .tool-status.completed, .tool-status.success { display: none; }
   .process-head { display: flex; align-items: center; gap: 8px; min-height: 24px; background: none; border: 0; padding: 0; text-align: left; font: inherit; font-size: 12px; line-height: 18px; color: var(--z-muted); cursor: pointer; }
-  .process-icon { width: 16px; height: 16px; flex: 0 0 auto; }
-  /* SVG ink, rather than its 16px box, should meet the label's optical center. */
-  .process-icon[data-lucide="search"],
-  .process-icon[data-lucide="squareTerminal"],
-  .process-icon[data-lucide="circleQuestionMark"],
-  .process-icon[data-lucide="codeXml"] { transform: translateY(-1px); }
-  .process-icon[data-lucide="brain"] { transform: translateY(-1.5px); }
-  /* Latin tool labels sit slightly above CJK labels in the VS Code UI font. */
-  .raw-tool-head .process-icon[data-lucide="codeXml"] { transform: translateY(0); }
-  .process-chevron { font-size: 14px; margin-left: auto; transform: translateY(-0.5px); }
-  [aria-expanded="true"] > .process-chevron { transform: translateY(-0.5px) rotate(180deg); }
+  /* Share the label's line-box center across platform fonts and display scales. */
+  .process-icon { display: block; width: 16px; height: 16px; flex: 0 0 auto; }
+  .process-chevron { display: block; flex: 0 0 auto; font-size: 14px; margin-left: auto; }
+  [aria-expanded="true"] > .process-chevron { transform: rotate(180deg); }
   .group-hidden, .work-note[hidden] { display: none; }
   .group-detail { margin-left: 24px; }
   .process-head:hover, .tool-head:hover { color: var(--vscode-foreground); }
   .process-head:focus-visible, .tool-head:focus-visible { outline: 1px solid var(--z-accent); outline-offset: -1px; border-radius: 4px; }
-  .reasoning-head { margin-bottom: -6px; }
+  /* Tighten expanded content without shortening a collapsed title's scrollport. */
+  .reasoning-head + .work-note { margin-top: -6px; }
   .tool-status { font-size: 11px; }
   .tool-status.running { color: var(--z-accent); }
   .tool-status.completed, .tool-status.success { color: var(--z-muted); }
@@ -910,6 +904,8 @@ export function getWebviewHtml(
   .selected-skill:hover .chip-icon, .selected-skill:focus-visible .chip-icon { display:none; }
   .selected-skill:hover .chip-close, .selected-skill:focus-visible .chip-close { display:grid; }
   .selected-skill svg, .skill-ref-chip svg, .agent-ref-chip svg, .slash-item.agent svg { width:14px; height:14px; flex:none; }
+  .skill-ref-chip, .agent-ref-chip { align-items:baseline; vertical-align:baseline; }
+  .skill-ref-chip svg, .agent-ref-chip svg { align-self:center; }
   .skill-ref-chip { margin-right:5px; }
   #active-command, #plan-indicator {
     display:inline-flex; align-items:center; gap:2px;
@@ -1082,17 +1078,21 @@ export function getWebviewHtml(
     background: transparent;
     color: color-mix(in srgb, var(--vscode-foreground) 58%, transparent);
     font-size: 9px;
+    font-family: inherit;
     font-variant-numeric: tabular-nums;
     line-height: 1;
     cursor: pointer;
   }
+  .q-dot > span { display:block; line-height:18px; }
   .q-dot:hover,
   .q-dot:focus-visible { color: var(--vscode-foreground); }
   .q-dot.current { color: var(--z-accent); }
   .q-dot.current::after {
     content: "";
     position: absolute;
-    inset: 6px 1px;
+    inset: 50% 1px auto;
+    height: 18px;
+    transform: translateY(-50%);
     border: 1px solid currentColor;
     border-radius: 4px;
     pointer-events: none;

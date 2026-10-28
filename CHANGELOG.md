@@ -1,5 +1,33 @@
 # 更新日志 / Changelog
 
+## 2.1.5 — 2026-10-28
+
+### 中文
+- 修复图片分析结果在截断、嵌套编码或单独到达时露出 JSON 包装和转义字符的问题；保留参数和结果中引用的工具标题、Output 标签等文字，并提示结果不完整。
+- 问答卡片定位到最下方的操作区，并避开浮动输入框；多个待处理请求时优先查看最新一张，自动跟随尊重手动浏览和折叠。
+- 使用方向键浏览较长的命令与能力菜单时，高亮项始终保持可见。
+- 查看归档页后仍可选择和发送正常会话引用；工作区切换与会话重命名及时更新引用候选。
+- 避免连续点击重试重复发送；重试保留 Plan 模式，正确处理恢复草稿及后来新增的输入和附件。
+- 修复代码中的反引号产生多余代码块、代码示例被误识别为工具调用的问题。
+- 已停止的工具不再因迟到更新重新显示为运行中；会话同步失败时提供重新连接指引。
+- 调整问题跳转数字和选中边框的居中对齐。
+- 统一工作过程图标、文字和展开箭头的垂直对齐，减少不同系统字体和显示缩放下的偏移，并保留折叠标题的完整高度。
+- 修复消息中技能和子智能体标签与正文的文字基线不齐。
+- 整理 MIT 许可证和第三方图标声明，便于自动识别项目许可证，并完整保留第三方署名与许可。
+
+### English
+- Decode truncated, nested, and standalone image-analysis results instead of showing JSON envelopes and escape sequences; preserve quoted tool headings and Output labels in parameters and results, and identify incomplete results.
+- Reveal the bottom actions of question cards above the floating composer, open the newest pending request first, and respect manual reading and folding.
+- Keep the highlighted entry visible while navigating long command and capability menus with the arrow keys.
+- Keep active conversation references available after viewing archives, and update suggestions when the workspace or session title changes.
+- Prevent repeated retry clicks from sending duplicate messages; retain Plan mode and handle recovered drafts without discarding or duplicating newer input and attachments.
+- Preserve literal backticks without extra code blocks, and keep tool examples inside code from becoming real tool calls.
+- Keep stopped tools from returning to a running state after late updates, and offer reconnect guidance for session synchronization failures.
+- Center question navigation numbers and their active outline.
+- Center work-step icons, labels, and expand arrows consistently across system fonts and display scales, and preserve the full height of collapsed thought headers.
+- Align inline skill and subagent labels with the surrounding message text.
+- Separate the MIT license from third-party icon notices for license detection while preserving all third-party attribution and license text.
+
 ## 2.1.4 — 2026-10-27
 
 ### 中文

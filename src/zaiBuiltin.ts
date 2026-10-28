@@ -1,6 +1,7 @@
 /** GLM / Z.ai server-side tools are streamed as markdown dumps inside assistant text. */
 
-import { formatToolOutput } from "./toolOutput";
+import { formatToolOutput, parsePartialJsonContainer } from "./toolOutput";
+import { t } from "./i18n";
 
 export type ZaiSegment =
   | { kind: "text"; text: string }
@@ -86,31 +87,92 @@ function splitOutputProse(raw: string): {output:string;rest:string} {
   return {output:raw,rest:""};
 }
 
+function splitIndentedProse(text: string): { body: string; rest: string } {
+  const pad = /\n[ \t]{8,}(?=\S)/.exec(text);
+  if (pad?.index != null) {
+    const after = text.slice(pad.index).trimStart();
+    if (after && !/^[\s\[\{\]\}",]/.test(after) && !after.startsWith("```")) {
+      return { body: text.slice(0, pad.index), rest: after };
+    }
+  }
+  return { body: text, rest: "" };
+}
+
+function fenceBounds(text: string, open: RegExpMatchArray): { bodyStart: number; bodyEnd: number; end: number } {
+  const bodyStart = open.index! + open[0].length;
+  const closing = new RegExp(`^ {0,3}${open[1][0]}{${open[1].length},}[ \\t]*(?:\\r?\\n|$)`, "gm");
+  closing.lastIndex = bodyStart;
+  const close = closing.exec(text);
+  return { bodyStart, bodyEnd: close?.index ?? text.length, end: close ? close.index + close[0].length : text.length };
+}
+
+function inlineCodeEnd(text: string, start: number, ticks: string): number | undefined {
+  let escapes = 0;
+  for (let at = start - 1; at >= 0 && text[at] === "\\"; at--) escapes++;
+  if (escapes % 2) return;
+  const rest = text.slice(start + ticks.length);
+  // A blank line ends the Markdown paragraph; it cannot close this code span.
+  const paragraphEnd = /\r?\n[ \t]*\r?\n/.exec(rest)?.index ?? rest.length;
+  for (const close of rest.matchAll(/`+/g)) {
+    if (close.index! >= paragraphEnd) break;
+    if (close[0].length === ticks.length) return start + ticks.length + close.index! + close[0].length;
+  }
+}
+
+/** Labels inside JSON parameters or results are data, not tool boundaries. */
+function builtinMarkers(text: string, pattern: RegExp): RegExpMatchArray[] {
+  const ranges: Array<{ start: number; end: number }> = [];
+  const markers = new RegExp("^ {0,3}(`{3,}|~{3,})([^\\r\\n]*)(?:\\r?\\n|$)|" + OUTPUT_MARK_RE.source + "|(`+)", "gm");
+  let protectedUntil = 0;
+  for (const marker of text.matchAll(markers)) {
+    const start = marker.index!;
+    if (start < protectedUntil) continue;
+    const bodyStart = start + marker[0].length;
+    let protectedStart = start;
+    if (marker[1]) {
+      // A fence starts a line; backticks within JSON strings or code are data.
+      if (marker[1][0] === "`" && marker[2].includes("`")) continue;
+      protectedUntil = fenceBounds(text, marker).end;
+    } else if (marker[3]) {
+      const end = inlineCodeEnd(text, start, marker[3]);
+      if (end === undefined) continue;
+      protectedUntil = end;
+    } else {
+      const { body } = splitIndentedProse(text.slice(bodyStart));
+      const prefix = new RegExp(`^\\s*(?:${SUMMARY_MARK_RE.source}\\s*)?`).exec(body)![0];
+      if (!/^[\[{]/.test(body.slice(prefix.length))) continue;
+      // Keep the real Output label visible while protecting its JSON value.
+      protectedStart = bodyStart;
+      protectedUntil = bodyStart + splitOutputProse(body).output.length;
+    }
+    ranges.push({ start: protectedStart, end: protectedUntil });
+  }
+  let range = 0;
+  return [...text.matchAll(new RegExp(pattern.source, "g"))].filter(match => {
+    while (range < ranges.length && ranges[range].end <= match.index!) range++;
+    return range >= ranges.length || match.index! < ranges[range].start;
+  });
+}
+
 function parseBuiltinBody(body: string, toolName: string): {
   input: string;
   output: string;
   rest: string;
   complete: boolean;
 } {
-  let rest = "";
-  let work = body;
-  const pad = work.match(/\n[ \t]{8,}(?=\S)/);
-  if (pad?.index != null) {
-    const after = work.slice(pad.index).trimStart();
-    if (after && !/^[\s\[\{\]\}",]/.test(after) && !after.startsWith("```")) {
-      rest = after;
-      work = work.slice(0, pad.index);
-    }
-  }
+  const separated = splitIndentedProse(body);
+  let rest = separated.rest;
+  const work = separated.body;
 
-  const fence = /```json\s*([\s\S]*?)(?:```|$)/.exec(work);
-  const input = fence ? fence[1].trim() : "";
-  const outMark = OUTPUT_MARK_RE.exec(work);
+  const fence = /^ {0,3}(`{3,}|~{3,})json[ \t]*(?:\r?\n|$)/m.exec(work);
+  const bounds = fence ? fenceBounds(work, fence) : undefined;
+  const input = bounds ? work.slice(bounds.bodyStart, bounds.bodyEnd).trim() : "";
+  const outMark = builtinMarkers(work, OUTPUT_MARK_RE)[0];
   const executing = /\*Executing on server/i.test(work);
   let outputRaw = "";
   let complete = false;
   if (outMark) {
-    const output = splitOutputProse(work.slice(outMark.index + outMark[0].length));
+    const output = splitOutputProse(work.slice(outMark.index! + outMark[0].length));
     outputRaw = output.output;
     rest = [output.rest, rest].filter(Boolean).join("\n\n");
     complete = true;
@@ -129,9 +191,17 @@ function parseBuiltinBody(body: string, toolName: string): {
 
 export function splitZaiBuiltin(text: string): ZaiSegment[] {
   if (!text) return [];
-  HEADER_RE.lastIndex = 0;
-  const matches = [...text.matchAll(HEADER_RE)];
-  if (matches.length === 0) return [{ kind: "text", text }];
+  const matches = builtinMarkers(text, HEADER_RE);
+  if (matches.length === 0) {
+    // Providers can deliver the tool header and its result in different text
+    // parts. The result-only part must not expose its transport envelope.
+    const imageResult = /^\s*(?:\*\*(?:Output|输出)\s*[:：]\*\*\s*)?\*\*`?analyze_image_result_summary`?\s*[:：]\*\*/i.exec(text);
+    if (imageResult) {
+      const { output, rest } = splitOutputProse(text.slice(imageResult[0].length));
+      return [{ kind: "text", text: [formatImageAnalysisOutput(output), rest].filter(Boolean).join("\n\n") }];
+    }
+    return [{ kind: "text", text }];
+  }
 
   const parts: ZaiSegment[] = [];
   let last = 0;
@@ -186,28 +256,47 @@ export function prettifyToolIo(text: string): string {
   return out.join("\n\n").trim();
 }
 
-/** The image service can wrap its textual result in a JSON text-content array,
- * then encode the text itself as another JSON string. Decode only valid layers. */
-export function formatImageAnalysisOutput(raw: string): string {
-  let value: unknown = raw.replace(
-    new RegExp(`^\\s*${SUMMARY_MARK_RE.source}\\s*`, "i"),
-    ""
-  ).trim();
-  for (let depth = 0; depth < 4; depth++) {
-    if (typeof value === "string") {
-      const text = value;
-      try { value = JSON.parse(text); continue; } catch { return prettifyToolIo(text); }
+type ImageOutput = { text: string; truncated: boolean };
+
+/** Decode known image-service envelopes, retaining received text if the server
+ * truncates a container or an inner JSON string. Plain prose is never unescaped. */
+function decodeImageOutput(value: unknown, allowTruncatedString = false, depth = 0): ImageOutput {
+  if (depth > 8) return { text: summarizeValue(value), truncated: false };
+  if (typeof value === "string") {
+    const text = value.trim();
+    try { return decodeImageOutput(JSON.parse(text), allowTruncatedString, depth + 1); } catch { /* Not a complete JSON value. */ }
+    if (/^[\[{]/.test(text) || (allowTruncatedString && text.startsWith('"'))) {
+      const partial = parsePartialJsonContainer(text, true);
+      if (partial !== undefined) return { ...decodeImageOutput(partial, true, depth + 1), truncated: true };
     }
-    if (Array.isArray(value)) return value.map(item => {
-      if (item && typeof item === "object" && typeof item.text === "string") return formatImageAnalysisOutput(item.text);
-      return summarizeValue(item);
-    }).filter(Boolean).join("\n\n");
-    if (value && typeof value === "object") {
-      const object = value as Record<string,unknown>;
-      if (typeof object.text === "string") { value=object.text; continue; }
-      if (Array.isArray(object.content)) { value=object.content; continue; }
+    // A native tool result may include a complete JSON value followed by logs.
+    // Preserve that tail instead of treating it as part of the JSON envelope.
+    const { output, rest } = splitOutputProse(text);
+    if (rest) {
+      const decoded = decodeImageOutput(output.trim(), allowTruncatedString, depth + 1);
+      return { ...decoded, text: [decoded.text, rest].filter(Boolean).join("\n\n") };
     }
-    return summarizeValue(value);
+    return { text: formatToolOutput(text), truncated: false };
   }
-  return typeof value === "string" ? value : summarizeValue(value);
+  if (Array.isArray(value)) {
+    const items = value.map(item => decodeImageOutput(item, allowTruncatedString, depth + 1));
+    return { text: items.map(item => item.text).filter(Boolean).join("\n\n"), truncated: items.some(item => item.truncated) };
+  }
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    if (typeof object.text === "string") return decodeImageOutput(object.text, allowTruncatedString, depth + 1);
+    if (Array.isArray(object.content)) return decodeImageOutput(object.content, allowTruncatedString, depth + 1);
+  }
+  return { text: summarizeValue(value), truncated: false };
+}
+
+export function formatImageAnalysisOutput(raw: string): string {
+  const stripped = raw
+    .replace(/^\s*\*\*(?:Output|输出)\s*[:：]\*\*\s*/i, "")
+    .replace(new RegExp(`^\\s*${SUMMARY_MARK_RE.source}\\s*`, "i"), "")
+    .trim();
+  const result = decodeImageOutput(stripped);
+  return result.truncated
+    ? `${result.text}\n\n${t("图片分析结果不完整，仅显示已收到的内容。")}`
+    : result.text;
 }

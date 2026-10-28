@@ -60,3 +60,31 @@ test("a highlighting failure preserves escaped code", (t) => {
     assert.doesNotMatch(html, /<script/);
   });
 });
+
+test("backticks in inline code and fenced content do not add a synthetic fence", () => {
+  withoutDom(() => {
+    for (const streaming of [false, true]) {
+      const inline = renderMarkdown("Inline triple ticks: ` ``` `", streaming);
+      assert.equal(inline.trim(), "<p>Inline triple ticks: <code>```</code></p>");
+      for (const source of [
+        '```javascript\nconst fence = "```";\n```',
+        '````markdown\n```javascript\nconst x = 1;\n````',
+      ]) {
+        const html = renderMarkdown(source, streaming);
+        assert.equal(html.match(/class="code-block"/g)?.length, 1);
+        assert.match(html, /```/);
+      }
+    }
+  });
+});
+
+test("native Markdown handles open backtick and tilde fences without changing their text", () => {
+  withoutDom(() => {
+    for (const marker of ["```", "~~~~", "````"]) {
+      const html = renderMarkdown(marker + 'javascript\nconst text = "<tag>";', true);
+      assert.equal(html.match(/class="code-block"/g)?.length, 1);
+      assert.match(html, /const text = &quot;&lt;tag&gt;&quot;;/);
+      assert.doesNotMatch(html, /hljs-keyword/);
+    }
+  });
+});

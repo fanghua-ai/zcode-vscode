@@ -28,7 +28,7 @@ function fixture() {
   const visibility: boolean[] = [];
   let backgroundPolls = 0;
   const response = deferred();
-  const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", subscriptions: [] } as unknown as vscode.ExtensionContext);
+  const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", subscriptions: [], workspaceState: { get: () => undefined } } as unknown as vscode.ExtensionContext);
   const state = provider as unknown as {
     client: { currentSessionId: string; currentMode: () => string; confirmedModel: () => {providerId: string; modelId: string} | undefined; confirmedControls: () => Partial<import("./zcodeClient").SessionControls>; setViewVisible: (visible: boolean) => void; pollBackgroundRuns: () => void; dispose: () => void; editUserQuery: () => Promise<unknown>; insertQueuedMessage: (text?: unknown) => Promise<unknown>; conversationFileChanges: () => Promise<unknown>; sendMessage: (...args: unknown[]) => Promise<unknown>; setMode: (mode: string) => Promise<void>; setModel: (...args: unknown[]) => Promise<unknown>; hasFreshSessionModel: () => boolean; readAvailableModels: () => Promise<{ current?: { providerId: string; modelId: string }; available: AvailableModel[] }>;
       stageSessionModel: (model: { providerId: string; modelId: string } | null) => void;
@@ -680,11 +680,11 @@ test("editing a question preserves validated conversation references in the back
   const sessionId = "sess_11111111-1111-4111-8111-111111111111";
   let rewrittenText = "";
   const state = f.state as unknown as {
-    sessions: Array<{ sessionId: string; title: string; archivedAt?: number }>;
+    sessionListViews: { active: { sessions: Array<{ sessionId: string; title: string; archivedAt?: number }>; state: string; loaded: boolean } };
     client: { currentSessionId: string; editUserQuery: (target: unknown, text: string, mode: string, attachments?: unknown) => Promise<unknown> };
     onWebviewMessage: (message: unknown) => Promise<void>;
   };
-  state.sessions = [{ sessionId, title: "Referenced conversation" }];
+  state.sessionListViews.active = { sessions: [{ sessionId, title: "Referenced conversation" }], state: "ready", loaded: true };
   state.client.editUserQuery = async (_target, text) => { rewrittenText = text; };
 
   await state.onWebviewMessage({
@@ -699,6 +699,50 @@ test("editing a question preserves validated conversation references in the back
 
   assert.equal(rewrittenText, "[#Referenced conversation](#sess_11111111-1111-4111-8111-111111111111)\n\nExplain this conversation");
   assert.deepEqual(f.posted, [{ type: "query_rewound", text: rewrittenText, sessionId: "A", viewGen: f.state.switchTicket, editRequestId: "attempt-A", commandId: "edit-command-A", entityId: "user-A", attachments: [] }]);
+  f.dispose();
+});
+
+test("conversation references remain available across active and archived list pages", async () => {
+  const f = fixture();
+  const active = { sessionId: "sess_reference", title: "Referenced conversation" };
+  const archived = { sessionId: "sess_archived", title: "Archived conversation", archivedAt: 1 };
+  let listed: Array<{ sessionId: string; title: string; archivedAt?: number }> = [active, archived];
+  const state = f.state as unknown as {
+    client: { listSessions: () => Promise<typeof listed> };
+    refreshSessions: (includeArchived?: boolean, startupList?: unknown, listVisible?: boolean) => Promise<void>;
+    sessionReferences: (references: Array<{ sessionId: string; title: string }>) => typeof listed;
+    adoptWorkspace: (workspacePath: string) => void;
+    applyRename: (sessionId: string, title: string) => Promise<void>;
+  };
+  state.client.listSessions = async () => listed;
+  await state.refreshSessions(false);
+  assert.deepEqual(state.sessionReferences([active]), [active]);
+  await state.refreshSessions(true);
+  assert.deepEqual(state.sessionReferences([active]), [active], "viewing archives invalidated an active reference");
+  assert.deepEqual((f.posted.at(-1)?.sessions as typeof listed).map(session => session.sessionId), [archived.sessionId]);
+  assert.deepEqual(f.posted.at(-1)?.referenceSessions, [active]);
+  assert.throws(() => state.sessionReferences([archived]), /不可用/);
+
+  listed = [{ ...active, archivedAt: 5 }, archived];
+  await state.refreshSessions(true);
+  assert.throws(() => state.sessionReferences([active]), /不可用/, "archived references must be rejected");
+  listed = [active, archived];
+  await state.refreshSessions(true);
+  assert.deepEqual(state.sessionReferences([active]), [active], "restored references were not refreshed from the archive page");
+
+  state.client.listSessions = async () => { throw new Error("offline"); };
+  await state.refreshSessions(true, undefined, true);
+  assert.deepEqual(f.posted.at(-1)?.referenceSessions, [active]);
+  assert.deepEqual(state.sessionReferences([active]), [active], "a transient list failure discarded the active catalog");
+  await state.applyRename(active.sessionId, "Renamed reference");
+  assert.deepEqual(state.sessionReferences([active]), [{ ...active, title: "Renamed reference" }], "a failed list refresh discarded the successfully renamed title");
+  state.adoptWorkspace("/work/a");
+  state.adoptWorkspace("/work/b");
+  assert.deepEqual(f.posted.at(-1)?.referenceSessions, []);
+  const resetMessages = f.posted.length;
+  await state.refreshSessions(false);
+  assert.equal(f.posted.length, resetMessages, "a hidden failed refresh must not be needed to clear workspace references");
+  assert.throws(() => state.sessionReferences([active]), /不可用/, "references leaked across workspace boundaries");
   f.dispose();
 });
 
@@ -909,6 +953,52 @@ test("/plan mode failure restores the current mode and the complete retry comman
   assert.deepEqual(f.posted.slice(0, 1), [{ type: "session_controls", mode: "build" }]);
   assert.equal(f.posted[1].type, "send_rejected");
   assert.equal(f.posted[1].text, "/plan Explain the change");
+  f.dispose();
+});
+
+test("retryLast acknowledges admission and associates a rejected retry with its recovery draft", async () => {
+  const f = fixture();
+  f.state.client.sendMessage = async () => {};
+  await f.state.onWebviewMessage({ type: "retryLast", sessionId: "A", commandId: "retry-ok", text: "QUESTION" });
+  assert.deepEqual(f.posted, [{ type: "send_admitted", sessionId: "A", commandId: "retry-ok" }]);
+  f.posted.length = 0;
+  f.state.client.sendMessage = async () => { throw new Error("retry rejected"); };
+  await f.state.onWebviewMessage({ type: "retryLast", sessionId: "A", commandId: "retry-failed", text: "EXPANDED_QUESTION", recoveryText: "ORIGINAL_QUESTION" });
+  assert.deepEqual(f.posted, [{ type: "send_rejected", sessionId: "A", commandId: "retry-failed", text: "ORIGINAL_QUESTION", chips: [], message: "retry rejected" }]);
+  f.dispose();
+});
+
+test("retryLast reapplies a rejected Plan shortcut before sending and restores controls on failure", async () => {
+  const f = fixture();
+  const order: string[] = [];
+  f.state.client.setMode = async mode => { order.push(mode); };
+  f.state.client.sendMessage = async text => { order.push(String(text)); };
+  const retry = { type: "retryLast", sessionId: "A", commandId: "plan-retry", text: "Plan task", recoveryText: "/plan Plan task", planMode: true };
+  await f.state.onWebviewMessage(retry);
+  assert.deepEqual(order, ["plan", "Plan task"]);
+  assert.deepEqual(f.posted, [{ type: "send_admitted", sessionId: "A", commandId: "plan-retry" }]);
+  f.posted.length = 0;
+  order.length = 0;
+  f.state.client.setMode = async () => { throw new Error("mode unavailable"); };
+  await f.state.onWebviewMessage(retry);
+  assert.deepEqual(order, []);
+  assert.deepEqual(f.posted, [
+    { type: "session_controls", mode: "build" },
+    { type: "send_rejected", sessionId: "A", commandId: "plan-retry", text: "/plan Plan task", chips: [], message: "mode unavailable" },
+  ]);
+  f.dispose();
+});
+
+test("retryLast cannot send into another session after reapplying Plan mode", async () => {
+  const f = fixture();
+  let sends = 0;
+  f.state.client.setMode = async () => { f.switchToB(); };
+  f.state.client.sendMessage = async () => { sends++; };
+  await f.state.onWebviewMessage({ type: "retryLast", sessionId: "A", commandId: "plan-retry", text: "A task", planMode: true });
+  assert.equal(sends, 0);
+  assert.equal(f.posted.at(-1)?.type, "send_rejected");
+  assert.equal(f.posted.at(-1)?.sessionId, "A");
+  assert.equal(f.posted.at(-1)?.commandId, "plan-retry");
   f.dispose();
 });
 

@@ -216,6 +216,7 @@ function bindSoftScrollbar(scroller: HTMLElement, axis: "x" | "y"): () => void {
   });
   rail.addEventListener("pointerdown", (event) => {
     if (event.button !== 0) return;
+    if (axis === "y" && messagesEl.contains(scroller)) cancelPromptFollow();
     const box = thumb.getBoundingClientRect();
     const client = axis === "y" ? event.clientY : event.clientX;
     const start = axis === "y" ? box.top : box.left;
@@ -306,6 +307,7 @@ let currentAssistantEl: HTMLElement | null = null;
 let overlayMode: "sessions" | "models" | "mode" | "thought" | null = null;
 let showArchived = false;
 let sessions: Session[] = [];
+let referenceSessions: SessionReference[] = [];
 let sessionListNotice: "ready" | "stale" | "initial" = "ready";
 let startupWaitTimer = 0;
 let startupWait: { key: string; startedAt: number } | null = null;
@@ -338,6 +340,7 @@ let ignoreScroll = false;
 /** Set when a prompt appears while output was being followed; cleared if the user scrolls away. */
 let resumeOuterFollow = false;
 let resumeWorkFollow = false;
+let promptFollowEpoch = 0;
 let jumpSeq = 0;
 let questionDrag: { x: number; left: number; moved: boolean } | null = null;
 let previewAnchor: HTMLButtonElement | null = null;
@@ -376,7 +379,7 @@ let explicitSessionRefs: SessionReference[] = [];
 let selectedSkills: SkillReference[] = [];
 let selectedAgents: AgentReference[] = [];
 let imageDrafts: DraftImage[] = [];
-const pendingInputs = new Map<string, { sessionId: string; draft: ComposerDraft }>();
+const pendingInputs = new Map<string, { sessionId: string; draft: ComposerDraft; restoreOnReject?: boolean }>();
 
 function persistComposerDraft(): void {
   const text = activeCommand ? `/${activeCommand} ${input.value}` : input.value;
@@ -430,7 +433,7 @@ function prepareComposerSwitch(): void {
   persistComposerDraft();
 }
 
-function recoverInput(msg: { commandId?: string; sessionId?: string; text?: string; chips?: ContextChip[]; sessionRefs?: SessionReference[]; attachments?: ImageAttachment[] }): void {
+function recoverInput(msg: { commandId?: string; sessionId?: string; text?: string; chips?: ContextChip[]; sessionRefs?: SessionReference[]; attachments?: ImageAttachment[] }): ComposerDraft | undefined {
   const pending = msg.commandId ? pendingInputs.get(msg.commandId) : undefined;
   const owner = pending ? (pending.sessionId || msg.sessionId || "") : msg.sessionId;
   const recoveredText = typeof msg.text === "string" ? extractLeadingSkills(msg.text) : undefined;
@@ -439,9 +442,17 @@ function recoverInput(msg: { commandId?: string; sessionId?: string; text?: stri
   if (msg.commandId) pendingInputs.delete(msg.commandId);
   if (owner === undefined || !failed) return;
   persistComposerDraft();
+  // A retry can leave an edited recovery draft in place instead of consuming it.
+  if (pending?.restoreOnReject === false) return failed;
   const recovered = composerDrafts.recover(owner, failed);
   if (owner === draftSessionId) restoreComposerDraft(recovered);
   vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId });
+  return failed;
+}
+
+function sameComposerDraft(a: ComposerDraft, b: ComposerDraft): boolean {
+  return a.text === b.text && (["chips", "images", "sessionRefs", "skills", "agents"] as const)
+    .every(key => JSON.stringify(a[key] ?? []) === JSON.stringify(b[key] ?? []));
 }
 const attachmentsEl = document.getElementById("attachments")!;
 const editorChipRow = document.getElementById("editor-chip-row")!;
@@ -613,8 +624,7 @@ function alignQuestionToTop(question: HTMLElement): void {
   const edge = questionReadingEdge();
   const delta = question.getBoundingClientRect().top - edge;
   stickToBottom = false;
-  resumeOuterFollow = false;
-  resumeWorkFollow = false;
+  cancelPromptFollow();
   if (Math.abs(delta) < 1) return;
   ignoreScroll = true;
   messagesEl.scrollTop += delta;
@@ -682,7 +692,16 @@ const activityLabels: Record<ActivityPhase, string> = {
 };
 
 function pendingPrompt(): HTMLElement | null {
-  return messagesEl.querySelector<HTMLElement>(".perm-card:not(.resolved), .ask-card:not(.resolved)");
+  return [...messagesEl.querySelectorAll<HTMLElement>(".perm-card:not(.resolved), .ask-card:not(.resolved)")].at(-1) ?? null;
+}
+
+function cancelPromptFollow(): void {
+  // Invalidate delayed placement as well as the current follow preference.
+  promptFollowEpoch++;
+  resumeOuterFollow = false;
+  resumeWorkFollow = false;
+  // The user's next scroll must update follow state even within a layout frame.
+  ignoreScroll = false;
 }
 
 function paintActivity(): void {
@@ -722,14 +741,30 @@ function revealPrompt(el: HTMLElement, focus = false): void {
   if (!el.isConnected || el.classList.contains("resolved") || !messagesEl.contains(el)) return;
   const fold = el.closest<HTMLElement>(".work-fold");
   if (fold) {
+    if (!focus && fold.dataset.userToggle === "closed") return;
+    if (focus) fold.dataset.userToggle = "open";
     fold.classList.add("open");
     workBody(fold).scrollTop = workBody(fold).scrollHeight;
   }
   // The action row can be below a very long command. Reveal controls, not just
   // the card's top, through both the work viewport and outer chat viewport.
-  const actions = el.querySelector<HTMLElement>(".perm-actions, .ask-actions:last-child") || el;
+  const actions = el.querySelector<HTMLElement>(".perm-actions, .ask-details > .ask-actions") || el;
   actions.scrollIntoView({block: "nearest", inline: "nearest"});
-  if (focus) { el.tabIndex = -1; el.focus({preventScroll: true}); }
+  // The transcript scrolls behind floating composer chrome. Native nearest
+  // scrolling can leave the controls underneath it even though they are in
+  // the scroll element's viewport.
+  const inputTop = (!questionRail.hidden ? questionRail : composerEl.querySelector(".composer-card") ?? composerEl).getBoundingClientRect().top;
+  const pendingAction = document.getElementById("pending-action")!;
+  const bottom = Math.min(inputTop, pendingAction.hidden ? inputTop : pendingAction.getBoundingClientRect().top) - 8;
+  const delta = actions.getBoundingClientRect().bottom - bottom;
+  if (delta > 0) messagesEl.scrollTop += delta;
+  if (focus) {
+    releaseCompletedReveal();
+    resumeOuterFollow = true;
+    resumeWorkFollow = true;
+    el.tabIndex = -1;
+    el.focus({preventScroll: true});
+  }
 }
 
 let messageEpoch = 0;
@@ -743,14 +778,16 @@ function announcePrompt(el: HTMLElement, follow: boolean): void {
   if (follow) resumeOuterFollow = true;
   if (follow || workNear) resumeWorkFollow = true;
   if (!follow) return;
+  releaseCompletedReveal();
   const epoch = messageEpoch;
+  const followEpoch = promptFollowEpoch;
   ignoreScroll = true;
   revealPrompt(el);
   // Confirm placement after layout without relying on a frame being delivered
   // immediately (e.g. an inactive or throttled webview).
   requestAnimationFrame(() => {
     if (epoch !== messageEpoch) return;
-    revealPrompt(el);
+    if (followEpoch === promptFollowEpoch) revealPrompt(el);
     ignoreScroll = false;
   });
 }
@@ -762,8 +799,9 @@ function restorePromptFollow(): void {
   resumeOuterFollow = false;
   resumeWorkFollow = false;
   const epoch = messageEpoch;
+  const followEpoch = promptFollowEpoch;
   const apply = () => {
-    if (epoch !== messageEpoch) return;
+    if (epoch !== messageEpoch || followEpoch !== promptFollowEpoch) return;
     ignoreScroll = true;
     if (work) {
       for (const fold of document.querySelectorAll<HTMLElement>('.work-fold.open[data-state="running"]')) {
@@ -1493,7 +1531,9 @@ function syncQuestionRail(): void {
     dot.type = "button";
     const marked = (index + 1) % 10 === 0;
     dot.className = "q-dot" + (marked ? " mark" : "");
-    dot.textContent = String(index + 1);
+    const number = document.createElement("span");
+    number.textContent = String(index + 1);
+    dot.appendChild(number);
     dot.dataset.jump = item.id;
     dot.dataset.preview = label;
     if (item.at) dot.dataset.at = String(item.at);
@@ -1582,6 +1622,7 @@ function updateQuestionRailActive(): void {
 
 function jumpToQuestion(id: string): void {
   releaseCompletedReveal();
+  cancelPromptFollow();
   const el = messagesEl.querySelector<HTMLElement>(`.message.user[data-jump="${CSS.escape(id)}"]`);
   if (!el) {
     if (!oldestLoadedId || pendingJump === id) return;
@@ -1600,8 +1641,6 @@ function jumpToQuestion(id: string): void {
     messagesEl.scrollTop -
     inset;
   stickToBottom = false;
-  resumeOuterFollow = false;
-  resumeWorkFollow = false;
   ignoreScroll = true;
   messagesEl.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
   updateJumpLatest();
@@ -1909,7 +1948,7 @@ function errorActions(text: string): Array<{ act: string; label: string }> {
   return actions;
 }
 
-function addErrorMessage(text: string): void {
+function addErrorMessage(text: string, rejectedDraft?: ComposerDraft): void {
   const question = sentQuestions().at(-1);
   const ownerSessionId = currentSessionId;
   const ownerViewGen = viewGen;
@@ -1937,10 +1976,23 @@ function addErrorMessage(text: string): void {
       if (currentSessionId !== ownerSessionId || viewGen !== ownerViewGen) return;
       const act = btn.dataset.act;
       if (act === "retryLast" && question && (failedPrompt || readImageAttachments(JSON.parse(question.dataset.images || "[]")).length)) {
+        if (holdStreams || isGenerating) return;
+        btn.disabled = true;
         const images = readImageAttachments(JSON.parse(question?.dataset.images || "[]"));
+        const commandId = crypto.randomUUID();
+        if (rejectedDraft) {
+          persistComposerDraft();
+          const consumed = draftSessionId === ownerSessionId && sameComposerDraft(composerDrafts.get(draftSessionId), rejectedDraft);
+          pendingInputs.set(commandId, { sessionId: ownerSessionId, draft: rejectedDraft, restoreOnReject: consumed });
+          if (consumed) {
+            restoreComposerDraft({ text: "", chips: [] });
+            persistComposerDraft();
+          }
+        }
         addUserMessage(failedPrompt || "", [], false, undefined, undefined, undefined, undefined, images);
         setGenerating(true);
-        post({ type: "retryLast", sessionId: ownerSessionId, text: failedPrompt || "", chips: [], attachments: images });
+        post({ type: "retryLast", commandId, sessionId: ownerSessionId, text: failedPrompt || "", chips: [], attachments: images,
+          ...(rejectedDraft ? { recoveryText: rejectedDraft.text, ...(/^\/plan\s/.test(rejectedDraft.text) ? { planMode: true } : {}) } : {}) });
       } else if (act === "showLog") post({ type: "showLog" });
       else if (act === "retry") post({ type: "retry" });
       else if (act === "pickModel") openOverlay("models");
@@ -3654,6 +3706,7 @@ function createWorkFold(state: "running" | "completed" | "interrupted", startedA
   btn.addEventListener("click", () => {
     const open = fold.classList.toggle("open");
     fold.dataset.userToggle = open ? "open" : "closed";
+    if (!open) cancelPromptFollow();
     paintWorkFold(fold);
   });
   paintWorkFold(fold);
@@ -3939,7 +3992,7 @@ function settleWorkFolds(state: "completed" | "interrupted", nextQuestion = fals
 
 function renderReasoningBody(note: HTMLElement, text: string): void {
   const parts = splitZaiBuiltin(text);
-  if (!parts.some(part => part.kind === "tool")) { note.textContent = text; return; }
+  if (!parts.some(part => part.kind === "tool")) { note.textContent = parts.map(part => part.kind === "text" ? part.text : "").join(""); return; }
   const toggles = [...note.querySelectorAll<HTMLElement>(".tool-call")].map(tool => tool.dataset.userToggle);
   note.replaceChildren();
   let index = 0;
@@ -4232,7 +4285,7 @@ function fillToolCallEl(
   el.dataset.toolName = toolName;
   const prevStatus = el.dataset.toolStatus ?? "";
   let status = data.status ?? "running";
-  if ((prevStatus === "completed" || prevStatus === "error") && status === "running") {
+  if ((prevStatus === "completed" || prevStatus === "error" || prevStatus === "cancelled") && status === "running") {
     status = prevStatus;
   }
   el.dataset.toolStatus = status;
@@ -4303,7 +4356,7 @@ function fillToolCallEl(
     !hideIo && outputText ? `${imageAnalysis ? `<div class="tool-section-label" ${uiLabelAttributes("结果")}>${t("结果")}</div>` : ""}<div class="tool-io out">${escapeText(outputText)}</div>` : ""
   }${fileHtml}`;
   el.classList.toggle("collapsed", !expanded);
-  el.innerHTML = `<button type="button" class="tool-head${category === "tool" && !imageAnalysis ? " raw-tool-head" : ""}" aria-expanded="${expanded ? "true" : "false"}">${processIcon(shellCall ? "terminal" : category)}<span class="tool-name" ${category === "tool" && !imageAnalysis ? "" : uiLabelAttributes(imageAnalysis ? "分析图片" : labelKey)}>${escapeText(imageAnalysis ? t("分析图片") : category === "tool" ? toolName : t(labelKey))}</span><span class="tool-preview" title="${escapeText(imageAnalysis ? "" : preview || toolName)}">${escapeText(imageAnalysis ? "" : preview || toolName)}</span><span class="tool-status ${escapeText(status)}" ${uiLabelAttributes(toolStatusKey(status))}>${escapeText(t(toolStatusKey(status)))}</span><svg class="process-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button><div class="tool-body">${bodyHtml}</div>`;
+  el.innerHTML = `<button type="button" class="tool-head" aria-expanded="${expanded ? "true" : "false"}">${processIcon(shellCall ? "terminal" : category)}<span class="tool-name" ${category === "tool" && !imageAnalysis ? "" : uiLabelAttributes(imageAnalysis ? "分析图片" : labelKey)}>${escapeText(imageAnalysis ? t("分析图片") : category === "tool" ? toolName : t(labelKey))}</span><span class="tool-preview" title="${escapeText(imageAnalysis ? "" : preview || toolName)}">${escapeText(imageAnalysis ? "" : preview || toolName)}</span><span class="tool-status ${escapeText(status)}" ${uiLabelAttributes(toolStatusKey(status))}>${escapeText(t(toolStatusKey(status)))}</span><svg class="process-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button><div class="tool-body">${bodyHtml}</div>`;
   if (!suspendScroll && (previousCategory !== category || prevStatus !== status)) refreshProcessGroups(el.parentElement);
   if (userToggle) el.dataset.userToggle = userToggle;
   el.querySelector(".tool-head")?.addEventListener("click", () => {
@@ -6271,7 +6324,7 @@ function addExplicitChip(chip: ContextChip): void {
 }
 
 function addExplicitSessionReference(reference: SessionReference): void {
-  if (sessions.some(session => session.sessionId === reference.sessionId && !session.archivedAt)) {
+  if (referenceSessions.some(session => session.sessionId === reference.sessionId)) {
     explicitSessionRefs = explicitSessionRefs.filter(item => item.sessionId !== reference.sessionId);
     explicitSessionRefs.push({ sessionId: reference.sessionId, title: reference.title });
     renderComposerChips();
@@ -6402,11 +6455,16 @@ messagesEl.addEventListener("click", (event) => {
 });
 messagesEl.addEventListener("pointerdown", releaseCompletedReveal, {capture:true});
 document.addEventListener("keydown", (event) => {
-  if (!completionRevealPending || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+  if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
   if (!["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) return;
   const target = event.target;
+  if (target instanceof Element && (target.closest("input, textarea, select, [contenteditable='true']") ||
+      (event.key === " " && target.closest("button, a")))) return;
   if (target === document.body || target === document.documentElement ||
-      (target instanceof Node && messagesEl.contains(target))) releaseCompletedReveal();
+      (target instanceof Node && messagesEl.contains(target))) {
+    cancelPromptFollow();
+    releaseCompletedReveal();
+  }
 }, { capture: true });
 messagesEl.addEventListener("scroll", () => {
   if (completionRevealPending) {
@@ -6432,7 +6490,7 @@ messagesEl.addEventListener(
     if (event.deltaY !== 0) releaseCompletedReveal();
     if (event.deltaY < 0) {
       stickToBottom = false;
-      resumeOuterFollow = false;
+      cancelPromptFollow();
       updateJumpLatest();
     }
     const viewport = event.target instanceof Element ? event.target.closest<HTMLElement>(".work-fold-body") : null;
@@ -6527,7 +6585,7 @@ function fileUri(fsPath: string): string {
 }
 const mentions = fileMentions(input, document.getElementById("composer")!, () => draftSessionId,
   (requestId,text,sessionId) => post({type:"searchWorkspaceFiles",requestId,text,sessionId}),
-  () => sessions.filter(session => !session.archivedAt).map(({ sessionId, title }) => ({ sessionId, title })),
+  () => referenceSessions,
   (choice: MentionChoice,sessionId) => {
     if (sessionId !== draftSessionId || holdStreams) return;
     if (choice.kind === "session") {
@@ -6876,6 +6934,7 @@ function renderSlashMenu(preserveKey?: string): void {
     const index = items.findIndex(item => slashEntryKey(item) === preserveKey);
     slashIndex = index < 0 ? 0 : index;
   } else slashIndex = Math.min(Math.max(slashIndex, 0), items.length - 1);
+  const previousScroll = menu.scrollTop;
   menu.replaceChildren();
   let section: SlashMenuEntry["kind"] | undefined;
   items.forEach((entry, index) => {
@@ -6922,6 +6981,14 @@ function renderSlashMenu(preserveKey?: string): void {
     menu.appendChild(item);
   });
   menu.classList.add("open");
+  menu.scrollTop = previousScroll;
+  const active = menu.querySelector<HTMLElement>(".slash-item.active");
+  if (active) {
+    const box = menu.getBoundingClientRect(), item = active.getBoundingClientRect();
+    const top = box.top + menu.clientTop, bottom = top + menu.clientHeight;
+    if (item.top < top) menu.scrollTop += item.top - top;
+    else if (item.bottom > bottom) menu.scrollTop += item.bottom - bottom;
+  }
 }
 
 function skillReferenceMarkdown(skill: SkillReference): string {
@@ -7502,6 +7569,9 @@ window.addEventListener("message", (event) => {
           ? { ...s, title: msg.title }
           : s
       );
+      referenceSessions = referenceSessions.map(session => session.sessionId === (msg.sessionId || currentSessionId)
+        ? { ...session, title: msg.title } : session);
+      mentions.refresh();
       if (
         msg.title &&
         (!msg.sessionId || msg.sessionId === currentSessionId)
@@ -7524,6 +7594,7 @@ window.addEventListener("message", (event) => {
       break;
     case "sessions":
       sessions = msg.sessions ?? [];
+      referenceSessions = msg.referenceSessions ?? [];
       if (msg.notice === "initial" || msg.notice === "stale" || msg.notice === "ready") sessionListNotice = msg.notice;
       mentions.refresh();
       currentSessionId = msg.currentId || currentSessionId;
@@ -7940,14 +8011,14 @@ window.addEventListener("message", (event) => {
         if (!msg.sessionId || msg.sessionId === currentSessionId) showToast(msg.message || "");
         break;
       }
-      recoverInput(msg);
+      const rejectedDraft = recoverInput(msg);
       if (!msg.sessionId || msg.sessionId === currentSessionId) {
         setGenerating(false);
         removePendingEditPens();
         settleWorkFolds("interrupted");
         settleReplyFooters();
         setStatus("error", msg.message || "");
-        addErrorMessage(msg.message || t("发送失败，内容已保留到草稿。"));
+        addErrorMessage(msg.message || t("发送失败，内容已保留到草稿。"), rejectedDraft);
         showToast(t("发送失败，内容已保留到草稿。"));
       }
       break;
@@ -8111,6 +8182,10 @@ const chromeObserver = new ResizeObserver(() => {
   const stick = stickToBottom;
   syncMessagesChrome();
   if (stick) scrollToBottom(true);
+  if (resumeOuterFollow) {
+    const prompt = pendingPrompt();
+    if (prompt) revealPrompt(prompt);
+  }
   scheduleCompletedReveal();
 });
 chromeObserver.observe(topbarEl);
@@ -8127,9 +8202,13 @@ window.addEventListener("resize", () => {
   scheduleCompletedReveal();
 });
 messagesEl.addEventListener("scroll", scheduleMessagesScrollbar, { passive: true });
-new MutationObserver(() => {
+new MutationObserver(records => {
   scheduleMessagesScrollbar();
   scheduleCompletedReveal();
+  if (resumeOuterFollow) {
+    const prompt = pendingPrompt();
+    if (prompt && records.some(record => prompt.contains(record.target))) revealPrompt(prompt);
+  }
 }).observe(messagesEl, {
   childList: true,
   subtree: true,
@@ -8137,6 +8216,7 @@ new MutationObserver(() => {
 });
 messagesScrollEl.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
+  cancelPromptFollow();
   releaseCompletedReveal();
   const thumbRect = messagesThumbEl.getBoundingClientRect();
   const onThumb = event.clientY >= thumbRect.top && event.clientY <= thumbRect.bottom;

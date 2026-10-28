@@ -165,7 +165,11 @@ async function runScenarios() {
     const text = "```javascript\n" + source;
     delta(status, text); window.stepFrame();
     const code = body(status).querySelector("code");
-    check(code.textContent === source, "streaming code was changed instead of escaped");
+    // CommonMark removes the final fence-boundary newline, including at EOF.
+    // Preserve the raw stream for later chunks; message copying trims edges.
+    check(code.textContent === source.slice(0, -1), "streaming code was changed instead of escaped");
+    check(body(status).dataset.streamText === text, "streaming dropped code source or its trailing newline");
+    check(body(status).dataset.copyText === text.trim(), "streaming changed the copied code source");
     check(!code.querySelector("span"), "streaming known-language code was highlighted");
     delta(status, text + "// FINAL_TAIL\n```");
     emit({ type: "status", sessionId: "stream-test", status });

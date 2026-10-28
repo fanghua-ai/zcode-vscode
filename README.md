@@ -256,7 +256,7 @@ Starting app-server { cmd: '…/code', args: [ '…/zcode.cjs', 'app-server' ], 
 
 #### 需要请人协助时
 
-可以先把本 README 交给本机智能体，让它按上述步骤排查。Windows 会话互不可见时，重点比较桌面 `setting.json` 中的 `recentProjects`、会话索引的 `workspace_key` 和 VS Code 的实际工作区路径；macOS 尚未实测，遇到异常时先核对安装路径、运行时及工作区是否一致。
+可以先把本 README 交给本机智能体，让它按上述步骤排查。Windows 会话互不可见时，重点比较桌面 `setting.json` 中的 `recentProjects`、会话索引的 `workspace_key` 和 VS Code 的实际工作区路径；macOS 已有上述 CI 与 SQLite 宿主验证，真实账号聊天和界面体验仍待验证，遇到异常时先核对安装路径、运行时及工作区是否一致。
 
 把下面几项一并给出（不要发送 `credentials.json` 原文或任何 API Key）：
 
@@ -500,7 +500,7 @@ Starting app-server { cmd: '…/code', args: [ '…/zcode.cjs', 'app-server' ], 
 
 #### When asking for help
 
-First give this README to a local AI agent and ask it to follow the checks above. For Windows session visibility issues, compare `recentProjects` in the desktop `setting.json`, `workspace_key` in the task index, and the actual VS Code workspace path. macOS has not been tested on a real machine; check the installation path, runtime, and workspace if issues occur.
+First give this README to a local AI agent and ask it to follow the checks above. For Windows session visibility issues, compare `recentProjects` in the desktop `setting.json`, `workspace_key` in the task index, and the actual VS Code workspace path. macOS has the CI and SQLite host coverage described above; real-account chat and visual behavior still need validation. Check the installation path, runtime, and workspace if issues occur.
 
 Include the following (do not send the contents of `credentials.json` or any API key):
 

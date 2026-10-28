@@ -334,6 +334,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       active: { sessions: [], state: "unknown", loaded: false },
       archived: { sessions: [], state: "unknown", loaded: false },
     };
+    this.post({ type: "sessions", sessions: [], referenceSessions: [], includeArchived: false, notice: "ready" });
   }
 
   private adoptWorkspace(next: string): void {
@@ -637,11 +638,14 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     void vscode.window.showInformationMessage(t("已复制。请在管理员 PowerShell 中运行，然后重启 VS Code。"));
   }
 
-  private paintTitle(title?: string): void {
+  private paintTitle(title?: string, sessionId = this.client?.currentSessionId): void {
     const next = (title || this.client?.currentTitle || "").trim();
     if (!next) return;
-    this.post({ type: "session_title", title: next, sessionId: this.client?.currentSessionId });
-    if (this.view) this.view.title = next;
+    const update = (sessions: SessionSummary[]) => sessions.map(session => session.sessionId === sessionId ? { ...session, title: next } : session);
+    this.sessions = update(this.sessions);
+    for (const view of Object.values(this.sessionListViews)) view.sessions = update(view.sessions);
+    this.post({ type: "session_title", title: next, sessionId });
+    if (this.view && sessionId === this.client?.currentSessionId) this.view.title = next;
   }
 
   private indexCurrentSession(title?: string): void {
@@ -1128,6 +1132,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       case "retryLast": {
         const ticket = this.switchTicket;
         const attachments = readImageAttachments(msg.attachments);
+        let planModeApplied = false;
         let client = this.client;
         let sessionId = msg.sessionId || client?.currentSessionId;
         if (!msg.text && !attachments.length) break;
@@ -1150,15 +1155,25 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
               : "会话已切换，请在当前会话重新发送。"));
           }
           const activeClient = assertRetryOwner(client);
+          if (msg.planMode) {
+            await activeClient.setMode("plan");
+            assertRetryOwner(activeClient);
+            planModeApplied = true;
+          }
           const prompt = buildPrompt(msg.text || "", prepareFileContext(msg.chips ?? [], this.workspacePath, vscode.workspace.textDocuments ?? []));
           await activeClient.sendMessage(prompt, attachments);
+          if (msg.commandId) this.post({ type: "send_admitted", commandId: msg.commandId, sessionId });
           if (activeClient === this.client && activeClient.currentSessionId === sessionId && ticket === this.switchTicket) this.indexCurrentSession();
         } catch (error) {
           logError("retry last message failed", error);
+          if (msg.planMode && !planModeApplied && client && client === this.client && client.currentSessionId === sessionId && ticket === this.switchTicket) {
+            this.post({ type: "session_controls", ...client.confirmedControls() });
+          }
           this.post({
             type: "send_rejected",
             sessionId,
-            text: msg.text,
+            ...(msg.commandId ? { commandId: msg.commandId } : {}),
+            text: msg.recoveryText ?? msg.text,
             chips: msg.chips ?? [],
             ...(attachments.length ? { attachments } : {}),
             message: userFacingError(error),
@@ -1345,7 +1360,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   private sessionReferences(references?: SessionReference[]): SessionReference[] {
     if (!Array.isArray(references)) return [];
-    const available = new Map(this.sessions.filter(session => !session.archivedAt).map(session => [session.sessionId, session.title]));
+    const available = new Map(this.sessionListViews.active.sessions.map(session => [session.sessionId, session.title]));
     const seen = new Set<string>();
     return references.flatMap(reference => {
       if (!reference || typeof reference.sessionId !== "string" || !/^sess_[A-Za-z0-9_-]+$/.test(reference.sessionId)) {
@@ -2315,31 +2330,27 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       const archived = new Set(flags.archived);
       const deleted = new Set(flags.deleted);
       const overridden = loadOverriddenTitles(this.workspacePath);
-      const displayed = listed
+      const available = listed
         .map((s) => {
           const title = overridden[s.sessionId] || s.title;
           const model = s.model || this.sessionModelFor(s.sessionId);
           return { ...s, title, model };
         })
         .filter((s) => !deleted.has(s.sessionId))
-        .filter((s) =>
-          includeArchived
-            ? archived.has(s.sessionId) || !!s.archivedAt
-            : !archived.has(s.sessionId) && !s.archivedAt
-        )
         .map((s) => ({
           ...s,
-          archivedAt: s.archivedAt ?? (archived.has(s.sessionId) ? 1 : undefined),
+          archivedAt: s.archivedAt || (archived.has(s.sessionId) ? 1 : undefined),
         }));
-      const other = view === "active" ? "archived" : "active";
-      const shown = new Set(displayed.map(session => session.sessionId));
-      this.sessionListViews[other].sessions = this.sessionListViews[other].sessions
-        .filter(session => !shown.has(session.sessionId));
-      this.sessionListViews[view] = { sessions: displayed, state: "ready", loaded: true };
+      // Both tabs come from the same all-session response. Keep references
+      // independent of the tab currently displayed, including restores/deletes.
+      this.sessionListViews.active = { sessions: available.filter(s => !s.archivedAt), state: "ready", loaded: true };
+      this.sessionListViews.archived = { sessions: available.filter(s => !!s.archivedAt), state: "ready", loaded: true };
+      const displayed = this.sessionListViews[view].sessions;
       this.sessions = displayed;
       this.post({
         type: "sessions",
-        sessions: this.sessionListViews[view].sessions,
+        sessions: displayed,
+        referenceSessions: this.sessionListViews.active.sessions.map(({ sessionId, title }) => ({ sessionId, title })),
         currentId: client.currentSessionId,
         includeArchived,
         notice: "ready",
@@ -2381,6 +2392,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.post({
         type: "sessions",
         sessions: cached.loaded ? cached.sessions : [],
+        referenceSessions: this.sessionListViews.active.sessions.map(({ sessionId, title }) => ({ sessionId, title })),
         currentId: this.client?.currentSessionId,
         includeArchived,
         notice: cached.loaded ? "stale" : "initial",
@@ -2416,11 +2428,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (this.client?.currentSessionId === sessionId) {
         await this.client.renameSession(next);
       }
-      this.post({
-        type: "session_title",
-        title: next,
-        sessionId,
-      });
+      this.paintTitle(next, sessionId);
       await this.refreshSessions();
       this.post({ type: "toast", text: t("已重命名") });
     });
