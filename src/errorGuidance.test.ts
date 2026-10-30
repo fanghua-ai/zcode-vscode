@@ -24,7 +24,8 @@ const cases: Array<[string,string,string]> = [
   ["会话同步失败：无法读取快照","synchronization","retry"],
   ["會話同步失敗：無法讀取快照","synchronization","retry"],
   ["Session sync failed: snapshot unavailable","synchronization","retry"],
-  ["Unexpected failure: <script>中文原始诊断</script>","general","pickModel"],
+  ["SQLite error: database is locked","general","retry"],
+  ["Unexpected failure: <script>中文原始诊断</script>","general","retry"],
 ];
 test("common diagnostics map to actionable recovery instead of log-only errors",()=>{
   for(const [source,category,action] of cases){const guidance=errorGuidance(source);assert.equal(guidance.category,category,source);assert.equal(guidance.action,action);assert.ok(guidance.hint.length);}

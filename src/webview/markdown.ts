@@ -78,7 +78,8 @@ function renderCode({ text, lang }: { text: string; lang?: string }, streaming: 
       if (language && hljs.getLanguage(language)) {
         highlighted = hljs.highlight(text, { language }).value;
       } else {
-        highlighted = hljs.highlightAuto(text).value;
+        // Unknown languages stay escaped rather than guessing across every grammar.
+        highlighted = escapeHtml(text);
       }
     } catch {
       highlighted = escapeHtml(text);

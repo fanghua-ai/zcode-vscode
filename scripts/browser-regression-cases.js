@@ -2824,6 +2824,32 @@ await test('session list failures stay inside the list and remain distinct from 
  emit({type:'sessions',includeArchived:false,currentId:'A',sessions:[{sessionId:'A',title:'上次会话'}],notice:'ready'});
  check(document.getElementById('session-list-notice').hidden,'successful refresh left the failure notice');
 });
+await test('session lists can load older results without losing search or archive scope',()=>{
+ reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});
+ document.getElementById('btn-sessions').click();
+ emit({type:'sessions',currentId:'A',includeArchived:false,sessions:[],referenceSessions:[],hasMore:true,notice:'ready'});
+ const notice=document.getElementById('session-list-notice');const button=notice.querySelector('button');
+ check(!notice.hidden&&button.textContent==='加载更多会话'&&notice.textContent.includes('仅显示已加载'),'a capped empty page looked complete');
+ const search=document.getElementById('overlay-search');search.value='Earlier';search.dispatchEvent(new Event('input'));
+ check(!notice.hidden,'filtering hid the load-more action');
+ button.click();const request=sent.at(-1);
+ check(request.type==='listSessions'&&request.loadMore===true&&request.includeArchived===false&&button.disabled,'load-more did not request the active page or show pending state');
+ const pending=sent.length;button.click();check(sent.length===pending,'double-click duplicated a pending page request');
+ emit({type:'sessions',currentId:'A',includeArchived:false,sessions:[{sessionId:'earlier',title:'Earlier conversation'}],referenceSessions:[{sessionId:'earlier',title:'Earlier conversation'}],hasMore:false,notice:'ready'});
+ check(notice.hidden&&document.getElementById('overlay-list').textContent.includes('Earlier conversation')&&search.value==='Earlier','older results lost the filter or kept a completed-page warning');
+ emit({type:'sessions',currentId:'A',includeArchived:true,sessions:[{sessionId:'archived',title:'Earlier archived'}],referenceSessions:[],hasMore:true,notice:'ready'});
+ button.click();check(sent.at(-1)?.loadMore===true&&sent.at(-1)?.includeArchived===true,'load-more lost archived scope');
+ const cancelled=sent.at(-1).requestId;
+ emit({type:'session_list_complete',requestId:'unrelated-request'});
+ check(button.disabled,'unrelated completion released an active request');
+ emit({type:'session_list_complete',requestId:cancelled});
+ check(!button.disabled&&document.getElementById('overlay-list').textContent.includes('Earlier archived'),'cancelled expansion remained stuck or discarded the list');
+ button.click();
+ emit({type:'session_list_complete',requestId:cancelled});
+ check(button.disabled,'an old completion released a newer request');
+ emit({type:'sessions',currentId:'A',includeArchived:true,sessions:[{sessionId:'archived',title:'Earlier archived'}],referenceSessions:[],hasMore:true,notice:'stale'});
+ check(!button.disabled&&button.textContent==='重试'&&document.getElementById('overlay-list').textContent.includes('Earlier archived'),'failed expansion discarded cached rows or blocked retry');
+});
 await test('reply selections survive VS Code clipboard command focus recovery',()=>{
  reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'copy-q1',role:'user',text:'One'},{id:'copy-a1',role:'assistant',text:'First selection'},{id:'copy-q2',role:'user',text:'Two'},{id:'copy-a2',role:'assistant',text:'Second selection'}]});
  const replies=[...messages.querySelectorAll('.message.assistant .md')];

@@ -41,7 +41,7 @@ export function errorGuidance(message: string): ErrorGuidance {
     hint:"请重新连接以恢复当前会话的聊天记录。若仍无法同步，请复制诊断信息并反馈。",
   };
   return {
-    category:"general", title:"这次操作未能完成", action:"pickModel", label:"切换模型",
+    category:"general", title:"这次操作未能完成", action:"retry", label:"重新连接",
     hint:"请先重试。若是发送或模型初始化失败，可重新选择一次模型；仍失败时重新读取登录。问题持续时，可复制诊断信息到社区提问。",
   };
 }

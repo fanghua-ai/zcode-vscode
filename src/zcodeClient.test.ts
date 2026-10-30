@@ -37,7 +37,7 @@ interface Internals {
   write: (message: unknown) => void;
   afterSessionAttached: () => Promise<void>;
   adoptResumedModel: () => Promise<void>;
-  ensureSessionModel: () => Promise<void>;
+  ensureSessionModel: (snapshot?: unknown) => Promise<void>;
   handleSessionEvent: (event: unknown) => void;
   handleConversationFrame: (event: unknown) => void;
   handleStateUpdated: (event: unknown) => void;
@@ -2108,6 +2108,98 @@ test("Linux session listing makes one scoped request and excludes other workspac
   assert.equal(calls, 1);
 });
 
+test("session pages expand past eighty entries and report whether the raw page is complete", async () => {
+  const { client, state } = fixture();
+  const all = Array.from({ length: 81 }, (_, index) => ({ sessionId: `session-${index}`, updatedAt: index }));
+  const limits: number[] = [];
+  state.sendRequest = async (method, params) => {
+    assert.equal(method, "session/list");
+    const { limit } = params as { limit: number };
+    limits.push(limit);
+    return { sessions: all.slice(0, limit) };
+  };
+  try {
+    const first = await client.listSessionsPage(true);
+    assert.equal(first.sessions.length, 80);
+    assert.equal(first.hasMore, true);
+    const expanded = await client.listSessionsPage(true, 160);
+    assert.equal(expanded.sessions.length, 81);
+    assert.equal(expanded.sessions[0].sessionId, "session-80");
+    assert.equal(expanded.hasMore, false);
+    assert.deepEqual(limits, [80, 160]);
+  } finally { client.dispose(); }
+});
+
+test("Windows page truncation survives deduplication across workspace path variants", t => {
+  const home = isolatedHome(t);
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  t.after(() => Object.defineProperty(process, "platform", descriptor));
+  const cliPath = path.join(home, ".zcode/cli/db/db.sqlite");
+  fs.mkdirSync(path.dirname(cliPath), { recursive: true });
+  const { DatabaseSync } = require("node:sqlite") as {
+    DatabaseSync: new (file: string) => { exec(sql: string): void; close(): void };
+  };
+  const db = new DatabaseSync(cliPath);
+  db.exec("CREATE TABLE session (directory TEXT); INSERT INTO session VALUES ('c:/work/')");
+  db.close();
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "C:\\Work", onEvent() {} });
+  const state = client as unknown as Internals;
+  let calls = 0;
+  state.sendRequest = async (method, params) => {
+    assert.equal(method, "session/list");
+    const request = params as { workspace: { workspacePath: string }; limit: number };
+    assert.equal(request.limit, 3); calls++;
+    return { sessions: Array.from({ length: 3 }, (_, index) => ({
+      sessionId: "same", updatedAt: index,
+      workspace: { workspacePath: request.workspace.workspacePath },
+    })) };
+  };
+  return client.listSessionsPage(true, 3).then(page => {
+    assert.equal(calls, 2);
+    assert.equal(page.sessions.length, 1);
+    assert.equal(page.sessions[0].updatedAt, 2);
+    assert.equal(page.hasMore, true);
+  }).finally(() => client.dispose());
+});
+
+test("session page compatibility fallback preserves the requested limit", async () => {
+  const { client, state } = fixture();
+  const requests: Array<{ limit: number; includeArchived?: boolean }> = [];
+  state.sendRequest = async (_method, params) => {
+    const request = params as { limit: number; includeArchived?: boolean };
+    requests.push(request);
+    if (Object.hasOwn(request, "includeArchived")) throw new Error('ZCode error -32602: Unrecognized key: "includeArchived"');
+    return { sessions: [{ sessionId: "active" }] };
+  };
+  try {
+    assert.equal((await client.listSessionsPage(true, 160)).hasMore, false);
+    await client.listSessionsPage(false, 320);
+    assert.deepEqual(requests.map(request => request.limit), [160, 160, 320]);
+    assert.equal(Object.hasOwn(requests[1], "includeArchived"), false);
+    assert.equal(Object.hasOwn(requests[2], "includeArchived"), false);
+  } finally { client.dispose(); }
+});
+
+test("a failed session page remains a failure rather than a complete empty page", async () => {
+  const { client, state } = fixture();
+  state.sendRequest = async () => { throw new Error("page unavailable"); };
+  try { await assert.rejects(client.listSessionsPage(true, 160), /page unavailable/); }
+  finally { client.dispose(); }
+});
+
+test("session pages reject invalid limits before making requests", async () => {
+  const { client, state } = fixture();
+  let calls = 0;
+  state.sendRequest = async () => { calls++; return {}; };
+  try {
+    for (const limit of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(client.listSessionsPage(true, limit), RangeError);
+    }
+    assert.equal(calls, 0);
+  } finally { client.dispose(); }
+});
+
 test("session listing retries without includeArchived on Desktop 3.16.2 and remembers the capability", async () => {
   const { client, state } = fixture();
   const requests: unknown[] = [];
@@ -2262,7 +2354,7 @@ test("new-session defaults apply model before model-specific reasoning and befor
   });
   state.subscribeConversation = async () => {};
   state.sendRequest = async (method, params) => {
-    if (method === "session/create") { state.sessionId = "NEW_DEFAULTS"; return {}; }
+    if (method === "session/create") { assert.equal((params as { mode: string }).mode, "yolo", "create with the requested permission before indexing the empty identity"); state.sessionId = "NEW_DEFAULTS"; return {}; }
     if (method === "session/subscribe") return { snapshot: snapshot() };
     if (method === "session/read") return snapshot();
     if (method === "v4/command") {
@@ -2611,6 +2703,97 @@ test("settled startup login cannot reinstall its old key after invalidation", as
   } finally {client.dispose();}
 });
 
+for (const scenario of ["current", "advanced", "wrong-owner", "legacy", "partial"] as const) {
+  test(`initial model selection reuses only a current attached catalog (${scenario})`, async () => {
+    const validated: string[] = [];
+    const { client, state } = fixture(undefined, async model => {
+      validated.push(model.modelId);
+      return null;
+    });
+    state.lastRevision = 5;
+    const snapshot = {
+      session: { sessionId: "A" }, runtime: { stateRevision: 5 },
+      settings: { model: { available: [{ ref: { providerId: "prov", modelId: "attached" } }] } },
+    };
+    const supplied: unknown = scenario === "wrong-owner" ? { ...snapshot, session: { sessionId: "B" } }
+      : scenario === "legacy" ? { ...snapshot, runtime: {} }
+      : scenario === "partial" ? { ...snapshot, settings: {} } : snapshot;
+    if (scenario === "advanced") state.lastRevision = 6;
+    let reads = 0;
+    const selected: string[] = [];
+    state.sendRequest = async method => {
+      assert.equal(method, "session/read");
+      reads++;
+      return { settings: { model: { available: [{ ref: { providerId: "prov", modelId: "fresh" } }] } } };
+    };
+    state.setModel = async (_provider, model) => { selected.push(model); };
+    try {
+      await state.ensureSessionModel(supplied);
+      assert.equal(reads, scenario === "current" ? 0 : 1);
+      assert.deepEqual(selected, [scenario === "current" ? "attached" : "fresh"]);
+      assert.deepEqual(validated, selected, "reusing a catalog must still validate the desktop provider");
+    } finally { client.dispose(); }
+  });
+}
+
+test("resuming an unset model uses the subscribed catalog without another snapshot read", async () => {
+  const { client, state } = fixture();
+  const model = { providerId: "prov", modelId: "m1" };
+  const snapshot = { session: { sessionId: "A" }, runtime: { stateRevision: 5, eventSeq: 7 },
+    settings: { model: { available: [{ ref: model }] } } };
+  state.subscribeConversation = async () => {};
+  client.emitSessionControls = async () => client.confirmedControls();
+  const selected: string[] = [];
+  state.setModel = async (_provider, model) => { selected.push(model); state.liveModelReady = true; };
+  state.sendRequest = async method => {
+    if (method === "session/resume") return snapshot;
+    if (method === "session/subscribe") return { eventSeq: 7 };
+    if (method === "session/read") assert.fail("an unchanged attached catalog was read again");
+    return {};
+  };
+  try {
+    await client.resumeSession("A", { sessionId: "A", title: "Empty", updatedAt: 1 });
+    assert.deepEqual(selected, [model.modelId]);
+  } finally { client.dispose(); }
+});
+
+test("an attached catalog cannot revive a model rejected by the desktop inventory", async () => {
+  const { client, state } = fixture(undefined, async () => false);
+  state.lastRevision = 5;
+  const snapshot = { session: { sessionId: "A" }, runtime: { stateRevision: 5 },
+    settings: { model: { available: [{ ref: { providerId: "prov", modelId: "removed" } }] } } };
+  let reads = 0;
+  state.sendRequest = async method => {
+    assert.equal(method, "session/read", "a rejected model must not be selected");
+    reads++; return snapshot;
+  };
+  try {
+    await assert.rejects(() => state.ensureSessionModel(snapshot), /暂时没有可用的模型/);
+    assert.equal(reads, 1);
+    assert.equal(state.liveModelReady, false);
+  } finally { client.dispose(); }
+});
+
+test("an empty attached catalog refreshes when its configured default is no longer available", async () => {
+  const removed = { providerId: "removed", modelId: "old" };
+  const current = { providerId: "prov", modelId: "replacement" };
+  const { client, state } = fixture(removed, async model => model.providerId === "removed" ? false : null);
+  state.lastRevision = 5;
+  let reads = 0;
+  state.sendRequest = async method => {
+    assert.equal(method, "session/read"); reads++;
+    return { settings: { model: { available: [{ ref: current }] } } };
+  };
+  const selected: string[] = [];
+  state.setModel = async (_provider, model) => { selected.push(model); };
+  try {
+    await state.ensureSessionModel({ session: { sessionId: "A" }, runtime: { stateRevision: 5 },
+      settings: { model: { available: [] } } });
+    assert.equal(reads, 1);
+    assert.deepEqual(selected, [current.modelId]);
+  } finally { client.dispose(); }
+});
+
 test("partial subscribe settings still read the model-dependent reasoning controls", async () => {
   const {client,state}=fixture();let reads=0;
   state.subscribeConversation=async()=>{};state.alignAndEmitModel=async()=>{};
@@ -2831,5 +3014,56 @@ test("PAT-backed runtime always resolves request auth instead of freezing its st
     ]);
     await state.handleProviderRuntimeHeaders(3, { providerId: runtime.providerId, expectedAccountScope: "OTHER-ACCOUNT" });
     assert.equal(replies[2].result.requestAuth, undefined);
+  } finally { client.dispose(); }
+});
+
+
+test("permission changes serialize so a queued plan keeps the acknowledged base permission", async () => {
+  const { client, state } = fixture();
+  const response = deferred<unknown>();
+  const calls: string[] = [];
+  state.sendRequest = async (_method, params) => {
+    calls.push((params as { mode: string }).mode);
+    if (calls.length === 1) return response.promise;
+    return {};
+  };
+  try {
+    const first = client.setMode("edit");
+    const second = client.setMode("plan");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(calls, ["edit"]);
+    response.resolve({});
+    await Promise.all([first, second]);
+    assert.deepEqual(calls, ["edit", "plan"]);
+    assert.equal(client.confirmedControls().baseMode, "edit");
+    assert.equal(client.currentMode(), "plan");
+  } finally { client.dispose(); }
+});
+
+test("a rejected permission change does not block the next change", async () => {
+  const { client, state } = fixture();
+  let attempts = 0;
+  state.sendRequest = async () => { if (++attempts === 1) throw new Error("rejected"); return {}; };
+  try {
+    await assert.rejects(client.setMode("yolo"), /rejected/);
+    await client.setMode("edit");
+    assert.equal(client.currentMode(), "edit");
+  } finally { client.dispose(); }
+});
+
+
+test("the create response wins over a previous chat's late runtime-preferences identity", async () => {
+  const { client, state } = fixture();
+  state.sendRequest = async (method) => {
+    if (method === "session/create") {
+      state.sessionId = "PREVIOUS";
+      return { session: { sessionId: "CREATED" } };
+    }
+    return {};
+  };
+  (client as unknown as { afterSessionAttached: () => Promise<void> }).afterSessionAttached = async () => {};
+  try {
+    await client.newSession();
+    assert.equal(client.currentSessionId, "CREATED");
   } finally { client.dispose(); }
 });

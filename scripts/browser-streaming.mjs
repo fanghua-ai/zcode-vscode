@@ -219,6 +219,21 @@ async function runScenarios() {
   check(!body("unsafe").querySelector("script,[onload],[onerror],[href^='javascript:']") && !window.__streamXss,
     "final highlighting bypassed HTML sanitization");
 
+  for (const language of ["", "unsupported-language"]) {
+    ready();
+    const code = 'const tag = "<img src=x onerror=alert(1)>";';
+    const source = "```" + language + "\n" + code + "\n```";
+    delta("plain-code", source); window.stepFrame();
+    emit({ type: "status", sessionId: "stream-test", status: "completedSuccess" });
+    check(body("plain-code").querySelector("code").textContent === code && !body("plain-code").querySelector("code span,img"),
+      "unknown-language completion changed or auto-highlighted code");
+    emit({ type: "history", sessionId: "stream-test", viewGen: generation,
+      items: [{ id: "plain-history", role: "assistant", text: source, tools: [] }] });
+    const restored = messages.querySelector(".code-block");
+    check(restored?.querySelector("code").textContent === code && !restored.querySelector("code span,img") && !!restored.querySelector("[data-copy]"),
+      "unknown-language history lost escaping or its copy button");
+  }
+
   ready("native-session");
   window.useNativeFrames();
   delta("native", "NATIVE"); delta("native", "NATIVE_LATEST");

@@ -612,6 +612,71 @@ function readSavedSession(sessionId: string): { time_created?: number; time_arch
   }
 }
 
+export function loadSessionExecutionState(sessionId: string): { mode: string; planEnabled: boolean } | undefined {
+  const file = sessionDbPath();
+  if (!fs.existsSync(file)) return;
+  try {
+    return withDb(file, db => {
+      const rows = db.all("SELECT type,data FROM session_entry WHERE session_id=? AND type IN ('runtime/execution_state','zcode-vscode/permission_restore')", [sessionId]) as Array<{ type: string; data: string }>;
+      const read = (type: string) => {
+        const row = rows.find(row => row.type === type);
+        if (!row) return;
+        const value = JSON.parse(row.data);
+        if (["build", "edit", "yolo", "auto"].includes(value?.mode) && typeof value?.planEnabled === "boolean") return value as { mode: string; planEnabled: boolean };
+      };
+      const saved = read("runtime/execution_state");
+      const pending = read("zcode-vscode/permission_restore");
+      // A different saved base indicates a newer choice made outside this client.
+      return pending && pending.mode === saved?.mode ? pending : saved;
+    });
+  } catch (error) {
+    logWarn("Could not read session execution state", error);
+  }
+}
+
+/** Keep the full target durable while the backend applies base and plan separately. */
+export function saveSessionRestoreIntent(sessionId: string, target?: { mode: string; planEnabled: boolean }): void {
+  const file = sessionDbPath();
+  if (!fs.existsSync(file)) return;
+  const id = `${sessionId}:zcode-vscode-permission-restore`;
+  if (!target && !withDb(file, db => db.get("SELECT id FROM session_entry WHERE id=? AND type='zcode-vscode/permission_restore'", [id]))) return;
+  withWritableDb(file, db => {
+    if (!target) {
+      db.run("DELETE FROM session_entry WHERE id=? AND type='zcode-vscode/permission_restore'", [id]);
+      return;
+    }
+    const now = Date.now();
+    db.run(`INSERT INTO session_entry (id, session_id, type, time_created, time_updated, data)
+      VALUES (?, ?, 'zcode-vscode/permission_restore', ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET data=excluded.data, time_updated=excluded.time_updated`,
+    [id, sessionId, now, now, JSON.stringify(target)]);
+  });
+}
+
+/** The backend skips saving mode changes until its first message persists the session.
+ * Our desktop-visible empty rows need the same execution-state record in that gap. */
+export function persistEmptySessionMode(sessionId: string, mode: string, planEnabled: boolean): void {
+  const file = sessionDbPath();
+  if (!fs.existsSync(file)) return;
+  withWritableDb(file, db => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      if (db.get("SELECT id FROM session WHERE id=?", [sessionId])
+        && !db.get("SELECT id FROM message WHERE session_id=? LIMIT 1", [sessionId])) {
+        const now = Date.now();
+        db.run(`INSERT INTO session_entry (id, session_id, type, time_created, time_updated, data)
+          VALUES (?, ?, 'runtime/execution_state', ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET data=excluded.data, time_updated=excluded.time_updated`,
+        [`${sessionId}:runtime-execution-state`, sessionId, now, now, JSON.stringify({ mode, planEnabled })]);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  });
+}
+
 /**
  * app-server only writes ~/.zcode/cli/db/db.sqlite on the first prompt.
  * Indexing the desktop sidebar before that leaves a ghost task that cannot

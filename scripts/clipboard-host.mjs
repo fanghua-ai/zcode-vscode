@@ -174,8 +174,11 @@ try {
     else {
       await click(inner, point, "right");
       const copyPoint = await until(() => top.evaluate(async () => {
-        const item = [...document.querySelectorAll(".monaco-menu .action-label")].find(node => node.textContent.trim() === "Copy");
-        if (!item?.closest(".monaco-menu")?.contains(document.activeElement) || item.closest(".disabled")) return null;
+        // VS Code can retain a hidden chat selection menu with its own Copy item.
+        const item = [...document.querySelectorAll(".monaco-menu .action-label")].find(node =>
+          node.textContent.trim() === "Copy" && node.getClientRects().length > 0
+          && node.closest(".monaco-menu")?.contains(document.activeElement) && !node.closest(".disabled"));
+        if (!item) return null;
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
         const rect = item.getBoundingClientRect();
         const point = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };

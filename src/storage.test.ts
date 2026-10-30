@@ -675,3 +675,27 @@ test("Windows rename keeps both the CLI directory spelling and existing desktop 
     assert.equal(db.prepare("SELECT count(*) AS n FROM tasks WHERE task_id='A'").get().n, 1);
   } finally { cli.close(); }
 });
+
+test("automatic selection honors CLI archives before index refresh and explicit restores", t => {
+  const { state, cliPath } = sessionOperations(t);
+  const choices = state as unknown as {
+    sessionIsArchived: (sessionId:string) => boolean;
+    chooseStartupSession: (listed: Array<{sessionId:string;title:string;archivedAt?:number}>, remembered: string | undefined, rejected: Set<string>) => string | undefined;
+    nextUsableSession: (listed: Array<{sessionId:string;archivedAt?:number}>) => {sessionId:string} | undefined;
+  };
+  const cli = new DatabaseSync(cliPath);
+  cli.prepare("UPDATE session SET time_archived=? WHERE id='A'").run(123);
+  assert.equal(choices.sessionIsArchived("A"), true, "manual opening also checks CLI archives before refresh");
+  const listed = [{sessionId:"A",title:"Archived in CLI"},{sessionId:"B",title:"Active"}];
+  assert.equal(choices.chooseStartupSession(listed, "A", new Set()), "B");
+  assert.equal(choices.nextUsableSession(listed)?.sessionId, "B");
+  assert.equal(choices.chooseStartupSession([listed[1]], "A", new Set()), "B", "remembered IDs outside the capped page must also be checked");
+  cli.prepare("UPDATE session SET time_archived=NULL WHERE id='A'").run();
+  const stale = [{...listed[0],archivedAt:123},listed[1]];
+  state.sessions = stale;
+  assert.equal(choices.sessionIsArchived("A"), false, "an explicit CLI restore overrides the displayed archive cache");
+  assert.equal(choices.chooseStartupSession(stale, "A", new Set()), "A");
+  assert.equal(choices.nextUsableSession(stale)?.sessionId, "A", "an explicit CLI restore overrides old wire archive metadata");
+  assert.equal(choices.chooseStartupSession(stale, "A", new Set(["A"])), "B");
+  cli.close();
+});

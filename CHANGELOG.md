@@ -1,5 +1,29 @@
 # 更新日志 / Changelog
 
+## 2.1.6 — 2026-10-30
+
+### 中文
+- 会话重启或切换后正确恢复保存的权限和计划模式；新建会话的默认权限及空会话中的手动调整也会保留。
+- 新建会话优先使用创建响应中的标识，避免后台请求使其误关联到旧会话。
+- 自动恢复和切换会话前核对 CLI 归档状态，避免重新打开已归档的会话。
+- 会话列表支持继续加载更早的记录，避免较早的活动会话被归档记录挤出；搜索和引用随已加载记录更新。
+- 同时拖入图片和普通文件时保留整批附件，避免遗漏或重复上传。
+- 连接或切换会话期间添加附件时显示提示，避免粘贴图片后没有反馈。
+- 通用错误优先提供重新连接，模型不可用时仍提供切换模型；协议错误提供对应的处理提示，启动排查操作失败时显示反馈。
+- 未标注有效语言的代码块按纯文本显示，减少恢复长代码历史时的卡顿；保留明确语言的语法高亮。
+- 恢复尚未选定模型的会话时复用有效的模型目录，减少初始化等待。
+
+### English
+- Restore saved permissions and Plan mode after restarts and session switches, including defaults and manual permission changes in empty conversations.
+- Use the identity returned by session creation so background requests cannot attach a new chat to the previous one.
+- Check CLI archive state before automatic session selection to avoid reopening archived conversations.
+- Load older session records on demand so archived records do not hide earlier active chats; search and references update with loaded records.
+- Preserve mixed image and file drops without missing files or duplicate uploads.
+- Explain when attachments cannot be added during connection or session switching.
+- Offer reconnect for generic errors and model selection for unavailable models, provide relevant protocol error guidance, and report failed startup guidance actions.
+- Keep code without a supported language label as plain text to reduce history-rendering stalls, while retaining explicit-language highlighting.
+- Reuse a current model catalog when restoring a session without a selected model, reducing initialization waits.
+
 ## 2.1.5 — 2026-10-28
 
 ### 中文

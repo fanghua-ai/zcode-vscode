@@ -308,6 +308,8 @@ let overlayMode: "sessions" | "models" | "mode" | "thought" | null = null;
 let showArchived = false;
 let sessions: Session[] = [];
 let referenceSessions: SessionReference[] = [];
+let sessionListHasMore = false;
+let sessionListRequestId = "";
 let sessionListNotice: "ready" | "stale" | "initial" = "ready";
 let startupWaitTimer = 0;
 let startupWait: { key: string; startedAt: number } | null = null;
@@ -538,8 +540,15 @@ async function cacheThumbnail(dataUrl: string, owner: string, id: string): Promi
     return true;
   } catch { return false; }
 }
+function attachmentInputReady(): boolean {
+  if (holdStreams || !sessionConnected || !draftSessionId) {
+    showToast(t("会话正在连接或切换，请稍后添加附件。"));
+    return false;
+  }
+  return true;
+}
 async function addImageFile(file: File): Promise<void> {
-  if (holdStreams || !draftSessionId) return;
+  if (!attachmentInputReady()) return;
   if (imageDrafts.length >= IMAGE_MAX_COUNT) { showToast(t("最多添加 8 张图片。")); return; }
   if (file.size > IMAGE_MAX_BYTES) { showToast(t("每张图片不能超过 20 MB。")); return; }
   if (!IMAGE_MIMES.includes(file.type as any)) { showToast(t("请选择 PNG、JPEG、WebP 或 GIF 图片。")); return; }
@@ -553,7 +562,7 @@ async function addImageFile(file: File): Promise<void> {
     post({ type: "uploadImage", imageId: id, sessionId: owner, fileName: file.name, dataUrl });
   } catch { imageResult({ type: "image_failed", imageId: id, sessionId: owner }); }
 }
-document.getElementById("attach-files")!.addEventListener("click", () => { if (!holdStreams) post({ type: "pickAttachments", sessionId: draftSessionId, maxImages: Math.max(0, IMAGE_MAX_COUNT - imageDrafts.length) }); });
+document.getElementById("attach-files")!.addEventListener("click", () => { if (attachmentInputReady()) post({ type: "pickAttachments", sessionId: draftSessionId, maxImages: Math.max(0, IMAGE_MAX_COUNT - imageDrafts.length) }); });
 input.addEventListener("paste", event => {
   const images = Array.from(event.clipboardData?.files ?? []).filter(file => file.type.startsWith("image/"));
   if (images.length) {
@@ -568,10 +577,16 @@ input.addEventListener("paste", event => {
 });
 input.addEventListener("dragover", event => { if (event.dataTransfer?.types.some(type => type === "Files" || type === "text/uri-list")) event.preventDefault(); });
 input.addEventListener("drop", event => {
-  const images = Array.from(event.dataTransfer?.files ?? []).filter(file => file.type.startsWith("image/"));
-  if (images.length) { event.preventDefault(); for (const image of images) void addImageFile(image); return; }
   const uris = (event.dataTransfer?.getData("text/uri-list") || "").split(/\r?\n/).filter(uri => /^file:/i.test(uri));
-  if (uris.length && !holdStreams) { event.preventDefault(); post({ type: "attachFileUris", sessionId: draftSessionId, uris, maxImages: Math.max(0, IMAGE_MAX_COUNT - imageDrafts.length) }); }
+  // A native drop can contain images and ordinary files together. Let the
+  // host handle the entire batch so neither ordinary files nor images repeat.
+  if (uris.length) {
+    event.preventDefault();
+    if (attachmentInputReady()) post({ type: "attachFileUris", sessionId: draftSessionId, uris, maxImages: Math.max(0, IMAGE_MAX_COUNT - imageDrafts.length) });
+    return;
+  }
+  const images = Array.from(event.dataTransfer?.files ?? []).filter(file => file.type.startsWith("image/"));
+  if (images.length) { event.preventDefault(); for (const image of images) void addImageFile(image); }
 });
 
 function post(msg: unknown): void {
@@ -5039,9 +5054,16 @@ function paintSessionListNotice(): void {
   const notice = document.getElementById("session-list-notice");
   if (!notice) return;
   const failed = overlayMode === "sessions" && (sessionListNotice === "stale" || sessionListNotice === "initial");
-  notice.hidden = !failed;
+  notice.hidden = overlayMode !== "sessions" || (!failed && !sessionListHasMore);
   const label = notice.querySelector("span");
-  if (label) setUiLabel(label, sessionListNotice === "initial" ? "会话列表加载失败" : "刷新失败，当前显示上次结果");
+  if (label) setUiLabel(label, failed
+    ? sessionListNotice === "initial" ? "会话列表加载失败" : "刷新失败，当前显示上次结果"
+    : "仅显示已加载的会话，加载更多后可继续搜索。");
+  const button = notice.querySelector<HTMLButtonElement>("button");
+  if (button) {
+    setUiLabel(button, sessionListRequestId ? "正在加载…" : failed ? "重试" : "加载更多会话");
+    button.disabled = !!sessionListRequestId;
+  }
 }
 
 function pickerAnchor(mode: "models" | "mode" | "thought"): HTMLElement {
@@ -7454,7 +7476,11 @@ document.addEventListener("mousedown", (e) => {
 });
 document.getElementById("overlay-close")!.addEventListener("click", closeOverlay);
 document.querySelector("#session-list-notice button")?.addEventListener("click", () => {
-  post({ type: "listSessions", includeArchived: showArchived, listVisible: true });
+  if (sessionListRequestId) return;
+  const loadMore = sessionListHasMore && sessionListNotice === "ready";
+  sessionListRequestId = crypto.randomUUID();
+  paintSessionListNotice();
+  post({ type: "listSessions", includeArchived: showArchived, listVisible: true, requestId: sessionListRequestId, ...(loadMore ? { loadMore: true } : {}) });
 });
 overlay.addEventListener("click", (e) => {
   if (e.target === overlay) closeOverlay();
@@ -7592,7 +7618,15 @@ window.addEventListener("message", (event) => {
     case "session_action_complete":
       if (msg.sessionId && msg.actionRequestId) finishSessionAction(msg.sessionId, msg.actionRequestId);
       break;
+    case "session_list_complete":
+      if (msg.requestId === sessionListRequestId) {
+        sessionListRequestId = "";
+        paintSessionListNotice();
+      }
+      break;
     case "sessions":
+      sessionListHasMore = msg.hasMore === true;
+      sessionListRequestId = "";
       sessions = msg.sessions ?? [];
       referenceSessions = msg.referenceSessions ?? [];
       if (msg.notice === "initial" || msg.notice === "stale" || msg.notice === "ready") sessionListNotice = msg.notice;
@@ -7726,6 +7760,8 @@ window.addEventListener("message", (event) => {
     case "user_input_echo":
       break;
     case "view_reset":
+      sessionListRequestId = "";
+      paintSessionListNotice();
       messageEpoch++;
       resetAllTurnCollapse();
       pinActiveQuestionUntil = 0;

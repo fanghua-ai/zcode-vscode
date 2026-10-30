@@ -6,6 +6,7 @@ import { hostT, userFacingError } from "./hostI18n";
 import { LocalizedError, messages, setUiLanguage, translate, relocalizeUiText } from "./i18n";
 import { traditionalMessages } from "./i18n.zhTW";
 import { setTestLanguage } from "./testSupport/vscode";
+import { errorGuidance } from "./errorGuidance";
 
 test("host notices read the preference on every call, independently of webview state", () => {
   try {
@@ -48,6 +49,25 @@ test("owned database errors translate while external diagnostics and interpolate
     );
     setTestLanguage("zh-TW");
     assert.match(userFacingError(error), /請更新 VS Code 後重試/);
+  } finally { setTestLanguage("auto"); }
+});
+
+test("localized protocol errors keep their RPC category and redact their details", () => {
+  try {
+    for (const language of ["zh-CN", "en", "zh-TW"]) {
+      setTestLanguage(language);
+      for (const code of [-32601, -32602]) {
+        const message = `ZCode error ${code}: Invalid params`;
+        const displayed = userFacingError(new Error(message));
+        assert.equal(displayed, message);
+        assert.equal(errorGuidance(displayed).category, "compatibility");
+      }
+      const secret = userFacingError(new Error("ZCode error -32602: Invalid params Authorization: Bearer sk-abcdefghijklmnop"));
+      assert.doesNotMatch(secret, /sk-abcdefghijklmnop/);
+      assert.match(secret, /^ZCode error -32602: Invalid params Authorization: \[REDACTED\]/);
+      assert.equal(errorGuidance(secret).category, "compatibility");
+      assert.notEqual(errorGuidance(userFacingError(new Error("Model API returned invalid params"))).category, "compatibility");
+    }
   } finally { setTestLanguage("auto"); }
 });
 

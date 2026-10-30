@@ -32,7 +32,7 @@ test("streaming code skips known and automatic highlighting, including open fenc
   });
 });
 
-test("settled code restores explicit and automatic highlighting between streamed renders", (t) => {
+test("settled code highlights explicit languages and leaves unknown languages escaped", (t) => {
   const known = t.mock.method(hljs, "highlight");
   const automatic = t.mock.method(hljs, "highlightAuto");
   withoutDom(() => {
@@ -42,14 +42,30 @@ test("settled code restores explicit and automatic highlighting between streamed
     assert.equal(known.mock.callCount(), 1);
     assert.equal(automatic.mock.callCount(), 0);
     for (const language of ["unknown-language", ""]) {
-      assert.match(renderMarkdown(source(language)), /<span class="hljs-/);
+      const html = renderMarkdown(source(language));
+      assert.doesNotMatch(html, /<span class="hljs-/);
+      assert.match(html, /class="code-block"/);
+      assert.match(html, /data-copy="1"/);
     }
-    assert.equal(automatic.mock.callCount(), 2);
+    assert.equal(automatic.mock.callCount(), 0);
     const beforeKnown = known.mock.callCount();
     assert.doesNotMatch(renderMarkdown(source("javascript"), true), /<span class="hljs-/);
     assert.equal(known.mock.callCount(), beforeKnown);
-    assert.equal(automatic.mock.callCount(), 2);
+    assert.equal(automatic.mock.callCount(), 0);
   });
+});
+
+test("unlabelled and unsupported code escapes HTML without automatic highlighting", (t) => {
+  const automatic = t.mock.method(hljs, "highlightAuto", () => { throw new Error("must not guess"); });
+  withoutDom(() => {
+    for (const language of ["", "unsupported-language"]) {
+      const html = renderMarkdown("```" + language + "\n<script>alert(1)</script>\n```");
+      assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+      assert.doesNotMatch(html, /<script/);
+      assert.match(html, /data-copy="1"/);
+    }
+  });
+  assert.equal(automatic.mock.callCount(), 0);
 });
 
 test("a highlighting failure preserves escaped code", (t) => {

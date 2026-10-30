@@ -16,7 +16,13 @@ export function userFacingError(error: unknown): string {
     text = hostT(error.key, error.values);
   } else {
     const message = error instanceof Error ? error.message : String(error);
-    text = hostT(message.replace(/^ZCode error -?\d+:\s*/, ""));
+    const rpc = /^ZCode error (-?\d+):\s*/.exec(message);
+    text = hostT(rpc ? message.slice(rpc[0].length) : message);
+    // Keep protocol failures identifiable after localization; other errors
+    // retain the existing readable-message format.
+    if (rpc && (rpc[1] === "-32601" || rpc[1] === "-32602")) {
+      text = `ZCode error ${rpc[1]}: ${text}`;
+    }
   }
   return redactSecrets(text);
 }

@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
-import { disposeSqliteSnapshots, listSessionQuestions, loadTaskFlags, setTaskArchived, setTaskDeleted } from "./taskIndex";
+import { saveSessionRestoreIntent, loadSessionExecutionState, persistEmptySessionMode, disposeSqliteSnapshots, listSessionQuestions, loadTaskFlags, setTaskArchived, setTaskDeleted } from "./taskIndex";
 
 const os = require("os") as typeof import("os");
 const loader = require("module") as { _load(name: string, ...args: unknown[]): unknown };
@@ -282,4 +282,60 @@ test("successive refreshes follow another process's WAL commits and desktop rest
     assert.equal(listSessionQuestions("session").length, 5, "WAL truncation lost history");
     await writer.close();
   } finally { await writer.kill(); }
+});
+
+
+test("empty session permission changes persist base mode and plan independently", t => {
+  const { cli } = fixture(t);
+  const db = questions(cli);
+  db.exec(`CREATE TABLE session_entry(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,time_created INTEGER,time_updated INTEGER,data TEXT);`);
+  const saved = () => JSON.parse(String(db.prepare("SELECT data FROM session_entry WHERE session_id='session'").get()?.data));
+  try {
+    persistEmptySessionMode("session", "yolo", false);
+    assert.deepEqual(saved(), { mode: "yolo", planEnabled: false });
+    persistEmptySessionMode("session", "yolo", true);
+    assert.deepEqual(saved(), { mode: "yolo", planEnabled: true });
+    assert.deepEqual(loadSessionExecutionState("session"), { mode: "yolo", planEnabled: true });
+    persistEmptySessionMode("session", "edit", false);
+    assert.deepEqual(saved(), { mode: "edit", planEnabled: false });
+    persistEmptySessionMode("missing", "yolo", false);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM session_entry").get().n, 1);
+    addQuestion(db, "question", 1);
+    assert.deepEqual(loadSessionExecutionState("session"), { mode: "edit", planEnabled: false }, "history-bearing chats still need the saved plan flag when snapshots omit it");
+    persistEmptySessionMode("session", "build", false);
+    assert.deepEqual(saved(), { mode: "edit", planEnabled: false }, "backend owns persistence after the first message");
+  } finally { db.close(); }
+});
+
+test("failed empty-session permission persistence rolls back and can retry", t => {
+  const { cli } = fixture(t);
+  const db = questions(cli);
+  try {
+    assert.throws(() => persistEmptySessionMode("session", "yolo", false), /session_entry/);
+    db.exec(`CREATE TABLE session_entry(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,time_created INTEGER,time_updated INTEGER,data TEXT);`);
+    persistEmptySessionMode("session", "yolo", false);
+    assert.equal(JSON.parse(String(db.prepare("SELECT data FROM session_entry").get().data)).mode, "yolo");
+  } finally { db.close(); }
+});
+
+
+test("a pending restore retains the full plan target across partial updates and allows explicit replacement", t => {
+  const { cli } = fixture(t);
+  const db = questions(cli);
+  db.exec(`CREATE TABLE session_entry(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,time_created INTEGER,time_updated INTEGER,data TEXT);`);
+  try {
+    persistEmptySessionMode("session", "yolo", true);
+    saveSessionRestoreIntent("session", { mode: "yolo", planEnabled: true });
+    persistEmptySessionMode("session", "yolo", false);
+    assert.deepEqual(loadSessionExecutionState("session"), { mode: "yolo", planEnabled: true });
+    saveSessionRestoreIntent("session");
+    assert.deepEqual(loadSessionExecutionState("session"), { mode: "yolo", planEnabled: false });
+    saveSessionRestoreIntent("session", { mode: "yolo", planEnabled: true });
+    persistEmptySessionMode("session", "edit", false);
+    assert.deepEqual(loadSessionExecutionState("session"), { mode: "edit", planEnabled: false }, "a newer saved base must take precedence over a stale restore target");
+    persistEmptySessionMode("session", "yolo", true);
+    saveSessionRestoreIntent("session");
+    assert.deepEqual(loadSessionExecutionState("session"), { mode: "yolo", planEnabled: true });
+    assert.equal(db.prepare("SELECT count(*) AS n FROM session_entry WHERE type='zcode-vscode/permission_restore'").get().n, 0);
+  } finally { db.close(); }
 });

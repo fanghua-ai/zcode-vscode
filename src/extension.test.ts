@@ -54,6 +54,12 @@ function fixture() {
   let stagedSessionModel: { providerId: string; modelId: string } | null | undefined;
   const activeClient = { currentSessionId: "A", currentMode: () => "build", confirmedModel: () => state.currentModel, confirmedControls: () => ({mode:"build"}), setViewVisible: (visible: boolean) => { visibility.push(visible); }, pollBackgroundRuns: () => { backgroundPolls++; }, dispose: () => {}, editUserQuery: () => response.promise, insertQueuedMessage: () => response.promise, conversationFileChanges: () => response.promise, sendMessage: () => response.promise, setMode: async () => {}, setModel: async () => {}, hasFreshSessionModel: () => false, readAvailableModels: async () => ({ available: [] }), stageSessionModel: (model: { providerId: string; modelId: string } | null) => { stagedSessionModel = model; },
     activitySince: () => undefined, noteHistoryDelivered: () => {}, queuedMessages: () => [] };
+  Object.assign(activeClient, {
+    listSessionsPage: async (includeArchived = false) => ({
+      sessions: await (state.client as unknown as { listSessions: (archived: boolean) => Promise<unknown[]> }).listSessions(includeArchived),
+      hasMore: false,
+    }),
+  });
   state.client = activeClient;
   const pollState = provider as unknown as { runningPoll?: NodeJS.Timeout; dispose: () => void };
   state.post = message => posted.push(message);
@@ -1276,4 +1282,94 @@ test("choosing a model while generating stages it for quota display", async () =
     modelId: "deepseek-chat",
   });
   f.dispose();
+});
+
+test("loading older session pages exposes active sessions hidden behind archived records", async () => {
+  const f = fixture();
+  const state = f.provider as unknown as {
+    client: {listSessionsPage:(archived:boolean,limit:number)=>Promise<{sessions:Array<{sessionId:string;title:string;archivedAt?:number}>;hasMore:boolean}>};
+    refreshSessions:(archived?:boolean,startupList?:unknown,visible?:boolean,more?:boolean)=>Promise<void>;
+    sessionListLimit:number;
+  };
+  const archived = Array.from({length:80},(_,i)=>({sessionId:`archived-${i}`,title:`Old ${i}`,archivedAt:1}));
+  const active = {sessionId:"older-active",title:"Older active conversation"};
+  const limits:number[]=[];
+  state.client.listSessionsPage=async(_archived,limit)=>{limits.push(limit);return {sessions:limit===80?archived:[...archived,active],hasMore:limit===80};};
+  await state.refreshSessions(false,undefined,true);
+  assert.deepEqual(f.posted.at(-1)?.sessions,[]);
+  assert.equal(f.posted.at(-1)?.hasMore,true);
+  await f.state.onWebviewMessage({type:"listSessions",listVisible:true,loadMore:true});
+  assert.deepEqual(limits,[80,160]);
+  assert.deepEqual((f.posted.at(-1)?.sessions as Array<{sessionId:string}>).map(session=>session.sessionId),[active.sessionId]);
+  assert.deepEqual(f.posted.at(-1)?.referenceSessions,[active]);
+  assert.equal(f.posted.at(-1)?.hasMore,false);
+  await state.refreshSessions(false,undefined,true);
+  assert.equal(limits.at(-1),160,"a refresh must not silently truncate an expanded list");
+});
+
+test("failed load-more retains its page and workspace changes reset the limit", async () => {
+  const f=fixture();
+  const state=f.provider as unknown as {
+    client:{listSessionsPage:(archived:boolean,limit:number)=>Promise<{sessions:Array<{sessionId:string;title:string}>;hasMore:boolean}>};
+    refreshSessions:(archived?:boolean,startupList?:unknown,visible?:boolean,more?:boolean)=>Promise<void>;
+    sessionListLimit:number;adoptWorkspace:(path:string)=>void;
+  };
+  state.adoptWorkspace("/project-a");
+  const cached={sessionId:"cached",title:"Existing chat"};
+  state.client.listSessionsPage=async()=>({sessions:[cached],hasMore:true});
+  await state.refreshSessions(false,undefined,true);
+  state.client.listSessionsPage=async()=>{throw Error("temporarily unavailable");};
+  await state.refreshSessions(false,undefined,true,true);
+  assert.equal(state.sessionListLimit,80);
+  assert.equal(f.posted.at(-1)?.notice,"stale");
+  assert.equal(f.posted.at(-1)?.hasMore,true);
+  assert.deepEqual((f.posted.at(-1)?.sessions as Array<{sessionId:string}>).map(session=>session.sessionId),[cached.sessionId]);
+  state.adoptWorkspace("/project-b");
+  assert.equal(state.sessionListLimit,80);
+  assert.deepEqual(f.posted.at(-1)?.sessions,[]);
+});
+
+test("quick switch can load past a page consisting only of archived sessions", async t => {
+  const f=fixture();
+  const state=f.provider as unknown as {client:{listSessionsPage:(archived:boolean,limit:number)=>Promise<{sessions:Array<{sessionId:string;title:string;archivedAt?:number}>;hasMore:boolean}>}};
+  state.client.listSessionsPage=async(_archived,limit)=>({sessions:limit===80?[{sessionId:"old",title:"Archived",archivedAt:1}]:[{sessionId:"active",title:"Active"}],hasMore:limit===80});
+  t.mock.method(testWindow,"showQuickPick",async (items: Array<{sessionId?:string;loadMore?:boolean}>)=>items[0]);
+  const selected:string[]=[];
+  t.mock.method(f.provider as unknown as {switchSession:(id:string)=>Promise<void>},"switchSession",async (id:string)=>{selected.push(id);});
+  await f.provider.quickSwitchSession();
+  assert.deepEqual(selected,["active"]);
+});
+
+test("a rejected slow-startup guidance action reports failure instead of escaping its caller", async () => {
+  const f=fixture();
+  const state=f.provider as unknown as {finishTiming:(timing:{dispose:()=>void;snapshot:()=>Record<string,string|number>})=>void;offerDefenderExclusion:()=>Promise<void>};
+  Object.assign(f.state.client,{clearTiming:()=>{}});
+  const descriptor=Object.getOwnPropertyDescriptor(process,"platform")!;
+  Object.defineProperty(process,"platform",{value:"win32"});
+  recoveryNotices.length=0;
+  state.offerDefenderExclusion=async()=>{throw Error("CLIPBRD_E_CANT_OPEN");};
+  try {
+    state.finishTiming({dispose(){},snapshot:()=>({kind:"open","session/resume":21000})});
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.ok(recoveryNotices.some(notice=>notice.message.includes("启动提示操作未完成")));
+  }finally{Object.defineProperty(process,"platform",descriptor);}
+});
+
+test("a superseded foreground page still completes when its hidden replacement fails", async () => {
+  const f=fixture();
+  const state=f.provider as unknown as {
+    client:{listSessions:()=>Promise<unknown[]>;listSessionsPage:()=>Promise<{sessions:Array<{sessionId:string;title:string}>;hasMore:boolean}>};
+    refreshSessions:(archived?:boolean,startupList?:unknown,visible?:boolean,more?:boolean)=>Promise<void>;
+  };
+  state.client.listSessionsPage=async()=>({sessions:[{sessionId:"A",title:"Cached"}],hasMore:true});
+  await state.refreshSessions(false,undefined,true);
+  let release!:(page:{sessions:Array<{sessionId:string;title:string}>;hasMore:boolean})=>void;
+  state.client.listSessionsPage=()=>new Promise(resolve=>{release=resolve;});
+  const more=f.state.onWebviewMessage({type:"listSessions",listVisible:true,loadMore:true,requestId:"foreground-more"});
+  state.client.listSessions=async()=>{throw Error("hidden refresh failed");};
+  await state.refreshSessions(false);
+  release({sessions:[{sessionId:"late",title:"Stale page"}],hasMore:false});
+  await more;
+  assert.equal(f.posted.filter(message=>message.type==="sessions").length,1,"a hidden failure or obsolete page replaced cached rows");
+  assert.deepEqual(f.posted.at(-1),{type:"session_list_complete",requestId:"foreground-more"});
 });

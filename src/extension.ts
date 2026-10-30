@@ -317,6 +317,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private startupPhaseSince = 0;
   private startupPhaseTimer: NodeJS.Timeout | undefined;
   private sessionListRequest = 0;
+  private sessionListLimit = 80;
+  private sessionListHasMore = false;
   private sessionListViews: Record<"active" | "archived", {
     sessions: SessionSummary[];
     state: "unknown" | "ready" | "failed";
@@ -330,6 +332,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   private resetSessionListCache(): void {
     this.sessions = [];
+    this.sessionListLimit = 80;
+    this.sessionListHasMore = false;
     this.sessionListViews = {
       active: { sessions: [], state: "unknown", loaded: false },
       archived: { sessions: [], state: "unknown", loaded: false },
@@ -574,7 +578,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     if (this.timing === timing) this.timing = null;
     this.client?.clearTiming(timing);
     if (isSlowWindowsStartup(process.platform, snapshot)) {
-      void this.offerDefenderExclusion(Number(snapshot["session/resume"]));
+      void this.offerDefenderExclusion(Number(snapshot["session/resume"])).catch(error => {
+        logWarn("Slow startup guidance failed", error);
+        void vscode.window.showErrorMessage(t("启动提示操作未完成，请重试或查看日志。"));
+      });
     }
   }
 
@@ -1078,7 +1085,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         await this.newSession();
         break;
       case "listSessions":
-        await this.refreshSessions(!!msg.includeArchived, undefined, msg.listVisible === true);
+        try {
+          await this.refreshSessions(!!msg.includeArchived, undefined, msg.listVisible === true, msg.loadMore === true);
+        } finally {
+          // Even superseded/hidden failures must release the requesting button.
+          if (msg.requestId) this.post({ type: "session_list_complete", requestId: msg.requestId });
+        }
         break;
       case "switchSession":
         if (msg.sessionId) await this.switchSession(msg.sessionId);
@@ -1631,26 +1643,30 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   async quickSwitchSession(): Promise<void> {
-    await this.refreshSessions();
-    const active = this.sessionListViews.active;
-    if (active.state === "failed" && !active.loaded) {
-      vscode.window.showInformationMessage(t("会话列表加载失败"));
-      return;
+    await this.refreshSessions(false, undefined, true);
+    for (;;) {
+      const active = this.sessionListViews.active;
+      if (active.state === "failed" && !active.loaded) {
+        vscode.window.showInformationMessage(t("会话列表加载失败"));
+        return;
+      }
+      if (active.sessions.length === 0 && !this.sessionListHasMore) {
+        vscode.window.showInformationMessage(t("此工作区还没有会话。"));
+        return;
+      }
+      const items: Array<vscode.QuickPickItem & { sessionId?: string; loadMore?: boolean }> = active.sessions.map(s => ({
+        label: s.title || t("未命名"), description: s.model?.modelId,
+        detail: s.sessionId, sessionId: s.sessionId,
+      }));
+      if (this.sessionListHasMore) items.push({ label: t("加载更多会话"), loadMore: true });
+      const picked = await vscode.window.showQuickPick(items, { placeHolder: t("切换 ZCode 会话") });
+      if (!picked) return;
+      if (picked.loadMore) await this.refreshSessions(false, undefined, true, true);
+      else {
+        if (picked.sessionId) await this.switchSession(picked.sessionId);
+        return;
+      }
     }
-    if (active.sessions.length === 0) {
-      vscode.window.showInformationMessage(t("此工作区还没有会话。"));
-      return;
-    }
-    const picked = await vscode.window.showQuickPick(
-      active.sessions.map((s) => ({
-        label: s.title || t("未命名"),
-        description: s.model?.modelId,
-        detail: s.sessionId,
-        sessionId: s.sessionId,
-      })),
-      { placeHolder: t("切换 ZCode 会话") }
-    );
-    if (picked) await this.switchSession(picked.sessionId);
   }
 
   async quickSelectModel(): Promise<void> {
@@ -1731,8 +1747,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private sessionIsArchived(sessionId: string): boolean {
-    if (this.sessions.some((s) => s.sessionId === sessionId && s.archivedAt)) return true;
-    return !!this.workspacePath && loadTaskFlags(this.workspacePath).archived.includes(sessionId);
+    const archiveTimes = loadSessionArchiveTimes([sessionId]);
+    const archived = archiveTimes.has(sessionId) ? archiveTimes.get(sessionId)
+      : this.sessions.find(session => session.sessionId === sessionId)?.archivedAt;
+    return !!archived || (!!this.workspacePath && loadTaskFlags(this.workspacePath).archived.includes(sessionId));
   }
 
   private async switchSession(sessionId: string): Promise<void> {
@@ -2306,7 +2324,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async refreshSessions(includeArchived = false, startupList?: SessionSummary[], listVisible = false): Promise<void> {
+  private async refreshSessions(includeArchived = false, startupList?: SessionSummary[], listVisible = false, loadMore = false): Promise<void> {
     const client = this.client;
     const ticket = this.switchTicket;
     if (!client) return;
@@ -2316,8 +2334,14 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const currentRequest = () => client === this.client && ticket === this.switchTicket
       && request === this.sessionListRequest && sameWorkspacePath(workspacePath, this.workspacePath);
     try {
-      const serverList = startupList ?? await client.listSessions(true);
+      const limit = startupList ? 80 : loadMore ? this.sessionListLimit * 2 : this.sessionListLimit;
+      const page = !startupList && (listVisible || limit > 80)
+        ? await client.listSessionsPage(true, limit)
+        : { sessions: startupList ?? await client.listSessions(true), hasMore: undefined };
       if (!currentRequest()) return;
+      const serverList = page.sessions;
+      this.sessionListLimit = limit;
+      this.sessionListHasMore = page.hasMore ?? serverList.length >= limit;
       const indexStarted = Date.now();
       const archiveTimes = loadSessionArchiveTimes(serverList.map(s => s.sessionId));
       const listed = serverList.map(s => archiveTimes.has(s.sessionId)
@@ -2354,6 +2378,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         currentId: client.currentSessionId,
         includeArchived,
         notice: "ready",
+        hasMore: this.sessionListHasMore,
       });
       let indexed = 0;
       for (const s of listed) {
@@ -2396,6 +2421,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         currentId: this.client?.currentSessionId,
         includeArchived,
         notice: cached.loaded ? "stale" : "initial",
+        hasMore: this.sessionListHasMore,
       });
     }
   }
@@ -2551,20 +2577,31 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.pushNewSessionDefaults();
   }
 
-  /** session/list can lag the desktop index. Read archive flags only after that list returns. */
-  private sessionExclusions(extra: Iterable<string> = []): Set<string> {
+  /** Merge CLI archive facts before choosing, even before the first list refresh. */
+  private sessionExclusions(
+    extra: Iterable<string> = [],
+    listed: Array<{ sessionId: string; archivedAt?: number }> = []
+  ): Set<string> {
     const flags = this.workspacePath
       ? loadTaskFlags(this.workspacePath)
       : { archived: [], deleted: [] };
-    return new Set([...flags.archived, ...flags.deleted, ...extra]);
+    const excluded = new Set([...flags.archived, ...flags.deleted, ...extra]);
+    const archiveTimes = loadSessionArchiveTimes(listed.map(session => session.sessionId));
+    for (const session of listed) {
+      // An explicit CLI null also overrides an old archivedAt in a server page.
+      if (archiveTimes.has(session.sessionId) ? archiveTimes.get(session.sessionId) : session.archivedAt) {
+        excluded.add(session.sessionId);
+      }
+    }
+    return excluded;
   }
 
   private nextUsableSession(
     listed: Array<{ sessionId: string; archivedAt?: number }>,
     extra: string[] = []
   ): { sessionId: string; archivedAt?: number } | undefined {
-    const excluded = this.sessionExclusions(extra);
-    return listed.find((s) => !excluded.has(s.sessionId) && !s.archivedAt);
+    const excluded = this.sessionExclusions(extra, listed);
+    return listed.find((s) => !excluded.has(s.sessionId));
   }
 
   private chooseStartupSession(
@@ -2572,13 +2609,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     remembered: string | undefined,
     rejected: ReadonlySet<string>
   ): string | undefined {
-    const excluded = this.sessionExclusions(rejected);
-    if (remembered && !excluded.has(remembered)) {
-      const known = listed.find((s) => s.sessionId === remembered);
-      // Absent from this page: the list is capped, so keep a session the index still allows.
-      if (!known || !known.archivedAt) return remembered;
-    }
-    return listed.find((s) => !excluded.has(s.sessionId) && !s.archivedAt)?.sessionId;
+    const candidates = remembered && !listed.some(session => session.sessionId === remembered)
+      ? [...listed, { sessionId: remembered }] : listed;
+    const excluded = this.sessionExclusions(rejected, candidates);
+    if (remembered && !excluded.has(remembered)) return remembered;
+    return listed.find((s) => !excluded.has(s.sessionId))?.sessionId;
   }
 
   private rememberSession(sessionId: string): void {
@@ -2903,6 +2938,7 @@ export type WebviewIn = {
   restart?: boolean;
   includeArchived?: boolean;
   listVisible?: boolean;
+  loadMore?: boolean;
   requestId?: string;
   actionRequestId?: string;
   optionId?: string;

@@ -7,7 +7,7 @@ import { LocalizedError } from "./i18n";
 import { ChildProcess, spawn } from "child_process";
 import * as readline from "readline";
 import { sameWorkspacePath } from "./workspacePath";
-import { listWorkspacePathVariants, sessionsFinishedSince } from "./taskIndex";
+import { listWorkspacePathVariants, sessionsFinishedSince, persistEmptySessionMode, loadSessionExecutionState, saveSessionRestoreIntent } from "./taskIndex";
 import { logDebug, logError, logInfo, logWarn } from "./log";
 import {
   ResolvedRuntime,
@@ -392,6 +392,8 @@ export class ZCodeClient {
   private stopWatch: NodeJS.Timeout | null = null;
   private acceptLive = true;
   private sessionChanges: Promise<unknown> = Promise.resolve();
+  private readonly modeChanges = new Map<string, Promise<void>>();
+  private readonly pendingSessionRestores = new Set<string>();
   private sessionGeneration = 0;
   private disposed = false;
 
@@ -947,6 +949,11 @@ export class ZCodeClient {
   }
 
   async listSessions(includeArchived = false): Promise<SessionSummary[]> {
+    return (await this.listSessionsPage(includeArchived)).sessions;
+  }
+
+  async listSessionsPage(includeArchived = false, limit = 80): Promise<{ sessions: SessionSummary[]; hasMore: boolean }> {
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new RangeError("Session list limit must be a positive safe integer");
     const started = Date.now();
     const timeoutMs = this.resumeRequests > 0 || this.lateResumes.size > 0
       ? ZCodeClient.sessionListTimeoutDuringResumeMs
@@ -954,7 +961,7 @@ export class ZCodeClient {
     try {
       const paths = listWorkspacePathVariants(this.opts.workspacePath);
       const results = await Promise.all(paths.map(async workspacePath => {
-        const params = { workspace: workspaceObject(workspacePath), limit: 80 };
+        const params = { workspace: workspaceObject(workspacePath), limit };
         try {
           return await this.sendRequest("session/list", {
             ...params, ...(this.sessionListSupportsArchived ? { includeArchived } : {}),
@@ -980,7 +987,9 @@ export class ZCodeClient {
       }
       const sessions = [...byId.values()];
       sessions.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-      return sessions;
+      // Truncation belongs to each raw page, before workspace filtering,
+      // archived filtering or deduplication across Windows path variants.
+      return { sessions, hasMore: results.some(result => (result?.sessions?.length ?? 0) >= limit) };
     } finally {
       this.activeTiming?.add("session/list", Date.now() - started);
       this.activeTiming?.addCount("sessionListCount");
@@ -1050,10 +1059,13 @@ export class ZCodeClient {
     const createdRuntime = this.defaultRuntime;
     this.setSessionModel(createdRuntime ? { providerId: createdRuntime.providerId, modelId: createdRuntime.modelId } : null);
     this.sessionRuntime = createdRuntime;
-    await this.sendRequest("session/create", {
+    const created = await this.sendRequest("session/create", {
       workspace: this.ws(),
-      mode: "build",
-    });
+      mode: newSessionDefaults?.mode ?? "build",
+    }) as SessionSnapshot | undefined;
+    // A background request for the previous chat may request preferences while
+    // creation is in flight. Its identity must not win over the create response.
+    if (created?.session?.sessionId) this.sessionId = created.session.sessionId;
 
     if (!this.sessionId) {
       this.opts.onEvent({
@@ -1077,6 +1089,7 @@ export class ZCodeClient {
   }
 
   private async resumeSessionInner(sessionId: string, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
+    await this.modeChanges.get(sessionId)?.catch(() => {});
     const changingSession = this.sessionId !== sessionId;
     this.releaseStopWait();
     this.runtimeNeedsRevalidation = true;
@@ -1133,6 +1146,29 @@ export class ZCodeClient {
 
     this.sessionId = sessionId;
     this.sessionReadable = true;
+    await this.queueModeChange(sessionId, async () => {
+      const savedExecution = loadSessionExecutionState(sessionId);
+      if (!savedExecution || !stillThisResume()) return;
+      const snapshot = resumedSnapshot as SessionSnapshot | undefined;
+      const base = readBaseSessionMode(snapshot?.settings);
+      const restoreBase = base !== savedExecution.mode
+        || readPlanFlag(snapshot?.settings) === true && !savedExecution.planEnabled;
+      if (!restoreBase && !savedExecution.planEnabled) {
+        saveSessionRestoreIntent(sessionId);
+        this.pendingSessionRestores.delete(sessionId);
+        return;
+      }
+      // setMode(base) clears the backend's saved plan flag. Keep the full target
+      // until every step succeeds, including across process restarts after failure.
+      this.pendingSessionRestores.add(sessionId);
+      if (savedExecution.planEnabled) saveSessionRestoreIntent(sessionId, savedExecution);
+      if (restoreBase) await this.applyMode(sessionId, savedExecution.mode, true);
+      if (savedExecution.planEnabled) await this.applyMode(sessionId, "plan", true);
+      if (savedExecution.planEnabled) saveSessionRestoreIntent(sessionId);
+      this.pendingSessionRestores.delete(sessionId);
+      resumedSnapshot = undefined;
+    });
+    if (!stillThisResume()) return;
     await this.afterSessionAttached("resumed", false, null, resumedSnapshot as SessionSnapshot | undefined);
     // Subscription failure throws above. Readable stays true, but this session
     // is not attached until the conversation catch-up succeeds.
@@ -1275,8 +1311,8 @@ export class ZCodeClient {
         const registered = available.find(model => !model.disabledReason &&
           model.providerId === requestedRuntime.providerId && model.modelId === requestedRuntime.modelId);
         if (registered) await this.setModel(registered.providerId, registered.modelId);
-        else await this.ensureSessionModel();
-      } else await this.ensureSessionModel();
+        else await this.ensureSessionModel(attachedSnapshot);
+      } else await this.ensureSessionModel(attachedSnapshot);
     } catch (e) {
       logWarn("Could not apply model to session", e);
       if (kind === "created") {
@@ -1363,12 +1399,13 @@ export class ZCodeClient {
       }
     }
 
-    if (defaults.mode && defaults.mode !== this.currentMode()) {
+    if (defaults.mode) {
       try {
-        await this.setMode(defaults.mode);
+        if (defaults.mode !== this.currentMode()) await this.setMode(defaults.mode);
+        else if (this.sessionId) this.persistEmptySessionMode(this.sessionId);
       } catch (error) {
         logWarn("Could not apply new-session permission default", error);
-        warn("新会话权限默认值未能应用，已沿用 ZCode 默认设置。");
+        warn(error instanceof LocalizedError ? error.message : "新会话权限默认值未能应用，已沿用 ZCode 默认设置。");
       }
     }
 
@@ -1397,8 +1434,10 @@ export class ZCodeClient {
   private attachSessionControls(sessionId?: string): void {
     if (this.sessionId) this.sessionControlStates.set(this.sessionId, {baseMode:this.baseMode, planEnabled:this.planEnabled});
     const saved = sessionId ? this.sessionControlStates.get(sessionId) : undefined;
-    this.baseMode = saved?.baseMode ?? "build";
-    this.planEnabled = saved?.planEnabled ?? false;
+    // Older snapshots expose only the base mode, omitting the independent plan flag.
+    const persisted = sessionId ? loadSessionExecutionState(sessionId) : undefined;
+    this.baseMode = persisted?.mode ?? saved?.baseMode ?? "build";
+    this.planEnabled = persisted?.planEnabled ?? saved?.planEnabled ?? false;
     this.lastControls = {...this.lastControls, mode:this.displayedMode(), baseMode:this.baseMode, planEnabled:this.planEnabled};
   }
 
@@ -2419,10 +2458,17 @@ export class ZCodeClient {
     }
   }
 
-  private async ensureSessionModel(): Promise<void> {
+  private async ensureSessionModel(attachedSnapshot?: SessionSnapshot): Promise<void> {
     if (this.liveModelReady) return;
     const isCurrent = this.sessionScope();
-    const snapshot = await this.readSessionSnapshot();
+    // The attach path has already subscribed and checked the resume revision.
+    // Reuse its catalog only while that revision is still current. Partial or
+    // legacy snapshots keep the normal read/validation path.
+    const reusable = attachedSnapshot?.session?.sessionId === this.sessionId
+      && typeof attachedSnapshot.runtime?.stateRevision === "number"
+      && attachedSnapshot.runtime.stateRevision >= this.lastRevision
+      && Array.isArray(attachedSnapshot.settings?.model?.available);
+    const snapshot = reusable ? attachedSnapshot : await this.readSessionSnapshot();
     if (!isCurrent()) return;
     if (snapshot) {
       this.applySnapshotSettings(snapshot);
@@ -2445,7 +2491,10 @@ export class ZCodeClient {
     // Cold sessions advertise an empty registry before the first send loads
     // their workspace profile. The backend resolves its configured default
     // after its identity is persisted; an empty shell is not evidence of an invalid model.
-    if (!tries.length && Array.isArray(snapshot?.settings?.model?.available) && !snapshot.settings.model.available.length) return;
+    if (!tries.length && Array.isArray(snapshot?.settings?.model?.available) && !snapshot.settings.model.available.length) {
+      if (reusable) return this.ensureSessionModel();
+      return;
+    }
     let lastError: Error | undefined;
     for (const m of tries) {
       if (!isCurrent()) return;
@@ -2469,7 +2518,12 @@ export class ZCodeClient {
         logWarn("Model candidate rejected", m.providerId, m.modelId, e);
       }
     }
-    if (isCurrent()) throw lastError ?? new LocalizedError("暂时没有可用的模型。");
+    if (isCurrent()) {
+      // An empty workspace registry may populate only during the first model
+      // operation. Refresh once before ruling out the attached candidates.
+      if (reusable) return this.ensureSessionModel();
+      throw lastError ?? new LocalizedError("暂时没有可用的模型。");
+    }
   }
 
   async setModel(providerId: string, modelId: string): Promise<void> {
@@ -2600,22 +2654,46 @@ export class ZCodeClient {
   async setMode(mode: string): Promise<void> {
     if (!this.sessionId) throw new LocalizedError("没有活动会话");
     const sessionId = this.sessionId;
-    const isCurrent = this.sessionScope();
-    await this.sendRequest("session/setMode", {
-      sessionId,
-      mode,
-    });
-    if (!isCurrent()) return;
-    if (mode === "plan") this.planEnabled = true;
-    else {
-      this.planEnabled = false;
-      if (BASE_SESSION_MODES.has(mode)) this.baseMode = mode;
+    return this.queueModeChange(sessionId, () => this.applyMode(sessionId, mode));
+  }
+
+  private async queueModeChange(sessionId: string, action: () => Promise<void>): Promise<void> {
+    const changing = (this.modeChanges.get(sessionId) ?? Promise.resolve()).catch(() => {}).then(action);
+    this.modeChanges.set(sessionId, changing);
+    try { await changing; }
+    finally { if (this.modeChanges.get(sessionId) === changing) this.modeChanges.delete(sessionId); }
+  }
+
+  private async applyMode(sessionId: string, mode: string, restoring = false): Promise<void> {
+    const previous = this.sessionId === sessionId
+      ? { baseMode: this.baseMode, planEnabled: this.planEnabled }
+      : this.sessionControlStates.get(sessionId) ?? { baseMode: "build", planEnabled: false };
+    const next = {
+      baseMode: BASE_SESSION_MODES.has(mode) ? mode : previous.baseMode,
+      planEnabled: mode === "plan",
+    };
+    await this.sendRequest("session/setMode", { sessionId, mode });
+    this.sessionControlStates.set(sessionId, next);
+    if (!this.disposed && this.sessionId === sessionId) {
+      this.baseMode = next.baseMode;
+      this.planEnabled = next.planEnabled;
+      this.lastControls = { ...this.lastControls, mode: this.displayedMode(), baseMode: this.baseMode, planEnabled: this.planEnabled };
+      this.opts.onEvent({ type: "session_controls", data: this.lastControls });
     }
-    this.lastControls = { ...this.lastControls, mode: this.displayedMode(), baseMode: this.baseMode, planEnabled: this.planEnabled };
-    this.opts.onEvent({
-      type: "session_controls",
-      data: this.lastControls,
-    });
+    this.persistEmptySessionMode(sessionId, next.baseMode, next.planEnabled);
+    if (!restoring) {
+      saveSessionRestoreIntent(sessionId);
+      this.pendingSessionRestores.delete(sessionId);
+    }
+  }
+
+  private persistEmptySessionMode(sessionId: string, baseMode = this.baseMode, planEnabled = this.planEnabled): void {
+    try {
+      persistEmptySessionMode(sessionId, baseMode, planEnabled);
+    } catch (error) {
+      logWarn("Could not persist empty-session permission", error);
+      throw new LocalizedError("权限已更新，但未能保存；请重试，否则重启后可能恢复旧权限。");
+    }
   }
 
   async setThoughtLevel(thoughtLevel: string): Promise<void> {
@@ -2693,6 +2771,9 @@ export class ZCodeClient {
   }
 
   private async requireAvailableSessionModel(): Promise<void> {
+    if (this.sessionId && this.pendingSessionRestores.has(this.sessionId)) {
+      throw new LocalizedError("会话权限尚未恢复完成，请重新连接或明确选择权限后重试。");
+    }
     const isCurrent = this.sessionScope();
     const model = this.sessionModel ?? this.defaultRuntime;
     if (!model || !this.opts.isSessionModelAvailable) return;
