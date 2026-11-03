@@ -34,7 +34,7 @@ npm run verify
 | `npm run test:desktop-sessions` | 实际 CLI 后端与客户端组合，使用临时存储和 localhost 假模型 |
 | `npm run test:desktop-attachments` | 原生图片上传、发送、读取；同样使用隔离存储 |
 
-CI 在 Linux x64、macOS ARM64 和 Intel 上运行 `npm run verify`（类型检查、隔离单元测试、生产构建和打包白名单），浏览器回归单独在 Linux Chrome 中执行，剪贴板回归在 Linux 的真实 VS Code webview 中执行。通过这些检查不等于已验证 macOS 桌面端真实账号登录和端到端聊天。
+CI 在 Linux x64、Windows x64、macOS ARM64 和 Intel 上运行 `npm run verify`（类型检查、隔离单元测试、生产构建和打包白名单），浏览器回归单独在 Linux Chrome 中执行，剪贴板回归在 Linux 的真实 VS Code webview 中执行。verify 包含逐插件开关、preload 参数隔离和共享配置写回测试。通过这些检查不等于已验证各平台桌面端真实账号登录和端到端聊天。
 
 剪贴板回归使用独立 VS Code 配置、扩展目录和固定回复夹具。Linux 请通过 `xvfb-run -a npm run test:clipboard-host` 在独立显示环境中运行，隔离系统剪贴板；可附加 `-- --vscode-executable /usr/share/code/code --vscode-version 1.143.1` 使用已安装的版本，默认下载 `stable`。它通过真实鼠标选区、Ctrl+C 和右键菜单的 Copy 项触发复制，每次先写入旧内容，再用 `vscode.env.clipboard.readText()` 核对完整选中文本，覆盖两次连续键盘复制、两次连续右键复制以及输入框复制。报告写入 `test-results/clipboard-host/`，失败保留宿主日志；普通浏览器里的合成 `copy` 事件不能替代这一层验证。
 

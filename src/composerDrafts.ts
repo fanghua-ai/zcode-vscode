@@ -8,6 +8,7 @@ export interface ComposerDraft {
   images?: DraftImage[];
   skills?: SkillReference[];
   agents?: AgentReference[];
+  planEnabled?: boolean;
 }
 
 export interface SkillReference { name: string; path: string }
@@ -16,6 +17,7 @@ export interface AgentReference { name: string }
 function copy(draft: ComposerDraft): ComposerDraft {
   return {
     text: draft.text,
+    ...(draft.planEnabled ? { planEnabled: true } : {}),
     chips: draft.chips.map(chip => ({ ...chip })),
     ...(draft.sessionRefs?.length ? { sessionRefs: draft.sessionRefs.map(reference => ({ ...reference })) } : {}),
     ...(draft.images?.length ? {images:draft.images.map(image=>({...image}))} : {}),
@@ -46,7 +48,7 @@ export class ComposerDrafts {
       const agents = Array.isArray(draft.agents) ? draft.agents.filter((agent): agent is AgentReference =>
         !!agent && typeof agent.name === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(agent.name)
       ) : [];
-      this.set(id, draft.text, chips, draftImages(draft.images), sessionRefs, skills, agents);
+      this.set(id, draft.text, chips, draftImages(draft.images), sessionRefs, skills, agents, draft.planEnabled === true);
     }
   }
 
@@ -54,19 +56,20 @@ export class ComposerDrafts {
     return copy(this.drafts.get(id) ?? { text: "", chips: [] });
   }
 
-  set(id: string, text: string, chips: ContextChip[], images: DraftImage[] = [], sessionRefs: SessionReference[] = [], skills: SkillReference[] = [], agents: AgentReference[] = []): void {
+  set(id: string, text: string, chips: ContextChip[], images: DraftImage[] = [], sessionRefs: SessionReference[] = [], skills: SkillReference[] = [], agents: AgentReference[] = [], planEnabled = false): void {
     const uniqueRefs = sessionRefs.filter((reference, index, all) =>
       /^sess_[A-Za-z0-9_-]+$/.test(reference.sessionId) && !!reference.title.trim() && all.findIndex(other => other.sessionId === reference.sessionId) === index
     ).map(reference => ({ ...reference }));
     const draft = {
       text,
+      ...(planEnabled ? { planEnabled: true } : {}),
       chips: chips.filter(chip => !chip.implicit).map(chip => ({ ...chip })),
       ...(uniqueRefs.length ? { sessionRefs: uniqueRefs } : {}),
       ...(images.length ? {images:images.map(image=>({...image}))} : {}),
       ...(skills.length ? { skills: skills.map(skill => ({ ...skill })) } : {}),
       ...(agents.length ? { agents: agents.map(agent => ({ ...agent })) } : {}),
     };
-    if (!text && !draft.chips.length && !images.length && !uniqueRefs.length && !skills.length && !agents.length) this.drafts.delete(id);
+    if (!planEnabled && !text && !draft.chips.length && !images.length && !uniqueRefs.length && !skills.length && !agents.length) this.drafts.delete(id);
     else this.drafts.set(id, draft);
   }
 
@@ -91,7 +94,7 @@ export class ComposerDrafts {
     for (const skill of failed.skills ?? []) if (!skills.some(existing => existing.path === skill.path)) skills.push({ ...skill });
     const agents = [...(current.agents ?? [])];
     for (const agent of failed.agents ?? []) if (!agents.some(existing => existing.name.toLowerCase() === agent.name.toLowerCase())) agents.push({ ...agent });
-    this.set(id, text, chips, images, sessionRefs, skills, agents);
+    this.set(id, text, chips, images, sessionRefs, skills, agents, current.planEnabled === true || failed.planEnabled === true);
     return this.get(id);
   }
 
@@ -99,7 +102,7 @@ export class ComposerDrafts {
     if (id) {
       const pending = this.get("");
       this.drafts.delete("");
-      if (pending.text || pending.chips.length || pending.sessionRefs?.length || pending.images?.length || pending.skills?.length || pending.agents?.length) this.recover(id, pending);
+      if (pending.planEnabled || pending.text || pending.chips.length || pending.sessionRefs?.length || pending.images?.length || pending.skills?.length || pending.agents?.length) this.recover(id, pending);
     }
     return this.get(id);
   }

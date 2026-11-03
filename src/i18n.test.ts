@@ -51,6 +51,10 @@ test("initial webview renders the selected language before its first message", (
   assert.ok(html.includes('placeholder="Ask ZCode, @ to add context, / to choose commands or capabilities"'));
   assert.ok(html.includes('id="btn-settings" title="Settings"'));
   assert.ok(html.includes('>Follow VS Code</option>'));
+  assert.ok(html.indexOf("New chat defaults") < html.indexOf("Desktop plugins"));
+  assert.ok(html.indexOf("Desktop plugins") < html.indexOf("Interface"));
+  assert.ok(html.includes('data-desktop-plugin="documents"'));
+  assert.ok(!html.includes('data-desktop-plugin="documents" checked'));
   assert.ok(html.indexOf("New chat defaults") < html.indexOf("Interface"));
   assert.ok(html.includes('id="default-session-model"'));
   assert.ok(html.includes('id="default-session-mode"'));

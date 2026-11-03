@@ -1,3 +1,4 @@
+import * as vscode from "vscode";
 import { createHash } from "crypto";
 import { uploadImage, readUploadedImage } from "./imageAttachments";
 import { withRuntimeCompileCache } from "./runtimeCache";
@@ -5,6 +6,7 @@ import { readImageAttachments, type ImageAttachment } from "./attachmentTypes";
 import { hostT as t, userFacingError } from "./hostI18n";
 import { LocalizedError } from "./i18n";
 import { ChildProcess, spawn } from "child_process";
+import * as fs from "fs";
 import * as readline from "readline";
 import { sameWorkspacePath } from "./workspacePath";
 import { listWorkspacePathVariants, sessionsFinishedSince, persistEmptySessionMode, loadSessionExecutionState, saveSessionRestoreIntent } from "./taskIndex";
@@ -26,6 +28,7 @@ import {
 } from "./desktop";
 import { fetchPlanQuota, invalidatePlanAuth, type PlanQuotaLimit, type QuotaLine, type PlanAuth } from "./credentials";
 import { desktopVersion } from "./diagnostics";
+import { DESKTOP_PLUGIN_OVERLAY_ENV } from "./desktopPluginOverlay";
 import { appServerLaunch, startupExitMessage } from "./serverPath";
 import { StartupTiming } from "./startupTiming";
 import { FileChange, parseFileChange } from "./toolFiles";
@@ -287,6 +290,13 @@ export interface ZCodeClientOptions {
   nodePath?: string;
   workspacePath: string;
   env?: Record<string, string>;
+  /**
+   * Hide official desktop viewer plugins from this app-server process.
+   * Requires desktopPluginOverlayPath, a plain Node preload script.
+   */
+  suppressDesktopPlugins?: boolean;
+  allowedDesktopPlugins?: string[];
+  desktopPluginOverlayPath?: string;
   compileCachePath?: string;
   runtime?: ResolvedRuntime;
   /** In-flight desktop login. Session attach waits for it, then reuses the key. */
@@ -669,6 +679,24 @@ export class ZCodeClient {
     return !!this.sessionId && this.sessionReadable && this.sessionSynced;
   }
 
+  /** Preload that hides desktop viewer plugins, or undefined when it cannot apply. */
+  private desktopPluginPreloadPath(): string | undefined {
+    if (!this.opts.suppressDesktopPlugins) return undefined;
+    const candidate = this.opts.desktopPluginOverlayPath;
+    const script = this.opts.binaryPath.endsWith(".cjs") || this.opts.binaryPath.endsWith(".js");
+    if (!script) {
+      logWarn("Native app-server binary cannot load the desktop-plugin overlay; official MCP processes will still start");
+      void vscode.window.showWarningMessage(t("当前运行时无法应用插件关闭设置，部分 MCP 仍可能启动。"));
+      return undefined;
+    }
+    if (!candidate || !fs.existsSync(candidate)) {
+      logWarn("Desktop-plugin overlay is missing; official MCP processes will still start", { candidate });
+      void vscode.window.showWarningMessage(t("当前运行时无法应用插件关闭设置，部分 MCP 仍可能启动。"));
+      return undefined;
+    }
+    return candidate;
+  }
+
   async start(opts?: {
     resumeSessionId?: string;
     createNew?: boolean;
@@ -680,11 +708,13 @@ export class ZCodeClient {
     ) => string | undefined;
   }): Promise<void> {
     const { binaryPath, nodePath, workspacePath } = this.opts;
+    const preloadPath = this.desktopPluginPreloadPath();
 
     const launch = appServerLaunch({
       binaryPath,
       nodePath,
       execPath: process.execPath,
+      preloadPath,
     });
     const cmd = launch.command;
     const args = launch.args;
@@ -693,6 +723,7 @@ export class ZCodeClient {
       ...process.env,
       ...appServerEnv(binaryPath),
       ...(this.opts.env ?? {}),
+      ...(preloadPath && args[0] === "--require" ? { [DESKTOP_PLUGIN_OVERLAY_ENV]: "1", ZCODE_VSCODE_ALLOWED_PLUGINS: JSON.stringify(this.opts.allowedDesktopPlugins ?? []) } : {}),
     }, this.opts.compileCachePath);
     this.activeTiming?.note("runtimeCompileCacheRequested", !!env.NODE_COMPILE_CACHE && env.NODE_DISABLE_COMPILE_CACHE !== "1");
     if (launch.electronAsNode) env.ELECTRON_RUN_AS_NODE = "1";

@@ -80,3 +80,16 @@ test("subagent selections survive draft persistence and failed-send recovery", (
   assert.deepEqual(restored.recover("A", { text: "retry", chips: [], agents }).agents, agents);
   assert.equal(restored.get("B").agents, undefined);
 });
+
+
+test("empty Plan drafts survive reload and pending handoff without leaking into other sessions", () => {
+  const drafts = new ComposerDrafts(undefined);
+  drafts.set("", "", [], [], [], [], [], true);
+  const restored = new ComposerDrafts(JSON.parse(JSON.stringify(drafts.serialize())));
+  assert.equal(restored.takePending("A").planEnabled, true);
+  assert.equal(restored.get("").planEnabled, undefined);
+  assert.equal(restored.get("B").planEnabled, undefined);
+  restored.set("A", "", []);
+  assert.equal(restored.get("A").planEnabled, undefined);
+  assert.equal(restored.recover("A", { text: "retry", chips: [], planEnabled: true }).planEnabled, true);
+});

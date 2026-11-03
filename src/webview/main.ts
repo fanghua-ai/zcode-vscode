@@ -376,6 +376,7 @@ interface LocalFile {
 }
 const composerDrafts = new ComposerDrafts(vscode.getState()?.composerDrafts);
 let draftSessionId = typeof vscode.getState()?.draftSessionId === "string" ? String(vscode.getState()!.draftSessionId) : "";
+let draftPlanEnabled = false;
 let explicitChips: ContextChip[] = [];
 let explicitSessionRefs: SessionReference[] = [];
 let selectedSkills: SkillReference[] = [];
@@ -385,15 +386,16 @@ const pendingInputs = new Map<string, { sessionId: string; draft: ComposerDraft;
 
 function persistComposerDraft(): void {
   const text = activeCommand ? `/${activeCommand} ${input.value}` : input.value;
-  composerDrafts.set(draftSessionId, text, explicitChips, imageDrafts, explicitSessionRefs, selectedSkills, selectedAgents);
+  composerDrafts.set(draftSessionId, text, explicitChips, imageDrafts, explicitSessionRefs, selectedSkills, selectedAgents, draftPlanEnabled);
   vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId });
 }
 
 function restoreComposerDraft(draft: ComposerDraft): void {
+  draftPlanEnabled = draft.planEnabled === true;
   const restored = draft.skills?.length ? { text: draft.text, skills: draft.skills } : extractLeadingSkills(draft.text);
   const persisted = /^\/([a-zA-Z][a-zA-Z0-9_-]*) ([\s\S]*)$/.exec(restored.text);
   const known = !!persisted && slashCommands.some(item => item.name === persisted[1]);
-  activeCommand = persisted && (known || !slashCommands.length) ? persisted[1] : undefined;
+  activeCommand = persisted && persisted[1].toLowerCase() !== "plan" && (known || !slashCommands.length) ? persisted[1] : undefined;
   input.value = activeCommand ? persisted![2] : restored.text;
   if (activeCommand) {
     const entry = slashCommands.find(item => item.name === activeCommand);
@@ -453,7 +455,7 @@ function recoverInput(msg: { commandId?: string; sessionId?: string; text?: stri
 }
 
 function sameComposerDraft(a: ComposerDraft, b: ComposerDraft): boolean {
-  return a.text === b.text && (["chips", "images", "sessionRefs", "skills", "agents"] as const)
+  return a.text === b.text && !!a.planEnabled === !!b.planEnabled && (["chips", "images", "sessionRefs", "skills", "agents"] as const)
     .every(key => JSON.stringify(a[key] ?? []) === JSON.stringify(b[key] ?? []));
 }
 const attachmentsEl = document.getElementById("attachments")!;
@@ -519,7 +521,7 @@ function imageResult(msg: any): void {
     const attachment = readImageAttachments([msg.attachment])[0];
     images[index] = attachment ? { ...images[index], ...attachment, status: "ready" } : { ...images[index], status: "error" };
   }
-  composerDrafts.set(owner, draft.text, draft.chips, images, draft.sessionRefs, draft.skills, draft.agents);
+  composerDrafts.set(owner, draft.text, draft.chips, images, draft.sessionRefs, draft.skills, draft.agents, draft.planEnabled);
   if (owner === draftSessionId) {
     imageDrafts = composerDrafts.get(owner).images ?? [];
     renderImageDrafts(); updateComposerActions();
@@ -534,7 +536,7 @@ async function cacheThumbnail(dataUrl: string, owner: string, id: string): Promi
     persistComposerDraft(); const draft = composerDrafts.get(owner); const item = draft.images?.find(image => image.id === id);
     if (!item) return;
     cacheDraftPreview(id, dataUrl);
-    item.thumbnail = thumbnail; composerDrafts.set(owner, draft.text, draft.chips, draft.images, draft.sessionRefs, draft.skills, draft.agents);
+    item.thumbnail = thumbnail; composerDrafts.set(owner, draft.text, draft.chips, draft.images, draft.sessionRefs, draft.skills, draft.agents, draft.planEnabled);
     if (owner === draftSessionId) { imageDrafts = draft.images ?? []; renderImageDrafts(); }
     vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize() });
     return true;
@@ -2007,7 +2009,7 @@ function addErrorMessage(text: string, rejectedDraft?: ComposerDraft): void {
         addUserMessage(failedPrompt || "", [], false, undefined, undefined, undefined, undefined, images);
         setGenerating(true);
         post({ type: "retryLast", commandId, sessionId: ownerSessionId, text: failedPrompt || "", chips: [], attachments: images,
-          ...(rejectedDraft ? { recoveryText: rejectedDraft.text, ...(/^\/plan\s/.test(rejectedDraft.text) ? { planMode: true } : {}) } : {}) });
+          ...(rejectedDraft ? { recoveryText: rejectedDraft.text, ...(rejectedDraft.planEnabled ? { planMode: true } : {}) } : {}) });
       } else if (act === "showLog") post({ type: "showLog" });
       else if (act === "retry") post({ type: "retry" });
       else if (act === "pickModel") openOverlay("models");
@@ -5313,8 +5315,16 @@ function selectOverlay(idx: number): void {
     post({ type: "selectModel", providerId: m.providerId, modelId: m.modelId });
   } else if (overlayMode === "mode") {
     const picked = String(item.payload);
-    if (picked === "plan") planEnabled = true;
-    else baseMode = picked;
+    if (picked === "plan") {
+      draftPlanEnabled = true;
+      updatePlanChip();
+      persistComposerDraft();
+      closeOverlay();
+      return;
+    }
+    draftPlanEnabled = false;
+    persistComposerDraft();
+    baseMode = picked;
     applySessionControls({
       mode: picked,
       baseMode,
@@ -6360,26 +6370,12 @@ function sendMessage(immediate = false): void {
   if (holdStreams || !sessionConnected) return;
   mentions.close();
   const body = input.value.trim();
-  const planShortcut = activeCommand === "plan";
+  const planShortcut = draftPlanEnabled;
   if (activeCommand && (selectedSkills.length || selectedAgents.length)) {
     showToast(t("命令暂不支持技能或子智能体引用，请先移除后重试。"));
     return;
   }
-  if (planShortcut && (imageDrafts.length || explicitChips.length || explicitSessionRefs.length || selectedSkills.length || selectedAgents.length)) {
-    showToast(t("Plan 命令暂不支持图片或上下文引用，请先移除后重试。"));
-    return;
-  }
-  if (planShortcut && !body) {
-    planEnabled = true;
-    applySessionControls({ mode: "plan", baseMode, planEnabled: true, thoughtEnabled, thoughtLevel: currentThought, thoughtLevels });
-    clearActiveCommand();
-    post({ type: "setMode", mode: "plan", sessionId: draftSessionId, viewGen });
-    persistComposerDraft();
-    return;
-  }
-  // Most active commands keep their slash prefix; /plan is a composer mode
-  // shortcut and sends only its task body after the host switches the session.
-  const prompt = planShortcut ? body : activeCommand ? `/${activeCommand} ${body}`.trim() + (body ? "" : " ") : body;
+  const prompt = activeCommand ? `/${activeCommand} ${body}`.trim() + (body ? "" : " ") : body;
   const agentPrompt = [...selectedAgents.map(agent => `@${agent.name}`), prompt].filter(Boolean).join(" ");
   const text = [...selectedSkills.map(skillReferenceMarkdown), agentPrompt].filter(Boolean).join("\n\n");
   if (!text.trim() && !imageDrafts.length) return;
@@ -6390,12 +6386,9 @@ function sendMessage(immediate = false): void {
   const chips = activeChips();
   const refs = explicitSessionRefs.map(reference => ({ ...reference }));
   const commandId = crypto.randomUUID();
-  const recoveryText = planShortcut ? `/plan ${body}` : prompt;
-  pendingInputs.set(commandId, { sessionId: draftSessionId, draft: { text: recoveryText, chips: explicitChips.map(chip => ({ ...chip })), sessionRefs: refs, images, skills: selectedSkills.map(skill => ({ ...skill })), agents: selectedAgents.map(agent => ({ ...agent })) } });
-  if (planShortcut) {
-    planEnabled = true;
-    applySessionControls({ mode: "plan", baseMode, planEnabled: true, thoughtEnabled, thoughtLevel: currentThought, thoughtLevels });
-  }
+  const recoveryText = prompt;
+  pendingInputs.set(commandId, { sessionId: draftSessionId, draft: { text: recoveryText, ...(planShortcut ? { planEnabled: true } : {}), chips: explicitChips.map(chip => ({ ...chip })), sessionRefs: refs, images, skills: selectedSkills.map(skill => ({ ...skill })), agents: selectedAgents.map(agent => ({ ...agent })) } });
+  draftPlanEnabled = false;
   input.value = "";
   clearActiveCommand();
   explicitChips = [];
@@ -6623,7 +6616,7 @@ const mentions = fileMentions(input, document.getElementById("composer")!, () =>
   });
 
 let slashCommands: Array<{ name: string; description: string; inputHint: string }> = [];
-type SlashSkill = { name: string; description: string; path: string };
+type SlashSkill = { name: string; description: string; path: string; gated?: boolean };
 type SlashAgent = { name: string; description: string; source: string };
 type SlashMenuEntry =
   | { kind: "command"; command: (typeof slashCommands)[number] }
@@ -6908,8 +6901,12 @@ function slashMatches(): SlashMenuEntry[] {
   const skillQuery = typed.replace(/^\$/, "");
   const agentQuery = typed.replace(/^@/, "");
   const isWholeInput = !input.value.slice(0, token.start).trim() && !input.value.slice(token.end).trim();
-  const commands = /^[\$@]/.test(typed) || !isWholeInput ? [] : slashCommands.filter(command =>
-    command.name.toLowerCase().startsWith(typed));
+  const catalog = [
+    { name: "plan", description: "开启计划模式", inputHint: "" },
+    ...slashCommands.filter(command => command.name.toLowerCase() !== "plan"),
+  ];
+  const commands = /^[\$@]/.test(typed) ? [] : catalog.filter(command =>
+    (command.name === "plan" || isWholeInput) && command.name.toLowerCase().startsWith(typed));
   return [
     ...commands
       .map(command => ({ kind: "command" as const, command })),
@@ -6983,14 +6980,16 @@ function renderSlashMenu(preserveKey?: string): void {
     const desc = document.createElement("span");
     desc.className = "slash-desc";
     if (entry.kind === "command") {
-      name.textContent = `/${entry.command.name}`;
+      name.textContent = entry.command.name === "plan" ? t("计划模式") : `/${entry.command.name}`;
       hint.className = "slash-hint";
       hint.textContent = entry.command.inputHint;
       desc.textContent = commandDescription(entry.command);
     } else if (entry.kind === "skill") {
       name.textContent = entry.skill.name;
       hint.className = "slash-hint";
-      desc.textContent = entry.skill.description;
+      desc.textContent = entry.skill.gated
+        ? `${t(entry.skill.description)} · ${t("已关闭，选择后可以启用")}`
+        : entry.skill.description;
     } else {
       name.textContent = entry.agent.name;
       hint.className = "slash-hint";
@@ -7025,6 +7024,16 @@ function applySlashMenuEntry(entry: SlashMenuEntry): void {
   const token = slashToken();
   if (!token) return;
   if (entry.kind === "skill") {
+    if (entry.skill.gated) {
+      input.setRangeText("", token.start, token.end, "end");
+      closeSlashMenu();
+      post({ type: "promptDesktopPluginSkill", text: entry.skill.name });
+      resizeComposerInput();
+      updateComposerActions();
+      persistComposerDraft();
+      input.focus();
+      return;
+    }
     if (!selectedSkills.some(skill => skill.path === entry.skill.path)) selectedSkills.push({ name: entry.skill.name, path: entry.skill.path });
   } else if (!selectedAgents.some(agent => agent.name.toLowerCase() === entry.agent.name.toLowerCase())) {
     selectedAgents.push({ name: entry.agent.name });
@@ -7041,6 +7050,19 @@ function applySlashMenuEntry(entry: SlashMenuEntry): void {
 /** Picking a command clears the composer: the body typed next is the parameter,
  *  sent with a /name prefix. The chip lives in the toolbar, like the desktop. */
 function applySlashCommand(command: { name: string }): void {
+  if (command.name.toLowerCase() === "plan") {
+    const token = slashToken();
+    if (!token) return;
+    input.setRangeText("", token.start, token.end, "end");
+    closeSlashMenu();
+    draftPlanEnabled = true;
+    updatePlanChip();
+    resizeComposerInput();
+    updateComposerActions();
+    persistComposerDraft();
+    input.focus();
+    return;
+  }
   activateCommand(command.name);
 }
 
@@ -7100,7 +7122,7 @@ function updateActiveCommandChip(): void {
 
 /** Permission-menu plan and /plan are one chip: lightbulb, the word plan, and the same hover X. */
 function updatePlanChip(): void {
-  const show = planEnabled || activeCommand === "plan";
+  const show = planEnabled || draftPlanEnabled;
   if (!show) {
     planIndicator.hidden = true;
     planIndicator.replaceChildren();
@@ -7113,6 +7135,9 @@ function updatePlanChip(): void {
 }
 
 function dismissPlanChip(): void {
+  draftPlanEnabled = false;
+  persistComposerDraft();
+  updatePlanChip();
   if (activeCommand === "plan") clearActiveCommand();
   if (!planEnabled) return;
   const next = baseMode && baseMode !== "plan" ? baseMode : "build";
@@ -7133,7 +7158,7 @@ function maybeActivateTypedCommand(): void {
   const match = /^\/([a-zA-Z][a-zA-Z0-9_-]*)\s$/.exec(input.value);
   if (!match) return;
   const name = match[1].toLowerCase();
-  if (!slashCommands.some(item => item.name.toLowerCase() === name)) return;
+  if (name === "plan" || !slashCommands.some(item => item.name.toLowerCase() === name)) return;
   activateCommand(name);
 }
 
@@ -7336,6 +7361,10 @@ settingsButton.addEventListener("click", () => {
 });
 languageSelect.addEventListener("change", () => {
   post({ type: "setLanguage", language: languageSelect.value });
+});
+const desktopPluginsInputs = [...document.querySelectorAll<HTMLInputElement>("[data-desktop-plugin]")];
+for (const checkbox of desktopPluginsInputs) checkbox.addEventListener("change", () => {
+  post({ type: "setDesktopPlugins", text: checkbox.dataset.desktopPlugin, enabled: checkbox.checked });
 });
 function applyComposerChrome(chrome: {
   showQuestionJump?: boolean;
@@ -7546,9 +7575,11 @@ window.addEventListener("message", (event) => {
       {
       const selected = selectedSlashKey();
       slashSkills = Array.isArray(msg.skills)
-        ? msg.skills.filter((skill: { name?: unknown; description?: unknown; path?: unknown }) =>
-          typeof skill?.name === "string" && skill.name.length > 0 &&
-          typeof skill?.description === "string" && typeof skill?.path === "string")
+        ? msg.skills.flatMap((skill: { name?: unknown; description?: unknown; path?: unknown; gated?: unknown }) => {
+          if (typeof skill?.name !== "string" || skill.name.length === 0) return [];
+          if (typeof skill.description !== "string" || typeof skill.path !== "string") return [];
+          return [{ name: skill.name, description: skill.description, path: skill.path, ...(skill.gated === true ? { gated: true } : {}) }];
+        })
         : [];
       renderSlashMenu(selected);
       }
@@ -7888,6 +7919,13 @@ window.addEventListener("message", (event) => {
     case "openSettings":
       settingsMenu.hidden = false;
       settingsButton.setAttribute("aria-expanded", "true");
+      if (msg.focus === "enable-desktop-plugins") {
+        document.getElementById("desktop-plugin-settings")?.scrollIntoView({ block: "nearest" });
+        desktopPluginsInputs[0]?.focus();
+      }
+      break;
+    case "desktop_plugins":
+      if (Array.isArray(msg.allowed)) for (const checkbox of desktopPluginsInputs) checkbox.checked = msg.allowed.includes(checkbox.dataset.desktopPlugin);
       break;
     case "status":
       if (msg.sessionId && msg.sessionId !== currentSessionId) break;
@@ -7988,7 +8026,7 @@ window.addEventListener("message", (event) => {
     case "file_added": {
       persistComposerDraft(); const draft = composerDrafts.get(msg.sessionId);
       if (!draft.chips.some(chip => chip.path === msg.chip.path)) draft.chips.push(msg.chip);
-      composerDrafts.set(msg.sessionId, draft.text, draft.chips, draft.images, draft.sessionRefs, draft.skills, draft.agents);
+      composerDrafts.set(msg.sessionId, draft.text, draft.chips, draft.images, draft.sessionRefs, draft.skills, draft.agents, draft.planEnabled);
       if (msg.sessionId === draftSessionId) { explicitChips = draft.chips; renderComposerChips(); }
       vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize() }); break;
     }

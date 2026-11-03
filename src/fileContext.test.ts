@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as path from "node:path";
 import { prepareFileContext } from "./fileContext";
 import { buildPrompt } from "./promptContext";
 const doc={uri:{fsPath:"/project/a.ts"},isDirty:true,languageId:"typescript",getText:()=>"latest unsaved content"};
@@ -13,7 +14,7 @@ test("file mentions use the latest unsaved buffer while explicit selections rema
 });
 test("saved files discard stale snapshots and other workspace roots resolve from the actual session root",()=>{
  const chips=prepareFileContext([{path:"/project/a.ts",relPath:"workspace/a.ts",snapshot:"stale"},{path:"/other/b.ts",relPath:"other-root/b.ts"}],"/project",[{...doc,isDirty:false}]);
- assert.equal(chips[0].snapshot,undefined);assert.equal(chips[0].relPath,"a.ts");assert.equal(chips[1].relPath,"../other/b.ts");
+ assert.equal(chips[0].snapshot,undefined);assert.equal(chips[0].relPath,"a.ts");assert.equal(chips[1].relPath,path.join("..","other","b.ts"));
 });
 test("oversized unsaved files reject sending rather than silently using old disk content",()=>{
  assert.throws(()=>prepareFileContext([{path:doc.uri.fsPath,relPath:"a.ts"}],"/project",[{...doc,getText:()=>"a".repeat(1024*1024+1)}]));

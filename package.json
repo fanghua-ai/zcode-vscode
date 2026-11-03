@@ -2,7 +2,7 @@
   "name": "zcode-desktop-chat",
   "displayName": "ZCode Chat",
   "description": "在 VS Code 右侧边栏里和 ZCode 智能体对话，复用桌面端的登录、模型和会话。Chat with the ZCode agent in the VS Code secondary side bar using the desktop app's account, models, and sessions.",
-  "version": "2.1.6",
+  "version": "2.1.7",
   "publisher": "fanghua",
   "author": "fanghua",
   "license": "MIT",
@@ -143,6 +143,11 @@
           "type": "string",
           "default": "",
           "description": "Model override as providerId/modelId (e.g. 'builtin:bigmodel-coding-plan/GLM-5.3-Flash'). Empty = reuse ZCode desktop default."
+        },
+        "zcode.showSuppressedPluginSkills": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "%config.showSuppressedPluginSkills.description%"
         },
         "zcode.quotaAdapters": {
           "type": "array",
@@ -569,6 +574,25 @@
           "default": "auto",
           "scope": "application",
           "description": "Interface language. Chat messages and model output are not translated."
+        },
+        "zcode.allowedDesktopPlugins": {
+          "type": "array",
+          "scope": "application",
+          "default": [],
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "documents",
+              "pdf",
+              "presentations",
+              "spreadsheets",
+              "browser-use",
+              "computer-use",
+              "zcode-site"
+            ]
+          },
+          "markdownDescription": "%config.allowedDesktopPlugins.description%"
         }
       }
     }

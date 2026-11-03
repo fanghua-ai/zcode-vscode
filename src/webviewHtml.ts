@@ -1,3 +1,4 @@
+import { DESKTOP_PLUGIN_CHOICES } from "./desktopPluginChoices";
 import { translate, type UiLanguage, type LanguageSetting } from "./i18n";
 import * as vscode from "vscode";
 
@@ -28,7 +29,8 @@ export function getWebviewHtml(
   extensionUri: vscode.Uri,
   nonce: string,
   language: { locale: UiLanguage; setting: LanguageSetting; vscodeLanguage: string } = { locale: "zh-CN", setting: "auto", vscodeLanguage: "zh-CN" },
-  chrome: ComposerChrome = defaultChrome
+  chrome: ComposerChrome = defaultChrome,
+  desktopPluginsEnabled: readonly string[] = []
 ): string {
   const t = (text: string) => translate(text, language.locale);
   const scriptUri = webview.asWebviewUri(
@@ -86,6 +88,7 @@ export function getWebviewHtml(
   input::placeholder, textarea::placeholder { color: var(--z-muted); opacity: 1; }
 
   #settings-menu {
+    font-size: 12px; line-height: 16px;
     position: absolute; top: calc(100% + 4px); right: 0; z-index: 100;
     width: 280px; max-height: min(72vh, 440px); padding: 6px; border-radius: 10px;
     display: flex; flex-direction: column; gap: 6px;
@@ -154,6 +157,7 @@ export function getWebviewHtml(
     font: inherit; font-size: 12px; outline: none;
   }
   .settings-select:focus-visible { border-color: var(--vscode-focusBorder); }
+  #desktop-plugin-settings { display:flex; flex-direction:column; gap:6px; }
   .settings-help { padding: 0 8px 4px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 15px; }
   button.settings-item { cursor: pointer; }
   button.settings-item:hover { background: var(--vscode-toolbar-hoverBackground); }
@@ -2047,6 +2051,10 @@ export function getWebviewHtml(
           </select>
         </div>
         <div class="settings-help" id="new-session-thought-help">${t("思考强度取决于模型；更换默认模型后会恢复为模型默认值。")}</div>
+        <div class="settings-section">${t("桌面插件")}</div>
+        <div id="desktop-plugin-settings">
+        ${DESKTOP_PLUGIN_CHOICES.map(choice => `<label class="settings-switch"><span>${t(choice.label)}</span><span class="switch"><input type="checkbox" data-desktop-plugin="${choice.id}"${desktopPluginsEnabled.includes(choice.id) ? " checked" : ""}><i></i></span></label>`).join("")}
+        <div class="settings-help">${t("允许后仍遵循桌面端原有开关。修改会重启当前会话；浏览器和电脑控制共用 JavaScript REPL。")}</div></div>
         <div class="settings-section">${t("界面")}</div>
         <label class="settings-switch"><span>${t("毛玻璃效果")}</span><span class="switch"><input type="checkbox" id="frosted-glass" data-chrome="frostedGlass"${chrome.frostedGlass ? " checked" : ""}><i></i></span></label>
         <div class="settings-item">

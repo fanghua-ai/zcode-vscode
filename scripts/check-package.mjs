@@ -10,7 +10,7 @@ const required = new Set([
   'THIRD-PARTY-NOTICES.txt',
   'package.nls.json', 'package.nls.zh-cn.json', 'package.nls.zh-tw.json',
   'media/icon-zcode-vscode.png',
-  'dist/extension.js', 'dist/webview.js',
+  'dist/extension.js', 'dist/webview.js', 'dist/desktopPluginOverlayPreload.cjs',
   'dist/math/katex.min.css', 'dist/math/LICENSE',
 ]);
 for (const file of files) assert.ok(required.has(file), `Unexpected packaged file: ${file}`);

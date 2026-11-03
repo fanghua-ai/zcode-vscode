@@ -34,6 +34,19 @@ const extensionOptions = {
 };
 
 /** @type {import('esbuild').BuildOptions} */
+const overlayOptions = {
+  entryPoints: ["src/desktopPluginOverlayPreload.ts"],
+  bundle: true,
+  outfile: "dist/desktopPluginOverlayPreload.cjs",
+  format: "cjs",
+  platform: "node",
+  target: "node18",
+  // Node loads this with --require before app-server. Keep it readable.
+  minify: false,
+  logLevel: "info",
+};
+
+/** @type {import('esbuild').BuildOptions} */
 const webviewOptions = {
   entryPoints: ["src/webview/main.ts"],
   bundle: true,
@@ -50,16 +63,18 @@ async function main() {
   if (watch) {
     const ext = await esbuild.context(extensionOptions);
     const web = await esbuild.context(webviewOptions);
+    const overlay = await esbuild.context(overlayOptions);
     fs.mkdirSync("dist", { recursive: true });
     copyFormulaAssets();
     writeThirdPartyNotices();
-    await Promise.all([ext.watch(), web.watch()]);
+    await Promise.all([ext.watch(), web.watch(), overlay.watch()]);
     console.log("[esbuild] watching for changes...");
   } else {
     fs.mkdirSync("dist", { recursive: true });
     await Promise.all([
       esbuild.build(extensionOptions),
       esbuild.build(webviewOptions),
+      esbuild.build(overlayOptions),
     ]);
     copyFormulaAssets();
     writeThirdPartyNotices();

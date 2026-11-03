@@ -15,6 +15,7 @@ VS Code 的 `ZCodeViewProvider` 负责 webview 消息、编辑器上下文和宿
 | `src/conversation.ts` | 帧解码、分片、副本、快照／增量一致性 |
 | `src/taskIndex.ts`、`src/desktopProjects.ts`、`src/workspacePath.ts` | 索引／持久化写入、归档删除、跨平台路径语义 |
 | `src/desktop.ts`、`src/credentials.ts`、`src/desktopJson.ts`、`src/serverPath.ts` | 桌面配置、登录、模型来源、运行时发现 |
+| `src/desktopPluginOverlay.ts` | 只在 VS Code 拉起的 app-server 里把文档、浏览器和电脑控制插件视为关闭；写回共享配置时按磁盘原值恢复这些开关 |
 | `src/webview/main.ts`、`src/webviewHtml.ts` | 页面状态、消息与工作过程、输入、导航、滚动、HTML／CSS／CSP |
 | `src/webview/markdown.ts`、`fileMentions.ts`、`imageAttachments.ts` | 已分离的 Markdown、文件提及、图片辅助逻辑 |
 | `src/imageAttachments.ts`、`src/draftImagePreview.ts` | 原生附件与未发送图片预览缓存 |

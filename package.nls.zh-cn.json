@@ -1,5 +1,6 @@
 {
   "command.showChromeSettings.title": "ZCode: 打开显示设置",
+  "config.showSuppressedPluginSkills.description": "这些插件关闭时，仍在 / 菜单列出文档、PDF、演示文稿、表格和浏览器技能。选中后不发送该技能。启用会记住，之后启动会拉起这些 MCP。",
   "command.setQuotaApiKey.title": "ZCode: 设置额度 API Key",
   "config.quotaAdapters.description": "可为自定义供应商配置只读额度接口。providerId 必须与当前模型完全一致。字段使用 JSON Pointer，例如 /data/balance；密钥通过“设置额度 API Key”命令保存，不写入 settings。除无认证的本机 HTTP 外必须使用 HTTPS。",
   "quotaAdapter.schemaVersion.description": "可选的适配器协议版本；省略时按 v1 处理，后续版本会继续兼容已有 v1 配置。",
@@ -64,5 +65,6 @@
   "config.formulaFonts.description": "遇到公式时是否下载 KaTeX 字体。auto 在回复旁询问，on 下载并保留字体，off 使用系统字体且不再询问。",
   "config.formulaFonts.auto": "在公式回复旁询问",
   "config.formulaFonts.on": "下载并使用公式字体",
-  "config.formulaFonts.off": "使用系统字体，不再询问"
+  "config.formulaFonts.off": "使用系统字体，不再询问",
+  "config.allowedDesktopPlugins.description": "允许在扩展中启用的插件，仍遵循桌面端原有开关。修改会重启当前会话。浏览器和电脑控制共用 JavaScript REPL。"
 }

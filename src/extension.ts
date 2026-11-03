@@ -1,3 +1,4 @@
+import { allowedDesktopPlugins, DESKTOP_PLUGIN_CHOICES } from "./desktopPluginChoices";
 import { rankWorkspaceFiles, workspaceSearchPatterns } from "./fileSearch";
 import { existingWorkspaceFile, previewFileKind, previewFilesForReply } from "./filePreview";
 import { resolveFileTarget } from "./workspaceFiles";
@@ -38,6 +39,7 @@ import {
 import { disposeLog, getLog, logDebug, logError, logInfo, logWarn } from "./log";
 import { redactSecrets } from "./redact";
 import { parseWebviewMessage } from "./webviewMessages";
+import { desktopPluginForSkill, withDesktopPluginSkillPrompts } from "./desktopPluginSkillPrompts";
 import {
   MATH_FONT_VERSION, MATH_FONTS_SHA256, formulaFontMode, installMathFontPack,
   loadMathFontPack, mathFontDataHref, mathFontFaceCss, mathFontPackReady,
@@ -185,9 +187,11 @@ export function activate(context: vscode.ExtensionContext) {
       if (e.affectsConfiguration("zcode.language")) provider.pushLanguage();
       if (e.affectsConfiguration("zcode.formulaFonts")) provider.syncMathFonts();
       if (e.affectsConfiguration("zcode.quotaAdapters")) provider.refreshQuota();
-      if (["binaryPath", "nodePath", "workspacePath", "model"].some(key => e.affectsConfiguration(`zcode.${key}`))) {
+      if (["binaryPath", "nodePath", "workspacePath", "model", "allowedDesktopPlugins"].some(key => e.affectsConfiguration(`zcode.${key}`))) {
         logInfo("ZCode settings changed; restarting session");
         void provider.restart("Settings changed");
+      } else if (e.affectsConfiguration("zcode.showSuppressedPluginSkills")) {
+        provider.refreshListedSkills();
       }
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
@@ -715,7 +719,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.context.extensionUri,
       nonce,
       this.interfaceLanguage(),
-      this.composerChrome()
+      this.composerChrome(),
+      this.allowedDesktopPlugins()
     );
 
     this.viewMessageListener = webviewView.webview.onDidReceiveMessage((raw: unknown) => {
@@ -903,6 +908,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         this.pushLanguage();
         break;
       }
+      case "setDesktopPlugins": {
+        if (typeof msg.enabled !== "boolean" || !DESKTOP_PLUGIN_CHOICES.some(choice => choice.id === msg.text)) break;
+        try { await this.updateDesktopPlugin(msg.text!, msg.enabled); }
+        finally { this.pushDesktopPlugins(); }
+        break;
+      }
       case "installMathFonts":
         await this.enableMathFonts();
         break;
@@ -941,6 +952,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         this.webviewEpoch++;
         this.pushLanguage();
         this.pushChrome();
+        this.pushDesktopPlugins();
         this.pushNewSessionDefaults();
         void this.syncMathFonts();
         this.flushOpenSettings();
@@ -1196,6 +1208,24 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       case "openRecoverySettings":
         if (msg.setting === "binaryPath" || msg.setting === "nodePath") await this.runRecoveryAction(msg.setting);
         break;
+      case "promptDesktopPluginSkill": {
+        const name = msg.text?.trim() || "";
+        const plugin = desktopPluginForSkill(name);
+        if (!plugin) break;
+        const enable = t("允许此插件");
+        const open = t("打开设置");
+        const action = await vscode.window.showInformationMessage(
+          t("{0} 所属插件已关闭。允许后会记住并重启当前会话，仍遵循桌面端原有开关。", { 0: name }),
+          enable,
+          open,
+        );
+        if (action === enable) {
+          await this.updateDesktopPlugin(plugin, true);
+        } else if (action === open) {
+          this.showChromeSettings("enable-desktop-plugins");
+        }
+        break;
+      }
       case "openCommunity":
         await vscode.env.openExternal(vscode.Uri.parse(COMMUNITY_URL));
         break;
@@ -1742,6 +1772,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   async restart(reason: string): Promise<void> {
     logInfo("Restarting ZCode", reason);
+    this.pushDesktopPlugins();
     this.disposeClient();
     await this.startZCode({ force: true });
   }
@@ -1953,6 +1984,53 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** Serialize read-modify-write updates from individual plugin switches. */
+  private pluginSettingChanges: Promise<void> = Promise.resolve();
+
+  private updateDesktopPlugin(id: string, allowed: boolean): Promise<void> {
+    const operation = this.pluginSettingChanges.catch(() => {}).then(async () => {
+      const current = this.allowedDesktopPlugins();
+      const next = allowedDesktopPlugins(allowed ? [...current, id] : current.filter(item => item !== id));
+      if (JSON.stringify(next) !== JSON.stringify(current)) {
+        try {
+          await vscode.workspace.getConfiguration("zcode").update("allowedDesktopPlugins", next, vscode.ConfigurationTarget.Global);
+        } catch (error) {
+          logError("Could not save plugin choices", error);
+          this.pushDesktopPlugins();
+          const message = error instanceof Error ? error.message : String(error);
+          if (/allowedDesktopPlugins.*not a registered configuration/i.test(message)) {
+            const reload = t("重新加载窗口");
+            const selected = await vscode.window.showInformationMessage(
+              t("VS Code 尚未注册新版插件设置。请重新加载窗口后，再允许此插件。"), reload,
+            );
+            if (selected === reload) await vscode.commands.executeCommand("workbench.action.reloadWindow");
+          } else {
+            vscode.window.showErrorMessage(t("保存插件设置失败：{0}", { 0: userFacingError(error) }));
+          }
+        }
+      }
+    });
+    this.pluginSettingChanges = operation;
+    return operation;
+  }
+
+  private allowedDesktopPlugins(): string[] {
+    return allowedDesktopPlugins(vscode.workspace.getConfiguration("zcode").get("allowedDesktopPlugins"));
+  }
+
+  private pushDesktopPlugins(): void {
+    this.post({ type: "desktop_plugins", allowed: this.allowedDesktopPlugins() });
+  }
+
+  private desktopPluginOverlay(): { suppressDesktopPlugins?: boolean; desktopPluginOverlayPath?: string; allowedDesktopPlugins?: string[] } {
+    if (this.allowedDesktopPlugins().length === DESKTOP_PLUGIN_CHOICES.length) return {};
+    return {
+      suppressDesktopPlugins: true,
+      desktopPluginOverlayPath: path.join(this.context.extensionPath, "dist", "desktopPluginOverlayPreload.cjs"),
+      allowedDesktopPlugins: this.allowedDesktopPlugins(),
+    };
+  }
+
   private async startZCode(opts?: {
     force?: boolean;
     createNew?: boolean;
@@ -2083,6 +2161,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       nodePath: nodePath || undefined,
       workspacePath,
       env: runtimeEnv(runtime),
+      ...this.desktopPluginOverlay(),
       compileCachePath: path.join(this.context.globalStorageUri.fsPath, "runtime-compile-cache"),
       runtime,
       resolveSessionRuntime: (model) => this.resolveSessionModelRuntime(model),
@@ -2175,6 +2254,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       binaryPath: launch.binaryPath,
       nodePath: launch.nodePath || undefined,
       workspacePath: launch.workspacePath,
+      ...this.desktopPluginOverlay(),
       pendingLogin: loginPromise,
       compileCachePath: path.join(this.context.globalStorageUri.fsPath, "runtime-compile-cache"),
       resolveSessionRuntime: (model) => this.resolveSessionModelRuntime(model),
@@ -2675,7 +2755,13 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           skills?: Array<{ name: string; description: string; path: string }>;
         };
         if (data.sessionId === this.client?.currentSessionId) {
-          this.post({ type: "skill_catalog", sessionId: data.sessionId, skills: data.skills ?? [] });
+          const config = vscode.workspace.getConfiguration("zcode");
+          const skills = withDesktopPluginSkillPrompts(
+            data.skills ?? [],
+            this.allowedDesktopPlugins(),
+            config.get<boolean>("showSuppressedPluginSkills") !== false,
+          );
+          this.post({ type: "skill_catalog", sessionId: data.sessionId, skills });
         }
         break;
       }
@@ -2799,10 +2885,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.runningPoll.unref?.();
   }
 
-  private pendingOpenSettings = false;
+  private pendingOpenSettings: string | null = null;
 
-  showChromeSettings(): void {
-    this.pendingOpenSettings = true;
+  showChromeSettings(focus?: string): void {
+    this.pendingOpenSettings = focus ?? "";
     void vscode.commands.executeCommand("workbench.view.extension.zcode-sidebar").then(() => {
       this.flushOpenSettings();
     });
@@ -2810,6 +2896,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   refreshQuota(): void {
     this.client?.refreshQuotaNow();
+  }
+
+  refreshListedSkills(): void {
+    this.client?.refreshSkillCatalog();
   }
 
   async setQuotaApiKey(): Promise<void> {
@@ -2847,9 +2937,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private flushOpenSettings(): void {
-    if (!this.pendingOpenSettings || !this.view) return;
-    this.pendingOpenSettings = false;
-    this.post({ type: "openSettings" });
+    if (this.pendingOpenSettings === null || !this.view) return;
+    const focus = this.pendingOpenSettings;
+    this.pendingOpenSettings = null;
+    this.post({ type: "openSettings", ...(focus ? { focus } : {}) });
   }
 
   private post(msg: Record<string, unknown>): void {

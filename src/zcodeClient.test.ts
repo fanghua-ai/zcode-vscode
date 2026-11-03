@@ -2093,7 +2093,7 @@ for (const change of ["switch", "dispose", "snapshot"]) {
   });
 }
 
-test("Linux session listing makes one scoped request and excludes other workspace casing", async () => {
+test("session listing makes one scoped request and follows host workspace casing", async () => {
   const {client, state} = fixture();
   let calls = 0;
   state.sendRequest = async (method, params) => {
@@ -2104,7 +2104,7 @@ test("Linux session listing makes one scoped request and excludes other workspac
       {sessionId: "other", workspace: {workspacePath: "/Test"}},
     ]};
   };
-  assert.deepEqual((await client.listSessions(true)).map(s => s.sessionId), ["ours"]);
+  assert.deepEqual((await client.listSessions(true)).map(s => s.sessionId), process.platform === "win32" ? ["ours", "other"] : ["ours"]);
   assert.equal(calls, 1);
 });
 

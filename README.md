@@ -101,7 +101,7 @@ code --install-extension zcode-desktop-chat-<版本>.vsix --force
 
 输入框上方显示手动加入的文件引用标签；选区引用带行号，可点击 × 移除。引用格式与桌面端相同，例如 `[main.ts](./src/main.ts#L12-L34)`。
 
-输入 `/` 可搜索当前会话的命令、技能和子智能体；用上下键移动，Tab 或 Enter 选择。技能和子智能体可多次选择，在输入区下方显示并点击移除。悬浮引用标签可查看完整路径、整个文件或选中片段，以及未保存修改提示。整文件引用在发送时读取最新编辑器内容；选区引用保留添加时的快照。图片分析卡片默认收起，展开后可分别查看参数和完整结果。
+输入 `/` 可搜索当前会话的命令、技能和子智能体；用上下键移动，Tab 或 Enter 选择。已关闭的文档和浏览器技能仍会列出，选中后可以允许对应插件；选择会记住，并重启当前会话，仍遵循桌面端原有开关。技能和子智能体可多次选择，在输入区下方显示并点击移除。悬浮引用标签可查看完整路径、整个文件或选中片段，以及未保存修改提示。整文件引用在发送时读取最新编辑器内容；选区引用保留添加时的快照。图片分析卡片默认收起，展开后可分别查看参数和完整结果。
 
 问询卡片在回答、拒绝或停止后会缩成工作区内的摘要行，点击可查看原问题和选择；完成后的选项不能重复提交。
 
@@ -132,7 +132,7 @@ code --install-extension zcode-desktop-chat-<版本>.vsix --force
 
 ### 设置
 
-VS Code 设置里搜索 `ZCode`：
+聊天右上角设置菜单提供「扩展中的插件服务」：分别允许 Word、PDF、演示文稿、表格、浏览器、电脑控制和 Sites。默认全部屏蔽，允许后仍遵循桌面端原有开关。修改会重启当前会话，请先结束正在进行的回复。
 
 | 设置 | 默认 | 说明 |
 |------|------|------|
@@ -141,6 +141,8 @@ VS Code 设置里搜索 `ZCode`：
 | `zcode.language` | `auto` | 跟随 VS Code，也可选择简体中文、繁体中文或英文 |
 | `zcode.workspacePath` | 空（当前窗口第一个文件夹） | 发给智能体的工作区根目录 |
 | `zcode.model` | 空（跟桌面默认） | 覆盖项，格式 `providerId/modelId` |
+| `zcode.allowedDesktopPlugins` | `[]` | 用户级允许列表，工作区不能覆盖。支持 documents、pdf、presentations、spreadsheets、browser-use、computer-use、zcode-site；允许不强制启用桌面端已关闭的插件。浏览器和电脑控制共用 REPL。修改后重启会话 |
+| `zcode.showSuppressedPluginSkills` | `true` | 上述插件关闭时，仍在 `/` 菜单列出文档、PDF、演示文稿、表格和浏览器技能。选中后不发送该技能，可以允许对应插件；选择会记住并重启当前会话 |
 | `zcode.quotaAdapters` | 空 | 自定义供应商额度接口；用 `providerId` 精确匹配，并映射或组合 JSON 返回字段。配置后运行 `ZCode: Set quota API key` 保存密钥。详见[额度适配器说明](docs/quota-adapters.md) |
 
 相关命令：`ZCode: Show Log`、`ZCode: Open Chat`、`ZCode: Set quota API key`。
@@ -185,13 +187,13 @@ VS Code 设置里搜索 `ZCode`：
 
 再打开 **ZCode: Show Log**（输出面板频道名 `ZCode`），对照下面的提示。聊天错误卡片上的「重试 / 打开日志 / 重新读取登录 / 选择模型」与这些情况对应。
 
-扩展用 VS Code 自带的运行时启动 app-server：
+扩展用 VS Code 自带的运行时启动 app-server。默认会先加载本扩展的 preload，只让这个进程把文档、浏览器和电脑控制插件看成关闭：
 
 ```text
-<VS Code 运行时> <zcode.cjs> app-server
+<VS Code 运行时> --require <扩展目录>/dist/desktopPluginOverlayPreload.cjs <zcode.cjs> app-server
 ```
 
-`zcode.binaryPath` 填写 `zcode.cjs`。桌面端名为 `zcode` / `ZCode` 的程序是 Electron 主程序，不是这个入口。
+将全部七项加入 `zcode.allowedDesktopPlugins` 后无需加载 preload。原生可执行文件无法加载 preload，关闭设置不能生效时会提示。建议使用桌面端的 `resources/glm/zcode.cjs` 入口。
 
 #### 本机自检
 
@@ -249,10 +251,10 @@ macOS 可再查 `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`。Win
 日志里成功启动时会出现类似：
 
 ```text
-Starting app-server { cmd: '…/code', args: [ '…/zcode.cjs', 'app-server' ], cwd: '…' }
+Starting app-server { cmd: '…/code', args: [ '--require', '…/desktopPluginOverlayPreload.cjs', '…/zcode.cjs', 'app-server' ], cwd: '…' }
 ```
 
-`args[0]` 是存在的 `zcode.cjs`。`cmd` 是 VS Code 的运行时。
+`cmd` 是 VS Code 的运行时。`--require` 后面是扩展自带的 preload；它之后的参数是存在的 `zcode.cjs`。允许全部七项插件后，`args` 只剩 `zcode.cjs` 和 `app-server`。
 
 #### 需要请人协助时
 
@@ -387,7 +389,7 @@ The interface follows the VS Code display language by default (Simplified Chines
 
 The small top-right control above the composer toggles question navigation. Click the context ring and the chevron beside it at the bottom right to toggle the quota panel. The panel uses one compact row of three equal-width progress indicators for context, five-hour quota, and weekly quota. All three display the percentage used; hover over an indicator for exact counts, remaining quota, and reset times. Its expansion state is saved; a waiting message appears until data arrives.
 
-Search for `ZCode` in VS Code settings:
+Chat settings provide individual controls for Word, PDF, presentations, spreadsheets, browser, computer use, and Sites. All are suppressed by default. Allowing one still follows desktop preferences. Changes restart the current chat; finish any running reply first.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -396,6 +398,8 @@ Search for `ZCode` in VS Code settings:
 | `zcode.language` | `auto` | Follow VS Code, or choose Simplified Chinese, Traditional Chinese, or English |
 | `zcode.workspacePath` | Empty (first folder in the window) | Workspace root sent to the agent |
 | `zcode.model` | Empty (desktop default) | Override as `providerId/modelId` |
+| `zcode.allowedDesktopPlugins` | `[]` | User-only allowlist: documents, pdf, presentations, spreadsheets, browser-use, computer-use, zcode-site. Allowing does not force-enable plugins disabled by the desktop. Browser and computer use share the REPL. Changes restart the chat |
+| `zcode.showSuppressedPluginSkills` | `true` | While those plugins are off, still list the document, PDF, presentation, spreadsheet, and browser skills in `/`. Choosing one does not send it. Allowing its plugin is remembered, restarts the chat, and still follows desktop preferences |
 | `zcode.quotaAdapters` | Empty | Custom provider quota endpoints, matched by exact `providerId`, with JSON response fields mapped or combined. Run `ZCode: Set quota API key` to store the secret. See [quota adapter guide](docs/quota-adapters.md). |
 
 Related commands: `ZCode: Show Log`, `ZCode: Open Chat`, `ZCode: Set quota API key`.
@@ -440,13 +444,13 @@ Choose **Settings → Copy diagnostics** in the top-right corner and give the re
 
 Open **ZCode: Show Log** first (Output channel name `ZCode`), then match the message below. The chat error card actions “重试 / 打开日志 / 重新读取登录 / 选择模型” (Retry / Open log / Reload sign-in / Select model) correspond to these cases.
 
-The extension starts app-server with the runtime that ships with VS Code:
+The extension starts app-server with the runtime that ships with VS Code. By default it loads this extension's preload first, so only that process treats the document, browser, and computer-use plugins as disabled:
 
 ```text
-<VS Code runtime> <zcode.cjs> app-server
+<VS Code runtime> --require <extension>/dist/desktopPluginOverlayPreload.cjs <zcode.cjs> app-server
 ```
 
-Set `zcode.binaryPath` to `zcode.cjs`. The desktop program named `zcode` / `ZCode` is the Electron app, and it is not this entry point.
+Allowing all seven plugins skips the preload. Native executables cannot load it; an unsupported suppression request shows a warning. Use the desktop resources/glm/zcode.cjs entry point.
 
 #### Local checks
 
@@ -493,10 +497,10 @@ Error cards provide recovery steps and direct actions for models, connections an
 A successful start looks like this in the log:
 
 ```text
-Starting app-server { cmd: '…/code', args: [ '…/zcode.cjs', 'app-server' ], cwd: '…' }
+Starting app-server { cmd: '…/code', args: [ '--require', '…/desktopPluginOverlayPreload.cjs', '…/zcode.cjs', 'app-server' ], cwd: '…' }
 ```
 
-`args[0]` is an existing `zcode.cjs`. `cmd` is the VS Code runtime.
+`cmd` is the VS Code runtime. The entry after `--require` is this extension's preload, followed by an existing `zcode.cjs`. With all seven plugins allowed, `args` contains only `zcode.cjs` and `app-server`.
 
 #### When asking for help
 
@@ -511,4 +515,4 @@ Include the following (do not send the contents of `credentials.json` or any API
 
 Type `@` to search workspace files and conversations, with files first and conversations after them. Continue with a filename, path, or conversation title; use Up/Down and Enter/Tab to add a reference, or Escape to dismiss the menu. File references appear above the composer. Conversation references appear as separate chips and are retained with drafts and rejected-send recovery. File search includes hidden configuration files and skips Git, dependency and build directories. Fuzzy matching prefers recent files. Typed queries search the whole workspace directly rather than relying on the initial listing. Up to 40 file results are shown, with a 15-second query cache, up to 5,000 candidates per pattern and 1,000 files for an empty query. Retry failed searches by clicking Retry or pressing Enter. Use `@"file name"` for names containing spaces. Skills and subagents are not in this @ menu; use / to search for them.
 
-Type `/` to search the current session’s commands, skills, and subagents, then use Up/Down and Tab or Enter to choose. Select multiple skills and subagents, and click their labels below the input to remove them. Hover over a file reference to see its full path, scope and unsaved-change status. Whole-file references use the current editor buffer when sent; selected passages retain their captured snapshot. Image-analysis cards start collapsed and show parameters and full results when expanded.
+Type `/` to search the current session’s commands, skills, and subagents, then use Up/Down and Tab or Enter to choose. Document and browser skills that are turned off still appear; choosing one can allow its plugin. The choice is remembered, restarts the chat, and still follows desktop preferences. Select multiple skills and subagents, and click their labels below the input to remove them. Hover over a file reference to see its full path, scope and unsaved-change status. Whole-file references use the current editor buffer when sent; selected passages retain their captured snapshot. Image-analysis cards start collapsed and show parameters and full results when expanded.

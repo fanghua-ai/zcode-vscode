@@ -1,5 +1,17 @@
 # 更新日志 / Changelog
 
+## 2.1.7 — 2026-11-03
+
+### 中文
+- `/` 菜单内置「计划模式」入口，选择保存在草稿中，发送时才应用；支持正文、附件、会话切换和失败恢复。
+- 在聊天设置中分别控制 Word、PDF、演示文稿、表格、浏览器、电脑控制和 Sites 插件。默认关闭，允许启用后仍遵循桌面端原有开关；修改会重启当前会话。
+- 选择被关闭的文档或浏览器技能时，只询问是否允许对应插件，不再同时启用整组服务。当前运行时无法应用关闭设置时显示提示。
+
+### English
+- The `/` menu provides a local Plan mode action. The choice stays in the draft until submission and survives attachments, session switches, and failed sends.
+- Control Word, PDF, presentation, spreadsheet, browser, computer-use, and Sites plugins separately in chat settings. They are suppressed by default; allowing a plugin still follows desktop preferences. Changes restart the current chat.
+- Choosing a suppressed document or browser skill offers to allow only its plugin. Show a warning when the runtime cannot apply plugin suppression.
+
 ## 2.1.6 — 2026-10-30
 
 ### 中文

@@ -10,5 +10,6 @@
 !media/icon-zcode-vscode.png
 !dist/extension.js
 !dist/webview.js
+!dist/desktopPluginOverlayPreload.cjs
 !dist/math/katex.min.css
 !dist/math/LICENSE

@@ -11,6 +11,27 @@
 
 
 
+ await test('suppressed skill opens one host confirmation without a duplicate toast',()=>{
+  reset('plugin-confirm');
+  emit({type:'skill_catalog',sessionId:'plugin-confirm',skills:[{name:'docx',description:'Word',path:'zcode-desktop-plugin-skill:docx',gated:true}]});
+  input.focus();type('/docx');
+  const before=document.getElementById('toast').textContent;
+  input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(sent.filter(m=>m.type==='promptDesktopPluginSkill').length===1,'confirmation not requested exactly once');
+  check(document.getElementById('toast').textContent===before,'duplicate toast appeared');
+  check(!document.querySelector('#selected-skills button'),'suppressed skill was attached');
+ });
+ await test('plugin switches send individual choices and reflect confirmed allowlist',()=>{
+  reset('plugin-settings');
+  const boxes=[...document.querySelectorAll('[data-desktop-plugin]')];
+  check(boxes.length===7,'missing plugin controls');
+  emit({type:'desktop_plugins',allowed:['pdf']});
+  check(boxes.find(b=>b.dataset.desktopPlugin==='pdf').checked&&!boxes.find(b=>b.dataset.desktopPlugin==='documents').checked,'allowlist not reflected');
+  const word=boxes.find(b=>b.dataset.desktopPlugin==='documents');word.click();
+  check(sent.some(m=>m.type==='setDesktopPlugins'&&m.text==='documents'&&m.enabled===true),'Word did not send an individual choice');
+  emit({type:'desktop_plugins',allowed:[]});
+  check(boxes.every(b=>!b.checked),'confirmed state did not reset controls');
+ });
  await test('loading older history preserves the exact editor, selection and image edit state',()=>{
   reset();const images=[{ref:'original-one',fileName:'one.png',mime:'image/png',bytes:100},{ref:'original-two',fileName:'two.png',mime:'image/png',bytes:100}];
   const items=[{id:'preserved-editor-q',role:'user',text:'ORIGINAL_EDIT',attachments:images},{id:'preserved-editor-a',role:'assistant',text:'ORIGINAL_REPLY'}];
@@ -687,13 +708,13 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
  await test('slash keyboard navigation keeps the active entry visible without scrolling the chat',()=>{
   reset('slash-keyboard');emit({type:'session_ready',sessionId:'slash-keyboard',viewGen:gen,slashCommands:[]});
   emit({type:'skill_catalog',sessionId:'slash-keyboard',skills:Array.from({length:25},(_,index)=>({name:'skill-'+index,description:'A skill',path:'/skills/'+index+'/SKILL.md'}))});
-  input.focus();type('/');const menu=document.getElementById('slash-menu'),chatScroll=messages.scrollTop;
+  input.focus();type('/$');const menu=document.getElementById('slash-menu'),chatScroll=messages.scrollTop;
   const visible=()=>{const box=menu.getBoundingClientRect(),item=menu.querySelector('.slash-item.active').getBoundingClientRect();check(item.top>=box.top-1&&item.bottom<=box.bottom+1,'active slash option left the menu viewport');};
   for(let i=0;i<20;i++){input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));visible();}
   check(menu.scrollTop>0&&messages.scrollTop===chatScroll,'slash navigation scrolled the chat or failed to scroll the menu');
   input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
   check(document.querySelector('#selected-skills button')?.textContent.includes('skill-20'),'Enter chose a different visible skill');
-  type('/');for(let i=0;i<20;i++)input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+  type('/$');for(let i=0;i<20;i++)input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
   for(let i=0;i<20;i++){input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true,cancelable:true}));visible();}
  });
  await test('slash menu reopens from a restored / draft on focus',()=>{
@@ -711,13 +732,13 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   reset('slash-refresh-selection');
   emit({type:'session_ready',sessionId:'slash-refresh-selection',viewGen:gen,slashCommands:[]});
   emit({type:'skill_catalog',sessionId:'slash-refresh-selection',skills:[{name:'alpha',description:'',path:'/alpha/SKILL.md'},{name:'beta',description:'',path:'/beta/SKILL.md'}]});
-  input.focus();type('/');input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+  input.focus();type('/$');input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
   check(document.querySelector('#slash-menu .active .slash-name')?.textContent==='beta','beta was not highlighted');
   emit({type:'skill_catalog',sessionId:'slash-refresh-selection',skills:[{name:'new',description:'',path:'/new/SKILL.md'},{name:'alpha',description:'',path:'/alpha/SKILL.md'},{name:'beta',description:'',path:'/beta/SKILL.md'}]});
   check(document.querySelector('#slash-menu .active .slash-name')?.textContent==='beta','refresh changed the highlighted skill');
   input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
   check(document.querySelector('#selected-skills button')?.textContent.includes('beta'),'Enter selected a different skill after refresh');
-  document.querySelector('#selected-skills button').click();type('/');input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+  document.querySelector('#selected-skills button').click();type('/$');input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
   emit({type:'skill_catalog',sessionId:'slash-refresh-selection',skills:[{name:'new',description:'',path:'/new/SKILL.md'},{name:'beta',description:'',path:'/beta/SKILL.md'}]});
   check(document.querySelector('#slash-menu .active .slash-name')?.textContent==='new','removed selection did not fall back to the first item');
  });
@@ -925,10 +946,10 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(body&&chip.parentElement===body&&(chip.nextSibling?.textContent??'').trim().startsWith('完成发布'),'badge must be inline before the body text');
   check(bubble.dataset.rawText.startsWith('/goal ')&&bubble.dataset.retryText.startsWith('/goal '),'raw texts must keep the /goal prefix for editing');
  });
- await test('/plan switches the session mode and sends only its task body',()=>{reset('plan-command-owner');emit({type:'session_ready',sessionId:'plan-command-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Explain the change');sendBtn.click();const send=sent.find(message=>message.type==='send');check(send?.text==='Explain the change'&&send.planMode===true&&send.sessionId==='plan-command-owner','/plan task was not routed as a session-owned plan submission');check(!messages.querySelector('.message.user .cmd-chip'),'the /plan command leaked into the submitted question');check(!document.getElementById('plan-indicator').hidden,'Plan mode indicator disappeared after submitting its task');});
- await test('/plan during generation queues only the task body with plan mode',()=>{reset('plan-queue-owner');emit({type:'session_ready',sessionId:'plan-queue-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});emit({type:'status',sessionId:'plan-queue-owner',status:'running'});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Queue this plan');sendBtn.click();const insert=sent.find(message=>message.type==='insert');check(insert?.text==='Queue this plan'&&insert.planMode===true&&insert.sessionId==='plan-queue-owner','queued /plan retained the slash prefix or lost its session mode');});
- await test('empty /plan switches mode without sending a message',()=>{reset('plan-empty-owner');emit({type:'session_ready',sessionId:'plan-empty-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));sendBtn.click();check(sent.some(message=>message.type==='setMode'&&message.mode==='plan'&&message.sessionId==='plan-empty-owner'),'empty /plan did not switch mode');check(!sent.some(message=>message.type==='send'||message.type==='insert'),'empty /plan sent a prompt');check(!document.getElementById('plan-indicator').hidden,'empty /plan did not leave the mode indicator on');});
- await test('/plan refuses context references without consuming the draft',()=>{reset('plan-context-owner');emit({type:'session_ready',sessionId:'plan-context-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Keep this task');emit({type:'addChip',chip:{path:'/test/plan.ts',relPath:'plan.ts',selectedText:'PLAN_CONTEXT'}});sendBtn.click();check(!sent.some(message=>message.type==='send'||message.type==='insert'||message.type==='setMode'),'unsupported /plan context was submitted');check(input.value==='Keep this task'&&document.querySelector('#attachments .ctx-chip'),'blocked /plan context was consumed');check(document.getElementById('toast').textContent.toLowerCase().includes('plan'),'blocked /plan context did not explain the restriction');});
+ await test('local Plan action is available without a backend command and preserves surrounding text',()=>{reset('plan-command-owner');emit({type:'session_ready',sessionId:'plan-command-owner',viewGen:gen,slashCommands:[]});input.focus();type('Explain /plan the change');input.setSelectionRange(13,13);input.dispatchEvent(new Event('input',{bubbles:true}));check(document.querySelector('#slash-menu .slash-item.command')&&document.getElementById('slash-menu').classList.contains('open'),'local Plan action missing: '+document.getElementById('slash-menu').textContent);input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));check(input.value==='Explain  the change','Plan selection consumed surrounding text');check(!sent.some(m=>m.type==='setMode'||m.type==='send'),'selection changed the running session');sendBtn.click();check(sent.find(m=>m.type==='send')?.text==='Explain  the change'&&sent.find(m=>m.type==='send')?.planMode===true,'task lost draft Plan mode');});
+ await test('Plan action preserves a running reply and queues ordinary task text',()=>{reset('plan-queue-owner');emit({type:'status',sessionId:'plan-queue-owner',status:'running'});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));check(!sent.some(m=>m.type==='insert'||m.type==='setMode'),'Plan selection touched the running session');type('Queue this plan');sendBtn.click();check(sent.find(m=>m.type==='insert')?.text==='Queue this plan'&&sent.find(m=>m.type==='insert')?.planMode===true,'queued task lost draft Plan');});
+ await test('empty Plan selection remains a draft until there is content to send',()=>{reset('plan-empty-owner');type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));sendBtn.click();check(!sent.some(m=>m.type==='setMode'||m.type==='send'||m.type==='insert'),'empty draft changed session mode');check(!document.getElementById('plan-indicator').hidden,'draft Plan indicator missing');});
+ await test('Plan action preserves file references and allows normal submission',()=>{reset('plan-context-owner');emit({type:'addChip',chip:{path:'/test/plan.ts',relPath:'plan.ts'}});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));check(document.querySelector('#attachments .ctx-chip'),'Plan selection dropped context');type('Keep this task');sendBtn.click();check(sent.find(m=>m.type==='send')?.chips.length===1,'Plan blocked context submission');});
  await test('slash commands offer a completion menu with builtin and custom entries',()=>{
   reset('slash-owner');
   emit({type:'session_ready',sessionId:'slash-owner',viewGen:gen,title:'T',slashCommands:[
@@ -938,9 +959,9 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   ]});
   type('/');
   const menu=document.getElementById('slash-menu');
-  check(menu.classList.contains('open')&&menu.querySelectorAll('.slash-item').length===3,'slash menu did not list all commands');
+  check(menu.classList.contains('open')&&menu.querySelectorAll('.slash-item').length===4,'slash menu did not list commands and local Plan action');
   check(menu.querySelector('.slash-item .slash-icon svg'),'slash commands lost their icons');
-  check(menu.querySelectorAll('.slash-icon svg').length===3,'not every command carries a glyph');
+  check(menu.querySelectorAll('.slash-icon svg').length===4,'not every command carries a glyph');
   type('/co');
   check(menu.classList.contains('open')&&menu.querySelectorAll('.slash-item').length===1&&menu.querySelector('.slash-name').textContent==='/compact','prefix filtering failed');
   input.dispatchEvent(new KeyboardEvent('keydown',{key:'Tab',bubbles:true,cancelable:true}));
@@ -1285,15 +1306,8 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   const retry=sent.filter(message=>message.type==='retryLast').at(-1);emit({...retry,type:'send_rejected',message:'Retry rejected again'});
   check(JSON.stringify(savedState.composerDrafts[owner])===before,'retry rejection merged an already retained recovery draft again');
  });
- await test('retrying a rejected Plan shortcut retains its mode and complete recovery command',()=>{
-  reset('retry-plan');emit({type:'session_ready',sessionId:'retry-plan',viewGen:gen,slashCommands:[{name:'plan',description:'Plan',inputHint:'/plan [task]'}]});
-  type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Original plan task');sendBtn.click();
-  const original=sent.find(message=>message.type==='send');emit({...original,type:'send_rejected',text:original.recoveryText,message:'Mode rejected'});
-  messages.querySelector('.message.error [data-act="retryLast"]').click();const retry=sent.find(message=>message.type==='retryLast');
-  check(retry.planMode===true&&retry.text==='Original plan task'&&retry.recoveryText==='/plan Original plan task','retry dropped the Plan shortcut mode or restored command');
-  emit({...retry,type:'send_rejected',text:retry.recoveryText,message:'Mode rejected again'});
-  check(input.value==='Original plan task'&&!document.getElementById('plan-indicator').hidden,'retry failure did not restore the Plan composer');
- });
+ await test('draft Plan survives session switches, rejection and cancellation without changing the server',()=>{reset('draft-plan-A');type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Draft task');emit({type:'view_reset',viewGen:++gen});emit({type:'session_ready',sessionId:'draft-plan-B',viewGen:gen});check(document.getElementById('plan-indicator').hidden,'draft Plan leaked across sessions');emit({type:'view_reset',viewGen:++gen});emit({type:'session_ready',sessionId:'draft-plan-A',viewGen:gen});emit({type:'history',sessionId:'draft-plan-A',viewGen:gen,items:[]});emit({type:'stream_release'});check(!document.getElementById('plan-indicator').hidden&&input.value==='Draft task','draft Plan did not restore');sendBtn.click();const send=sent.find(m=>m.type==='send');check(send?.planMode===true,'restored draft lost mode');emit({...send,type:'send_rejected',message:'Rejected'});check(input.value==='Draft task'&&!document.getElementById('plan-indicator').hidden,'rejection lost draft Plan');sent.length=0;document.getElementById('plan-indicator').click();check(document.getElementById('plan-indicator').hidden&&!sent.some(m=>m.type==='setMode'),'cancel changed backend mode');sendBtn.click();check(!sent.find(m=>m.type==='send')?.planMode,'cancelled draft still requested Plan');});
+ await test('raw /plan text stays literal after Escape and draft restoration',()=>{reset('plan-raw');emit({type:'session_ready',sessionId:'plan-raw',viewGen:gen,slashCommands:[{name:'plan',description:'legacy',inputHint:'/plan [task]'}]});type('/plan');check(document.querySelectorAll('#slash-menu .slash-item.command').length===1,'legacy command duplicated local Plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));type('/plan Explain this');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));sendBtn.click();check(sent.find(m=>m.type==='send')?.text==='/plan Explain this','raw Plan text was interpreted');check(!sent.some(m=>m.type==='setMode'),'Escape changed mode');});
  await test('retry after switch uses the current session prompt',()=>{reset('A');type('QUESTION_FROM_A');sendBtn.click();reset('B');emit({type:'history',sessionId:'B',viewGen:gen,items:[{id:'user-B',role:'user',text:'QUESTION_FROM_B',tools:[]}]});emit({type:'session_error',message:'Model failed in B'});messages.querySelector('.err-actions [data-act="retryLast"]').click();check(sent.some(m=>m.type==='retryLast'&&m.sessionId==='B'&&m.text==='QUESTION_FROM_B'),'Retry lost the current session owner '+JSON.stringify(sent.filter(m=>m.type==='retryLast')));});
  await test('empty new session cannot retry an old session question',()=>{reset('A');type('OLD_PRIVATE_QUESTION_A');sendBtn.click();reset('B');emit({type:'session_error',message:'B failed before a question'});messages.querySelector('.err-actions [data-act="retryLast"]')?.click();check(!sent.some(m=>m.type==='retryLast'&&m.text==='OLD_PRIVATE_QUESTION_A'),'old question sent into empty B');});
  await test('a detached retry action cannot send after its session changes',()=>{reset('A');type('STALE_RETRY_QUESTION_A');sendBtn.click();emit({type:'status',sessionId:'A',status:'error',message:'Retry this failure'});const button=messages.querySelector('.message.error .err-actions [data-act="retryLast"]');check(button,'retry action was not created');reset('B');button.click();check(!sent.some(m=>m.type==='retryLast'),'stale error action sent into the new session');});
@@ -1737,7 +1751,7 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
 
  const imageFixture={ref:'image-ref',fileName:'sample.png',mime:'image/png',bytes:100};
  const addImage=(owner='A',id='image-test')=>{emit({type:'image_pending',sessionId:owner,imageId:id,fileName:imageFixture.fileName,mime:imageFixture.mime,bytes:100});emit({type:'image_ready',sessionId:owner,imageId:id,attachment:imageFixture});};
- await test('/plan refuses images without consuming the draft',()=>{reset('plan-image-owner');emit({type:'session_ready',sessionId:'plan-image-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Keep this task');addImage('plan-image-owner');sendBtn.click();check(!sent.some(message=>message.type==='send'||message.type==='insert'||message.type==='setMode'),'unsupported /plan image was submitted');check(input.value==='Keep this task'&&document.querySelector('#image-drafts .image-chip'),'blocked /plan image was consumed');check(document.getElementById('toast').textContent.toLowerCase().includes('plan'),`blocked /plan image did not explain the restriction: ${document.getElementById('toast').textContent}`);});
+ await test('Plan action retains images for ordinary submission',()=>{reset('plan-image-owner');addImage('plan-image-owner');type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));check(document.querySelector('#image-drafts .image-chip'),'Plan selection consumed image');type('Describe this');sendBtn.click();check(sent.find(m=>m.type==='send')?.attachments.length===1,'Plan blocked image submission');});
  await test('draft image preview opens full data, preserves draft and rejects stale responses',()=>{
   reset('preview-draft');type('PREVIEW_CAPTION');addImage('preview-draft');
   const button=document.querySelector('#image-drafts .image-preview-btn');

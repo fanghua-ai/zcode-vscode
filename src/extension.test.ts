@@ -10,7 +10,7 @@ import type { PickerModel, ResolvedRuntime } from "./desktop";
 import { ZCodeClient } from "./zcodeClient";
 import { StartupTiming } from "./startupTiming";
 import type { AvailableModel } from "./zcodeClient";
-import { setTestLanguage, setTestFiles, workspace, window as testWindow, recoveryCalls, recoveryNotices } from "./testSupport/vscode";
+import { setTestLanguage, setTestFiles, workspace, window as testWindow, recoveryCalls, recoveryNotices, setInformationChoice, configUpdates, resetConfigValues } from "./testSupport/vscode";
 
 function deferred() {
   let resolve!: (value?: unknown) => void;
@@ -28,7 +28,7 @@ function fixture() {
   const visibility: boolean[] = [];
   let backgroundPolls = 0;
   const response = deferred();
-  const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", subscriptions: [], workspaceState: { get: () => undefined } } as unknown as vscode.ExtensionContext);
+  const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", extensionPath: "/unused", subscriptions: [], workspaceState: { get: () => undefined } } as unknown as vscode.ExtensionContext);
   const state = provider as unknown as {
     client: { currentSessionId: string; currentMode: () => string; confirmedModel: () => {providerId: string; modelId: string} | undefined; confirmedControls: () => Partial<import("./zcodeClient").SessionControls>; setViewVisible: (visible: boolean) => void; pollBackgroundRuns: () => void; dispose: () => void; editUserQuery: () => Promise<unknown>; insertQueuedMessage: (text?: unknown) => Promise<unknown>; conversationFileChanges: () => Promise<unknown>; sendMessage: (...args: unknown[]) => Promise<unknown>; setMode: (mode: string) => Promise<void>; setModel: (...args: unknown[]) => Promise<unknown>; hasFreshSessionModel: () => boolean; readAvailableModels: () => Promise<{ current?: { providerId: string; modelId: string }; available: AvailableModel[] }>;
       stageSessionModel: (model: { providerId: string; modelId: string } | null) => void;
@@ -628,13 +628,13 @@ for (const lateResult of ["success", "failure"] as const) {
     });
     const f = fixture();
     const state = f.state as unknown as {
-      context: { globalStorageUri: { fsPath: string } };
+      context: { globalStorageUri: { fsPath: string }; extensionPath: string };
       client: ZCodeClient | null;
       startupPhase: string | null;
       startupPhaseTimer?: NodeJS.Timeout;
       startWhileLoginRuns: (timing: StartupTiming, started: number, login: Promise<unknown>, launch: unknown) => Promise<void>;
     };
-    state.context = { globalStorageUri: { fsPath: path.join(home, "storage") } };
+    state.context = { globalStorageUri: { fsPath: path.join(home, "storage") }, extensionPath: "/unused" };
     const timing = new StartupTiming("open");
     try {
       const notices = recoveryNotices.length;
@@ -1069,13 +1069,13 @@ for (const language of ["zh-CN", "zh-TW", "en"]) {
 
 
 test("workspace mention search stays scoped and responses retain request ownership", async () => {
- const f = fixture(); const state = f.state as typeof f.state & {workspacePath:string}; state.workspacePath="/test/work";
- setTestFiles(["/test/work/src/main.ts","/test/work/.vscode/settings.json"]);
+ const f = fixture(); const state = f.state as typeof f.state & {workspacePath:string}; state.workspacePath=path.resolve("/test/work");
+ setTestFiles([path.join(state.workspacePath,"src","main.ts"),path.join(state.workspacePath,".vscode","settings.json")]);
  await state.onWebviewMessage({type:"searchWorkspaceFiles",requestId:"search-A",sessionId:"A",text:"main"});
- assert.deepEqual(f.posted.pop(),{type:"workspace_files",requestId:"search-A",sessionId:"A",files:[{path:"/test/work/src/main.ts",relPath:"src/main.ts"}]});
+ assert.deepEqual(f.posted.pop(),{type:"workspace_files",requestId:"search-A",sessionId:"A",files:[{path:path.join(state.workspacePath,"src","main.ts"),relPath:path.join("src","main.ts")}]});
  f.switchToB();
  await state.onWebviewMessage({type:"searchWorkspaceFiles",requestId:"search-B",sessionId:"B",text:"settings"});
- assert.deepEqual(f.posted.pop(),{type:"workspace_files",requestId:"search-B",sessionId:"B",files:[{path:"/test/work/.vscode/settings.json",relPath:".vscode/settings.json"}]});
+ assert.deepEqual(f.posted.pop(),{type:"workspace_files",requestId:"search-B",sessionId:"B",files:[{path:path.join(state.workspacePath,".vscode","settings.json"),relPath:path.join(".vscode","settings.json")}]});
  assert.deepEqual(f.posted,[]); setTestFiles([]);
   f.dispose();
 });
@@ -1108,6 +1108,79 @@ test("recovery buttons open only known settings and the fixed community destinat
       {url:"https://marketplace.visualstudio.com/items?itemName=fanghua.zcode-desktop-chat#qna"},
     ]);
   } finally {recoveryCalls.length=0;provider.dispose();}
+});
+
+test("enabling a suppressed desktop skill is remembered for later MCP startup", async () => {
+  const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", extensionPath: "/unused", subscriptions: [] } as unknown as vscode.ExtensionContext);
+  const state = provider as unknown as { onWebviewMessage: (message: Record<string, unknown>) => Promise<void> };
+  const before = configUpdates.length;
+  recoveryNotices.length = 0;
+  setTestLanguage("en");
+  setInformationChoice(0);
+  try {
+    await state.onWebviewMessage({ type: "promptDesktopPluginSkill", text: "docx" });
+    assert.match(recoveryNotices.at(-1)?.message ?? "", /docx/);
+    assert.match(recoveryNotices.at(-1)?.message ?? "", /remembered/i);
+    assert.deepEqual(configUpdates.slice(before), [{ key: "allowedDesktopPlugins", value: ["documents"], target: 1 }]);
+    setInformationChoice(1);
+    await state.onWebviewMessage({ type: "promptDesktopPluginSkill", text: "pdf" });
+    assert.equal((provider as unknown as { pendingOpenSettings: string | null }).pendingOpenSettings, "enable-desktop-plugins");
+  } finally {
+    setInformationChoice(undefined);
+    setTestLanguage("auto");
+    recoveryNotices.length = 0;
+    resetConfigValues();
+    provider.dispose();
+  }
+});
+
+test("the chat settings switch remembers whether desktop plugins start", async () => {
+  const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", extensionPath: "/unused", subscriptions: [] } as unknown as vscode.ExtensionContext);
+  const state = provider as unknown as { onWebviewMessage: (message: Record<string, unknown>) => Promise<void> };
+  const before = configUpdates.length;
+  try {
+    await state.onWebviewMessage({ type: "setDesktopPlugins", text: "documents", enabled: true });
+    await state.onWebviewMessage({ type: "setDesktopPlugins", text: "documents", enabled: false });
+    assert.deepEqual(configUpdates.slice(before), [
+      { key: "allowedDesktopPlugins", value: ["documents"], target: 1 },
+      { key: "allowedDesktopPlugins", value: [], target: 1 },
+    ]);
+  } finally {
+    resetConfigValues();
+    provider.dispose();
+  }
+});
+
+test("concurrent plugin choices preserve each other and reject unknown plugins", async () => {
+  const f = fixture();
+  const before = configUpdates.length;
+  try {
+    await Promise.all([
+      f.state.onWebviewMessage({ type: "setDesktopPlugins", text: "documents", enabled: true }),
+      f.state.onWebviewMessage({ type: "setDesktopPlugins", text: "pdf", enabled: true }),
+    ]);
+    await f.state.onWebviewMessage({ type: "setDesktopPlugins", text: "unknown", enabled: true });
+    assert.deepEqual(configUpdates.slice(before).map(update => update.value), [["documents"], ["documents", "pdf"]]);
+  } finally { resetConfigValues(); f.provider.dispose(); }
+});
+
+test("unregistered plugin settings offer window reload without a session failure", async t => {
+  const f = fixture();
+  const original = workspace.getConfiguration.bind(workspace);
+  t.mock.method(workspace, "getConfiguration", () => ({ ...original(), update: async () => {
+    throw new Error("Unable to write to User Settings because zcode.allowedDesktopPlugins is not a registered configuration.");
+  } }));
+  recoveryNotices.length = 0;
+  recoveryCalls.length = 0;
+  setTestLanguage("en");
+  setInformationChoice(0);
+  try {
+    await f.state.onWebviewMessage({ type: "setDesktopPlugins", text: "documents", enabled: true });
+    assert.match(recoveryNotices.at(-1)?.message ?? "", /has not registered/);
+    assert.ok(recoveryCalls.some(call => call.command === "workbench.action.reloadWindow"));
+    assert.ok(!f.posted.some(message => message.type === "session_error"));
+    assert.deepEqual(f.posted.find(message => message.type === "desktop_plugins")?.allowed, []);
+  } finally { setInformationChoice(undefined); setTestLanguage("auto"); f.provider.dispose(); }
 });
 
 test("startup notifications describe the exact setting and include actionable buttons",()=>{

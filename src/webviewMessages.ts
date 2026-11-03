@@ -24,9 +24,10 @@ export const KNOWN_WEBVIEW_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   "fileReferenceDetails", "historyRenderTiming", "insert", "installMathFonts", "listSessions", "loadFileChanges",
   "loadOlder", "loadPreviewFiles", "loadThrough", "newSession", "openCommunity", "openDiff",
   "openFile", "openGitDiff", "openMarkdownFile", "openRecoverySettings", "permissionAnswer",
+  "promptDesktopPluginSkill",
   "pickAttachments", "previewImage", "queueDelete", "queueEdit", "queueReorder", "queueSendNow",
   "ready", "refreshReferenceCatalog", "renameSession", "responsePainted", "retry", "retryLast", "rewindFiles",
-  "searchWorkspaceFiles", "selectModel", "send", "setChrome", "setLanguage", "setMode",
+  "searchWorkspaceFiles", "selectModel", "send", "setChrome", "setDesktopPlugins", "setLanguage", "setMode",
   "setNewSessionDefaults", "setThoughtLevel", "showLog", "stop", "switchSession",
   "thumbnailImage", "unarchiveSession", "uploadImage", "userInputAnswer",
 ]);

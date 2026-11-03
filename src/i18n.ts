@@ -391,6 +391,20 @@ export const messages: Record<string, string> = {
   "改文件前先问我。": "Ask before editing files.",
   "自动编辑": "Auto edit",
   "自动编辑文件。": "Edit files automatically.",
+  "扩展中的插件服务": "Plugin services in this extension",
+  "允许后仍遵循桌面端原有开关。修改会重启当前会话；浏览器和电脑控制共用 JavaScript REPL。": "Allowed plugins still follow desktop preferences. Changes restart this chat. Browser and computer use share the JavaScript REPL.",
+  "允许此插件": "Allow this plugin",
+  "{0} 所属插件已关闭。允许后会记住并重启当前会话，仍遵循桌面端原有开关。": "The plugin for {0} is off. Allowing it is remembered and restarts this chat, while still following desktop preferences.",
+  "{0} 已关闭。允许后会记住，并重启当前会话。": "{0} is off. Allowing it is remembered and restarts this chat.",
+  "当前运行时无法应用插件关闭设置，部分 MCP 仍可能启动。": "This runtime could not apply plugin suppression. Some MCP services may still start.",
+  "演示文稿": "Presentations",
+  "表格": "Spreadsheets",
+  "浏览器": "Browser",
+  "电脑控制": "Computer use",
+  "重新加载窗口": "Reload Window",
+  "VS Code 尚未注册新版插件设置。请重新加载窗口后，再允许此插件。": "VS Code has not registered the updated plugin settings. Reload the window, then allow this plugin again.",
+  "保存插件设置失败：{0}": "Could not save plugin settings: {0}",
+  "开启计划模式": "Enable Plan mode",
   "计划模式": "Plan mode",
   "编辑前先出计划。": "Make a plan before editing.",
   "完全访问": "Full access",
@@ -481,7 +495,25 @@ export const messages: Record<string, string> = {
   "就绪": "Ready",
   "ZCode 进程已退出": "ZCode process exited",
   "模型未能完成本轮回复": "The model failed to complete this turn",
-  "会话错误": "Session error"
+  "会话错误": "Session error",
+  "创建和编辑 Word 文档": "Create and edit Word documents",
+  "在侧栏查看 Word 文档": "View Word documents in the side panel",
+  "创建、转换和处理 PDF": "Create, convert, and process PDFs",
+  "在侧栏查看 PDF": "View PDFs in the side panel",
+  "创建和编辑演示文稿": "Create and edit presentations",
+  "在侧栏查看演示文稿": "View presentations in the side panel",
+  "创建和编辑表格": "Create and edit spreadsheets",
+  "在侧栏查看表格": "View spreadsheets in the side panel",
+  "操作内置浏览器": "Control the built-in browser",
+  "用浏览器测试网页界面": "Test a web page in the browser",
+  "已关闭，选择后可以启用": "Off. Choose it to enable",
+  "该技能": "This skill",
+  "启用这些插件": "Enable these plugins",
+  "{0} 已关闭。启用后会记住，之后默认拉起这些 MCP。": "{0} is off. Enabling is remembered, and later sessions start these MCP processes.",
+  "{0} 已关闭。启用后会记住这个选择，之后启动默认拉起这些插件的 MCP，并重启当前会话。": "{0} is off. Enabling is remembered. Later startups launch these plugins' MCP processes, and this chat restarts now.",
+  "桌面插件": "Desktop plugins",
+  "启用文档和浏览器插件": "Enable document and browser plugins",
+  "打开后会记住，并重启当前会话。之后会拉起文档、PDF、演示文稿、表格和浏览器的 MCP，以及共享的 JavaScript REPL。电脑控制只有在桌面端已经打开时才会恢复。只记在用户设置里，工作区不能覆盖。": "This choice is remembered in user settings and restarts the current chat. Later startups launch the document, PDF, presentation, spreadsheet, and browser MCP processes, plus the shared JavaScript REPL. Computer use returns only when the desktop app already had it on. A workspace setting cannot override this."
 };
 const aliases: Record<string, string> = {
   "Cannot manage goals while a prompt is running": "正在回复时不能修改或清除目标。可以先暂停，或等这轮结束再操作。",
@@ -515,7 +547,7 @@ const aliases: Record<string, string> = {
   "ZCode process exited": "ZCode 进程已退出",
   "The model failed to complete this turn": "模型未能完成本轮回复",
   "Session error": "会话错误",
-  "Setup needed": "需要设置"
+  "Setup needed": "需要设置",
 };
 const englishSources = Object.fromEntries(Object.entries(messages).map(([key, value]) => [value, key]));
 let language: UiLanguage = "zh-CN";
