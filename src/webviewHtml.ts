@@ -1,3 +1,4 @@
+import { DESKTOP_PLUGIN_CHOICES } from "./desktopPluginChoices";
 import { translate, type UiLanguage, type LanguageSetting } from "./i18n";
 import * as vscode from "vscode";
 
@@ -28,7 +29,8 @@ export function getWebviewHtml(
   extensionUri: vscode.Uri,
   nonce: string,
   language: { locale: UiLanguage; setting: LanguageSetting; vscodeLanguage: string } = { locale: "zh-CN", setting: "auto", vscodeLanguage: "zh-CN" },
-  chrome: ComposerChrome = defaultChrome
+  chrome: ComposerChrome = defaultChrome,
+  desktopPluginsEnabled: readonly string[] = []
 ): string {
   const t = (text: string) => translate(text, language.locale);
   const scriptUri = webview.asWebviewUri(
@@ -40,7 +42,7 @@ export function getWebviewHtml(
     `img-src ${webview.cspSource} data:`,
     `style-src ${webview.cspSource} 'unsafe-inline'`,
     `script-src 'nonce-${nonce}'`,
-    `font-src ${webview.cspSource}`,
+    `font-src ${webview.cspSource} data:`,
   ].join("; ");
 
   return `<!DOCTYPE html>
@@ -86,6 +88,7 @@ export function getWebviewHtml(
   input::placeholder, textarea::placeholder { color: var(--z-muted); opacity: 1; }
 
   #settings-menu {
+    font-size: 12px; line-height: 16px;
     position: absolute; top: calc(100% + 4px); right: 0; z-index: 100;
     width: 280px; max-height: min(72vh, 440px); padding: 6px; border-radius: 10px;
     display: flex; flex-direction: column; gap: 6px;
@@ -154,6 +157,7 @@ export function getWebviewHtml(
     font: inherit; font-size: 12px; outline: none;
   }
   .settings-select:focus-visible { border-color: var(--vscode-focusBorder); }
+  #desktop-plugin-settings { display:flex; flex-direction:column; gap:6px; }
   .settings-help { padding: 0 8px 4px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 15px; }
   button.settings-item { cursor: pointer; }
   button.settings-item:hover { background: var(--vscode-toolbar-hoverBackground); }
@@ -387,7 +391,7 @@ export function getWebviewHtml(
     margin-top: -10px;
     justify-content: flex-end;
   }
-  .msg-meta.reply-meta { margin-top: -4px; }
+  .msg-meta.reply-meta { margin-top: -4px; min-width: 0; }
   .msg-copy {
     width: 16px;
     height: 16px;
@@ -408,6 +412,16 @@ export function getWebviewHtml(
     background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
   }
   .msg-time { font-variant-numeric: tabular-nums; }
+  .math-font-hint {
+    border: 0; padding: 0; background: transparent; color: inherit;
+    font: inherit; cursor: pointer;
+    min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  }
+  .math-font-hint:hover,
+  .math-font-hint:focus-visible { color: var(--vscode-foreground); text-decoration: underline; }
+  .math-font-hint:disabled,
+  .math-font-hint:disabled:hover,
+  .math-font-hint:disabled:focus-visible { cursor: default; color: inherit; text-decoration: none; }
   .turn-hidden { display: none !important; }
   .turn-collapsed,
   .turn-folded {
@@ -716,22 +730,16 @@ export function getWebviewHtml(
   .tool-status { flex-shrink: 0; }
   .tool-status.completed, .tool-status.success { display: none; }
   .process-head { display: flex; align-items: center; gap: 8px; min-height: 24px; background: none; border: 0; padding: 0; text-align: left; font: inherit; font-size: 12px; line-height: 18px; color: var(--z-muted); cursor: pointer; }
-  .process-icon { width: 16px; height: 16px; flex: 0 0 auto; }
-  /* SVG ink, rather than its 16px box, should meet the label's optical center. */
-  .process-icon[data-lucide="search"],
-  .process-icon[data-lucide="squareTerminal"],
-  .process-icon[data-lucide="circleQuestionMark"],
-  .process-icon[data-lucide="codeXml"] { transform: translateY(-1px); }
-  .process-icon[data-lucide="brain"] { transform: translateY(-1.5px); }
-  /* Latin tool labels sit slightly above CJK labels in the VS Code UI font. */
-  .raw-tool-head .process-icon[data-lucide="codeXml"] { transform: translateY(0); }
-  .process-chevron { font-size: 14px; margin-left: auto; transform: translateY(-0.5px); }
-  [aria-expanded="true"] > .process-chevron { transform: translateY(-0.5px) rotate(180deg); }
+  /* Share the label's line-box center across platform fonts and display scales. */
+  .process-icon { display: block; width: 16px; height: 16px; flex: 0 0 auto; }
+  .process-chevron { display: block; flex: 0 0 auto; font-size: 14px; margin-left: auto; }
+  [aria-expanded="true"] > .process-chevron { transform: rotate(180deg); }
   .group-hidden, .work-note[hidden] { display: none; }
   .group-detail { margin-left: 24px; }
   .process-head:hover, .tool-head:hover { color: var(--vscode-foreground); }
   .process-head:focus-visible, .tool-head:focus-visible { outline: 1px solid var(--z-accent); outline-offset: -1px; border-radius: 4px; }
-  .reasoning-head { margin-bottom: -6px; }
+  /* Tighten expanded content without shortening a collapsed title's scrollport. */
+  .reasoning-head + .work-note { margin-top: -6px; }
   .tool-status { font-size: 11px; }
   .tool-status.running { color: var(--z-accent); }
   .tool-status.completed, .tool-status.success { color: var(--z-muted); }
@@ -882,7 +890,27 @@ export function getWebviewHtml(
     color:var(--vscode-foreground); cursor:pointer; text-align:left;
   }
   .slash-item.active, .slash-item:hover { background:var(--vscode-list-hoverBackground); }
+  .slash-item.skill, .slash-item.agent { grid-template-rows:auto; }
+  .slash-item.skill .slash-desc, .slash-item.agent .slash-desc { grid-column:3; }
+  .slash-item.skill .slash-hint, .slash-item.agent .slash-hint { display:none; }
+  .slash-heading { color:var(--z-muted); font-size:11px; padding:6px 8px; }
+  .slash-heading:not(:first-child) { margin-top:3px; border-top:1px solid color-mix(in srgb, var(--vscode-foreground) 9%, transparent); padding-top:8px; }
   .slash-icon { display:grid; place-items:center; width:15px; height:15px; color:var(--z-muted); align-self:center; }
+  .slash-icon.skill { font-size:11px; font-weight:700; }
+  #selected-skills { display:flex; align-items:center; flex:1 1 0; min-width:24px; overflow-x:auto; scrollbar-width:thin; }
+  #selected-skills[hidden] { display:none; }
+  .selected-skill, .skill-ref-chip, .agent-ref-chip { display:inline-flex; align-items:center; gap:4px; color:var(--vscode-textLink-foreground, var(--z-accent)); font-weight:600; }
+  #selected-skills .selected-skill { flex:0 0 auto; gap:2px; max-width:min(132px, 100%); color:var(--vscode-foreground); font-weight:600; }
+  .selected-skill .skill-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .selected-skill .chip-icon, .selected-skill .chip-close { display:grid; place-items:center; flex:none; }
+  .selected-skill .chip-icon { color:var(--z-accent); }
+  .selected-skill .chip-close { display:none; }
+  .selected-skill:hover .chip-icon, .selected-skill:focus-visible .chip-icon { display:none; }
+  .selected-skill:hover .chip-close, .selected-skill:focus-visible .chip-close { display:grid; }
+  .selected-skill svg, .skill-ref-chip svg, .agent-ref-chip svg, .slash-item.agent svg { width:14px; height:14px; flex:none; }
+  .skill-ref-chip, .agent-ref-chip { align-items:baseline; vertical-align:baseline; }
+  .skill-ref-chip svg, .agent-ref-chip svg { align-self:center; }
+  .skill-ref-chip { margin-right:5px; }
   #active-command, #plan-indicator {
     display:inline-flex; align-items:center; gap:2px;
     color:var(--vscode-foreground); font-weight:600;
@@ -1054,17 +1082,21 @@ export function getWebviewHtml(
     background: transparent;
     color: color-mix(in srgb, var(--vscode-foreground) 58%, transparent);
     font-size: 9px;
+    font-family: inherit;
     font-variant-numeric: tabular-nums;
     line-height: 1;
     cursor: pointer;
   }
+  .q-dot > span { display:block; line-height:18px; }
   .q-dot:hover,
   .q-dot:focus-visible { color: var(--vscode-foreground); }
   .q-dot.current { color: var(--z-accent); }
   .q-dot.current::after {
     content: "";
     position: absolute;
-    inset: 6px 1px;
+    inset: 50% 1px auto;
+    height: 18px;
+    transform: translateY(-50%);
     border: 1px solid currentColor;
     border-radius: 4px;
     pointer-events: none;
@@ -1894,6 +1926,19 @@ export function getWebviewHtml(
   }
   .oi-sub { font-size: 11px; color: var(--z-muted); margin-top: 2px; }
   .overlay-empty { padding: 16px; color: var(--z-muted); font-size: 12px; }
+  .session-list-notice {
+    display: flex; align-items: center; gap: 8px;
+    margin: 2px 4px 8px; padding: 8px 10px; border-radius: 8px;
+    background: color-mix(in srgb, var(--z-warning) 12%, transparent);
+    color: var(--vscode-foreground); font-size: 11px; line-height: 1.4;
+  }
+  .session-list-notice[hidden] { display: none; }
+  .session-list-notice span { flex: 1; min-width: 0; }
+  .session-list-notice button {
+    flex: 0 0 auto; border: 0; border-radius: 6px; padding: 3px 7px;
+    background: transparent; color: var(--z-accent); font: inherit; font-size: 11px; cursor: pointer;
+  }
+  .session-list-notice button:hover { background: var(--vscode-toolbar-hoverBackground); }
   #setup-recovery { padding:0 12px 10px; }
   #setup-hint { padding: 0 12px 8px; font-size: 12px; color: var(--z-muted); line-height: 1.4; }
 
@@ -2006,6 +2051,10 @@ export function getWebviewHtml(
           </select>
         </div>
         <div class="settings-help" id="new-session-thought-help">${t("思考强度取决于模型；更换默认模型后会恢复为模型默认值。")}</div>
+        <div class="settings-section">${t("桌面插件")}</div>
+        <div id="desktop-plugin-settings">
+        ${DESKTOP_PLUGIN_CHOICES.map(choice => `<label class="settings-switch"><span>${t(choice.label)}</span><span class="switch"><input type="checkbox" data-desktop-plugin="${choice.id}"${desktopPluginsEnabled.includes(choice.id) ? " checked" : ""}><i></i></span></label>`).join("")}
+        <div class="settings-help">${t("允许后仍遵循桌面端原有开关。修改会重启当前会话；浏览器和电脑控制共用 JavaScript REPL。")}</div></div>
         <div class="settings-section">${t("界面")}</div>
         <label class="settings-switch"><span>${t("毛玻璃效果")}</span><span class="switch"><input type="checkbox" id="frosted-glass" data-chrome="frostedGlass"${chrome.frostedGlass ? " checked" : ""}><i></i></span></label>
         <div class="settings-item">
@@ -2030,7 +2079,8 @@ export function getWebviewHtml(
         <label class="settings-switch"><span>${t("折叠权限和推理")}</span><span class="switch"><input type="checkbox" id="fold-session-controls" data-chrome="foldSessionControls"${chrome.foldSessionControls ? " checked" : ""}><i></i></span></label>
     </div>
   </div>
-  <div id="messages"></div>
+  <!-- Keep transcript selection focused when VS Code forwards clipboard commands. -->
+  <div id="messages" tabindex="-1"></div>
   <div id="messages-scrollbar" hidden aria-hidden="true"><div id="messages-thumb"></div></div>
   <div id="composer">
     <div id="goal-zone">
@@ -2075,7 +2125,7 @@ export function getWebviewHtml(
       </div>
       <div id="image-drafts"></div>
       <div id="input-area">
-        <textarea id="input" rows="1" placeholder="${t("向 ZCode 提问，@ 添加上下文，/ 选择能力")}"></textarea>
+        <textarea id="input" rows="1" placeholder="${t("向 ZCode 提问，@ 添加上下文，/ 选择命令或能力")}"></textarea>
       </div>
       <div class="composer-toolbar">
         <div class="toolbar-left">
@@ -2085,6 +2135,7 @@ export function getWebviewHtml(
           <button type="button" id="controls-toggle" class="toolbar-btn" title="${t("展开权限和推理")}" aria-label="${t("展开权限和推理")}" aria-expanded="false"><svg viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M4.5 2.5 8 6 4.5 9.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
           <button type="button" id="plan-indicator" class="toolbar-btn" hidden></button>
           <button type="button" id="active-command" class="toolbar-btn active-command" hidden></button>
+          <div id="selected-skills" hidden></div>
         </div>
         <button type="button" id="context-meter" class="context-meter" title="${t("上下文窗口")}" aria-label="${t("上下文窗口")}" aria-controls="usage-panel" aria-expanded="false"><span class="usage-ring" id="context-ring-tip"><svg class="context-ring" viewBox="0 0 20 20" aria-hidden="true"><circle class="context-track" cx="10" cy="10" r="7"></circle><circle class="context-value" cx="10" cy="10" r="7"></circle></svg></span><span class="usage-ring" id="five-hour-ring-tip"><svg class="five-hour-ring" viewBox="0 0 20 20" aria-hidden="true"><circle class="context-track" cx="10" cy="10" r="7"></circle><circle class="five-hour-value" cx="10" cy="10" r="7"></circle></svg></span><svg class="usage-chevron" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="m2.5 4.5 3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         <button type="button" id="insert-now-btn" class="send" title="${t("立即发送（打断当前回复）")}" aria-label="${t("立即发送")}"></button>
@@ -2116,6 +2167,9 @@ export function getWebviewHtml(
         <button type="button" id="tab-archived" class="tab-btn">${t("Archived")}</button>
       </div>
       <input id="overlay-search" placeholder="${t("Filter…")}">
+      <div id="session-list-notice" class="session-list-notice" hidden role="status">
+        <span></span><button type="button" data-i18n-key="重试">${t("重试")}</button>
+      </div>
       <div id="overlay-list"></div>
     </div>
   </div>

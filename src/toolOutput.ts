@@ -16,14 +16,17 @@ function parseJsonContainer(text: string): unknown | undefined {
 
 type PartialJsonResult = { value: unknown; complete: boolean };
 
-/** Recover complete fields when a tool summary ends in the middle of JSON. */
-function parsePartialJsonContainer(text: string): unknown | undefined {
+/** Recover complete fields when a tool summary ends in the middle of JSON.
+ * Image-service envelopes can also retain partial text, including an inner
+ * JSON string. Other tools keep the conservative complete-field behavior. */
+export function parsePartialJsonContainer(text: string, keepPartialStrings = false): unknown | undefined {
   const source = text.trim();
-  if (!source.startsWith("{") && !source.startsWith("[")) return undefined;
+  if (!source.startsWith("{") && !source.startsWith("[") && !(keepPartialStrings && source.startsWith('"'))) return undefined;
   let index = 0;
   const skipWhitespace = () => { while (/\s/.test(source[index] ?? "")) index++; };
   const hasMembers = (value: unknown) =>
-    Array.isArray(value) ? value.length > 0 : !!value && typeof value === "object" && Object.keys(value).length > 0;
+    Array.isArray(value) ? value.length > 0 : keepPartialStrings && typeof value === "string" ? value.length > 0
+      : !!value && typeof value === "object" && Object.keys(value).length > 0;
 
   function parseString(): PartialJsonResult | undefined {
     if (source[index] !== '"') return undefined;

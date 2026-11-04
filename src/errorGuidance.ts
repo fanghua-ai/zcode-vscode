@@ -3,6 +3,11 @@ export const COMMUNITY_URL = "https://marketplace.visualstudio.com/items?itemNam
 export type RecoveryAction = "pickModel" | "retry" | "binaryPath" | "nodePath";
 export interface ErrorGuidance { category: string; title: string; hint: string; action: RecoveryAction; label: string }
 export function errorGuidance(message: string): ErrorGuidance {
+  // Explicit RPC schema failures take precedence over field names such as apiKey or quota.
+  if (/\bZCode error -3260[12]\b|unrecognized key|method not found|unknown method|schema mismatch|协议.*不匹配|版本.*不支持/i.test(message)) return {
+    category:"compatibility", title:"当前版本可能不支持这项操作", action:"retry", label:"重新连接",
+    hint:"ZCode 服务端未识别这项请求，或请求参数不符合要求。桌面端升级可能改变 app-server 协议，也可能是扩展发送的参数有误。本扩展支持桌面端 3.12.3–3.16.3；请核对桌面端与扩展版本后重新连接。仍有问题时，请复制诊断信息并反馈。",
+  };
   if (/zcode\.nodePath|Node\.js.*(?:not found|无法|不存在)|node runtime|spawn.*node.*ENOENT|运行时.*(?:不存在|无法启动)/i.test(message)) return {
     category:"runtime", title:"无法启动 ZCode 运行时", action:"nodePath", label:"设置运行时路径",
     hint:"请先更新 VS Code 并重新连接。若使用自定义 Node.js，在设置 zcode.nodePath 中填写 Node 可执行文件的完整路径。",
@@ -23,10 +28,6 @@ export function errorGuidance(message: string): ErrorGuidance {
     category:"model", title:"模型尚未准备好", action:"pickModel", label:"切换模型",
     hint:"请先重新选择一次模型后重试。若仍没有可用模型，请在桌面端确认模型能正常对话，再重新读取登录。",
   };
-  if (/schema|unsupported|not supported|Method not found|版本.*不支持|会话同步失败|无法安全写入 WAL/i.test(message)) return {
-    category:"compatibility", title:"当前版本可能不支持这项操作", action:"retry", label:"重新连接",
-    hint:"请确认扩展与 ZCode 桌面端版本兼容，更新后重新连接。仍有问题时可携带诊断信息到社区提问。",
-  };
   if (/ETIMEDOUT|ECONN|ENOTFOUND|fetch failed|network|timed? ?out|timeout|网络|超时|process exited|进程已退出|app-server.*退出/i.test(message)) return {
     category:"network", title:"暂时无法连接到 ZCode 或模型服务", action:"retry", label:"重新连接",
     hint:"请检查网络、代理和桌面端是否能正常对话，再重新连接后重试。",
@@ -35,8 +36,12 @@ export function errorGuidance(message: string): ErrorGuidance {
     category:"access", title:"当前文件或目录无法访问", action:"retry", label:"重新连接",
     hint:"请检查工作区、ZCode 安装目录和用户数据目录的读写权限，以及是否被安全软件拦截，处理后重试。",
   };
+  if (/会话同步失败|會話同步失敗|Session sync failed/i.test(message)) return {
+    category:"synchronization", title:"会话暂时未能同步", action:"retry", label:"重新连接",
+    hint:"请重新连接以恢复当前会话的聊天记录。若仍无法同步，请复制诊断信息并反馈。",
+  };
   return {
-    category:"general", title:"这次操作未能完成", action:"pickModel", label:"切换模型",
+    category:"general", title:"这次操作未能完成", action:"retry", label:"重新连接",
     hint:"请先重试。若是发送或模型初始化失败，可重新选择一次模型；仍失败时重新读取登录。问题持续时，可复制诊断信息到社区提问。",
   };
 }

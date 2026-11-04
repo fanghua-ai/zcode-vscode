@@ -1,5 +1,6 @@
 {
   "command.showChromeSettings.title": "ZCode: Open display settings",
+  "config.showSuppressedPluginSkills.description": "While those plugins are off, still list the document, PDF, presentation, spreadsheet, and browser skills in /. Choosing one does not send the skill. Enabling is remembered and later startups launch their MCP processes.",
   "command.setQuotaApiKey.title": "ZCode: Set quota API key",
   "config.quotaAdapters.description": "Optional read-only quota adapters for custom providers. Match providerId exactly. Use JSON Pointer paths such as /data/balance; secrets are stored with the Set quota API key command, never in settings. HTTPS is required except unauthenticated localhost HTTP.",
   "quotaAdapter.schemaVersion.description": "Optional adapter schema version. Omission means version 1; future versions will keep existing version 1 settings compatible.",
@@ -60,5 +61,10 @@
   "quotaAdapter.field.budgetLimitDivisor.description": "Optional positive divisor for the limit amount, for example 100 to convert cents to currency units.",
   "quotaAdapter.field.budgetUsedPath.description": "JSON Pointer to the used amount. For multiple requests, start with the request id, for example /usage/total.",
   "quotaAdapter.field.budgetUsedDivisor.description": "Divide the used amount by this value before subtraction, for example 100 when the API reports cents and the limit is in dollars.",
-  "capabilities.untrustedWorkspaces.description": "ZCode Chat starts a local ZCode process, so it only runs in trusted workspaces."
+  "capabilities.untrustedWorkspaces.description": "ZCode Chat starts a local ZCode process, so it only runs in trusted workspaces.",
+  "config.formulaFonts.description": "Download KaTeX fonts when a formula appears. auto asks beside the reply, on downloads and keeps the fonts, and off uses system fonts without asking.",
+  "config.formulaFonts.auto": "Ask beside a formula reply",
+  "config.formulaFonts.on": "Download and use formula fonts",
+  "config.formulaFonts.off": "Use system fonts without asking",
+  "config.allowedDesktopPlugins.description": "Plugins allowed in the extension. Desktop enablement still applies. Changes restart the current chat. Browser and computer use share the JavaScript REPL."
 }

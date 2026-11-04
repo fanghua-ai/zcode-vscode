@@ -20,14 +20,12 @@ try {
   const require = createRequire(import.meta.url);
   await build({ entryPoints: ["src/testSupport/handoffScenario.ts"], outfile: scenarioPath,
     bundle: true, platform: "node", format: "cjs",
-    external: [require.resolve("node-sqlite3-wasm")],
     plugins: baseline === undefined ? [] : [{ name: "baseline-client", setup(builder) {
       builder.onLoad({ filter: /[\\/]zcodeClient\.ts$/ }, () => ({
         contents: baseline, loader: "ts", resolveDir: path.resolve("src"),
       }));
     } }],
-    alias: { vscode: path.resolve("src/testSupport/vscode.ts"),
-      "node-sqlite3-wasm": require.resolve("node-sqlite3-wasm") },
+    alias: { vscode: path.resolve("src/testSupport/vscode.ts") },
   });
   const fixtureAt = process.argv.indexOf("--reasoning-fixture");
   const pasted = fixtureAt >= 0 ? await readFile(process.argv[fixtureAt + 1], "utf8") : undefined;
@@ -48,15 +46,18 @@ try {
   html = html.slice(0, scriptStart) + `<script nonce="${nonce}">
     window.sent=[];
     const frameTimers=new Map();let nextFrameId=0;
-    window.requestAnimationFrame=callback=>{const id=++nextFrameId;const timer=window.setTimeout(()=>{frameTimers.delete(id);callback(performance.now());},0);frameTimers.set(id,timer);return id;};
-    window.cancelAnimationFrame=id=>{const timer=frameTimers.get(id);if(timer!==undefined){window.clearTimeout(timer);frameTimers.delete(id);}};
+    window.requestAnimationFrame=callback=>{const id=++nextFrameId;const timer=window.setTimeout(()=>{frameTimers.delete(id);callback(performance.now());},0);frameTimers.set(id,{timer,callback});return id;};
+    window.cancelAnimationFrame=id=>{const frame=frameTimers.get(id);if(frame){window.clearTimeout(frame.timer);frameTimers.delete(id);}};
+    window.flushTestFrames=()=>{for(const [id,frame] of [...frameTimers]){if(!frameTimers.has(id))continue;window.clearTimeout(frame.timer);frameTimers.delete(id);frame.callback(performance.now());}};
     window.workbarBackendHistory=${JSON.stringify(workbarBackendHistory).replace(/</g, "\\u003c")};
     window.acquireVsCodeApi=()=>({postMessage:msg=>window.sent.push(msg),getState:()=>window.savedState,setState:state=>{window.savedState=state}});
   </script>` + html.slice(scriptStart);
   html = html.replace("</body>", () => `<script nonce="${nonce}">
   try {
     const check=(condition,message)=>{if(!condition)throw new Error(message)};
-    const emit=data=>window.dispatchEvent(new MessageEvent('message',{data}));
+    // Existing scenarios inspect already painted UI. Frame scheduling has its
+    // own controlled/native browser-streaming regression suite.
+    const emit=data=>{window.dispatchEvent(new MessageEvent('message',{data}));if(data.type==='assistant_text_delta')window.flushTestFrames();};
     emit({type:'session_ready',sessionId:'A',title:'Test',viewGen:1});
     const quoted='say "hello"';
     emit({type:'user_input_request',requestId:'multi',questions:[{
@@ -206,7 +207,7 @@ try {
     emit({type:'ui_language',language:'en',setting:'en'});
     check(document.documentElement.lang === 'en','document language did not change');
     check(document.getElementById('language-label').textContent === 'Interface language','language label was not translated');
-    check(document.getElementById('input').placeholder === 'Ask ZCode, @ to add context, / to choose capabilities','composer placeholder was not translated');
+    check(document.getElementById('input').placeholder === 'Ask ZCode, @ to add context, / to choose commands or capabilities','composer placeholder was not translated');
     check(document.getElementById('conn-label').textContent === 'Stopped','existing status was not translated');
     check(messages.querySelector('.work-fold-label')?.textContent === 'Worked 1m 5s','work fold did not change language');
     check(permissionTitle.textContent===literalTool+' requires approval','dynamic permission label was reverse-matched or untranslated');
@@ -283,12 +284,15 @@ try {
     document.body.setAttribute('data-smoke','passed');
   } catch(error) {
     document.body.setAttribute('data-smoke','failed');
+    document.body.setAttribute('data-smoke-error', String(error.stack));
     const errorReport=document.createElement('pre');
     errorReport.id='smoke-error';errorReport.textContent=String(error.stack);document.body.append(errorReport);
   }
   </script></body>`);
   const regressions = await readFile(new URL("./browser-regression-cases.js", import.meta.url), "utf8");
-  html = html.replace("</body>", () => `<script nonce="${nonce}">${regressions.replaceAll("</script>", "<\\/script>")}</script></body>`);
+  const mathFontFixture = pathToFileURL(path.resolve("node_modules/katex/dist/fonts/KaTeX_Main-Regular.woff2")).href;
+  const truncatedImageFixture = await readFile("src/testFixtures/image-analysis-truncated.txt", "utf8");
+  html = html.replace("</body>", () => `<script nonce="${nonce}">const mathFontFixture=${JSON.stringify(mathFontFixture)};const truncatedImageFixture=${JSON.stringify(truncatedImageFixture).replaceAll("<", "\\u003c")};\n${regressions.replaceAll("</script>", "<\\/script>")}</script></body>`);
   const file = path.join(root, "test.html");
   await writeFile(file, html);
   const result = spawnSync(process.env.CHROME_BIN || "google-chrome", [

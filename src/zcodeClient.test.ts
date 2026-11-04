@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { ChildProcess } from "child_process";
 import test, { type TestContext } from "node:test";
 import * as fs from "fs";
 import * as path from "path";
@@ -32,11 +33,11 @@ interface Internals {
   historyCache: { sessionId: string; items: HistoryItem[] } | null;
   pendingPermissions: Map<string, PermissionRequest>;
   pendingUserInputs: Map<string, UserInputRequest>;
-  sendRequest: (method: string, params?: unknown) => Promise<unknown>;
+  sendRequest: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
   write: (message: unknown) => void;
   afterSessionAttached: () => Promise<void>;
   adoptResumedModel: () => Promise<void>;
-  ensureSessionModel: () => Promise<void>;
+  ensureSessionModel: (snapshot?: unknown) => Promise<void>;
   handleSessionEvent: (event: unknown) => void;
   handleConversationFrame: (event: unknown) => void;
   handleStateUpdated: (event: unknown) => void;
@@ -68,6 +69,46 @@ function isolatedHome(t: TestContext): string {
   t.after(() => { os.homedir = originalHome; fs.rmSync(root, { recursive: true, force: true }); });
   return root;
 }
+
+test("a late skill catalog response does not replace a newer refresh", async () => {
+  const { client, state, events } = fixture();
+  const requests: Array<(value: unknown) => void> = [];
+  state.sendRequest = async () => new Promise(resolve => requests.push(resolve));
+  try {
+    client.refreshSkillCatalog();
+    client.refreshSkillCatalog();
+    requests[1]({ skills: [{ name: "new", description: "", path: "/new/SKILL.md" }] });
+    await new Promise(resolve => setImmediate(resolve));
+    requests[0]({ skills: [{ name: "old", description: "", path: "/old/SKILL.md" }] });
+    await new Promise(resolve => setImmediate(resolve));
+    const catalogs = events.filter(event => event.type === "skill_catalog");
+    assert.equal(catalogs.length, 1);
+    assert.equal((catalogs[0].data as { skills: Array<{ name: string }> }).skills[0].name, "new");
+  } finally { client.dispose(); }
+});
+
+test("subagent suggestions use the active session plugin catalog", { timeout: 3000 }, async () => {
+  let publish!: (event: ZCodeEvent) => void;
+  const complete = new Promise<ZCodeEvent>(resolve => { publish = resolve; });
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", onEvent: event => {
+    const data = event.data as { agents?: Array<{ name: string }> };
+    if (event.type === "subagent_catalog" && data.agents?.some(agent => agent.name === "demo:reviewer")) publish(event);
+  } });
+  const state = client as unknown as Internals;
+  state.sessionId = "A";
+  state.sendRequest = async (method, params) => {
+    assert.equal(method, "plugins/referenceCatalog");
+    assert.equal((params as { sessionId: string }).sessionId, "A");
+    return { plugins: [{ enabled: true, subagentNames: ["demo:reviewer"] }] };
+  };
+  client.refreshSubagentCatalog();
+  const event = await complete;
+  const data = event.data as { sessionId: string; agents: Array<{ name: string }> };
+  assert.equal(data.sessionId, "A");
+  assert.ok(data.agents.some(agent => agent.name === "reviewer"));
+  assert.ok(data.agents.some(agent => agent.name === "Explore"));
+  client.dispose();
+});
 
 test("an explicitly disabled session model cannot fall back to a stale CLI provider key", async t => {
   const root = isolatedHome(t);
@@ -328,6 +369,112 @@ test("configured provider quota is used by exact provider id and falls back to Z
   assert.deepEqual(customCalls, ["private-provider", "private-provider", "another-provider"]);
   assert.equal(planCalls, 2);
   client.dispose();
+});
+
+test("startup waits once for a cold plugin scan and does not queue another resume", async () => {
+  const { client, state } = fixture();
+  const resumed: string[] = [];
+  const timeouts: number[] = [];
+  client.listSessions = async () => [
+    { sessionId: "REMEMBERED", title: "remembered", updatedAt: 3 },
+    { sessionId: "OTHER", title: "other", updatedAt: 2 },
+  ];
+  client.resumeSession = async (id: string, _known?: unknown, timeoutMs = 30000) => {
+    resumed.push(id);
+    timeouts.push(timeoutMs);
+    if (id === "REMEMBERED") throw new Error(`Request session/resume timed out after ${timeoutMs}ms`);
+    state.sessionId = id;
+  };
+  await state.openStartupSession({
+    chooseResume: (listed, rejected) => rejected.has("REMEMBERED")
+      ? listed.find((session) => session.sessionId === "OTHER")?.sessionId
+      : "REMEMBERED",
+  });
+  assert.deepEqual(resumed, ["REMEMBERED", "OTHER"]);
+  assert.deepEqual(timeouts, [90000, 90000]);
+  assert.equal(state.sessionId, "OTHER");
+});
+
+test("a session list waits out an in-flight resume before using its normal deadline", async () => {
+  const { client, state } = fixture();
+  const resume = deferred<unknown>();
+  const methods: string[] = [];
+  const timeouts: number[] = [];
+  state.afterSessionAttached = async () => {};
+  state.adoptResumedModel = async () => {};
+  state.sendRequest = async (method, _params, timeoutMs) => {
+    methods.push(method);
+    if (method === "session/list") timeouts.push(timeoutMs ?? 0);
+    if (method === "session/resume") return resume.promise;
+    return { sessions: [] };
+  };
+  const restoring = client.resumeSession("B", { sessionId: "B", title: "B", updatedAt: 1 });
+  for (let i = 0; i < 20 && !methods.includes("session/resume"); i++) await tick();
+  await client.listSessions();
+  assert.deepEqual(timeouts, [90000]);
+  resume.resolve({});
+  await restoring;
+  timeouts.length = 0;
+  await client.listSessions();
+  assert.deepEqual(timeouts, [20000]);
+  client.dispose();
+});
+
+test("a timed-out resume keeps later session lists waiting until the server replies", async () => {
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", onEvent: () => {} });
+  const state = client as unknown as {
+    write: (msg: { id: number; method: string; params?: { timeout?: number } }) => void;
+    sendRequest: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
+    handleLine: (line: string) => void;
+  };
+  const written: Array<{ id: number; method: string }> = [];
+  const listTimeouts: number[] = [];
+  const sendRequest = state.sendRequest.bind(client);
+  state.write = (msg) => { written.push(msg); };
+  try {
+    await assert.rejects(sendRequest("session/resume", { sessionId: "A" }, 5), /timed out after 5ms/);
+    state.sendRequest = async (method, _params, timeoutMs) => {
+      if (method === "session/list") listTimeouts.push(timeoutMs ?? 0);
+      return { sessions: [] };
+    };
+    await client.listSessions();
+    // A late reply for the abandoned id means the server queue has moved on.
+    state.handleLine(JSON.stringify({ id: written[0].id, result: {} }));
+    await client.listSessions();
+    assert.deepEqual(listTimeouts, [90000, 20000]);
+  } finally {
+    client.dispose();
+  }
+});
+
+test("a read during resume does not query a session the server has not activated", async () => {
+  const { client, state } = fixture();
+  const resume = deferred<unknown>();
+  const methods: string[] = [];
+  state.afterSessionAttached = async () => {};
+  state.adoptResumedModel = async () => {};
+  state.sendRequest = async (method) => {
+    methods.push(method);
+    if (method === "session/resume") return resume.promise;
+    if (method === "session/list") return { sessions: [] };
+    return {};
+  };
+  const switching = client.switchSession("B");
+  for (let i = 0; i < 10 && !methods.includes("session/resume"); i++) await tick();
+  await client.emitSessionControls();
+  assert.equal(methods.includes("session/read"), false);
+  resume.resolve({});
+  await switching;
+  methods.length = 0;
+  state.sendRequest = async (method) => {
+    methods.push(method);
+    return {
+      session: { model: { providerId: "p", modelId: "m" } },
+      settings: { mode: { current: "build" }, permission: { mode: "build" }, thoughtLevel: { enabled: false } },
+    };
+  };
+  await client.emitSessionControls();
+  assert.ok(methods.includes("session/read"));
 });
 
 test("startup follows the filtered choice and does not resume a stale first row", async () => {
@@ -842,6 +989,83 @@ test("restored work folds receive the desktop active duration instead of elapsed
   } finally { client.dispose(); }
 });
 
+test("running turn timing updates preserve streamed text events", async () => {
+  const { client, state, events } = fixture();
+  const frame = (fromSeq: number, toSeq: number, payload: unknown) => ({
+    topic: "conversation/A", subscriptionId: "running-header", fromSeq, toSeq, payload,
+  });
+  state.sendRequest = async method => {
+    if (method === "v4/conversation/subscribe") {
+      state.handleConversationFrame(frame(0, 1, { kind: "snapshot", snapshot: {
+        logEpoch: "epoch", seq: 1, control: { phase: "running" }, rows: { window: [
+          { rowId: 1, kind: "turnHeader", turnId: "turn", state: "running", activeMs: 10 },
+          { rowId: 2, kind: "userInput", turnId: "turn", entityId: "question", origin: "realUser", text: "问题" },
+          { rowId: 3, kind: "assistantText", turnId: "turn", text: "起", state: "streaming" },
+        ] },
+      } }));
+      return { ack: { subscriptionId: "running-header", logEpoch: "epoch" } };
+    }
+    return {};
+  };
+  try {
+    await client.prepareViewChange();
+    await state.subscribeConversation();
+    client.endViewChange();
+    events.length = 0;
+    state.handleConversationFrame(frame(1, 2, { kind: "deltas", deltas: [
+      { op: "row.upserted", row: { rowId: 1, kind: "turnHeader", turnId: "turn", state: "running", activeMs: 20 } },
+      { op: "row.upserted", row: { rowId: 3, kind: "assistantText", turnId: "turn", text: "起始", state: "streaming" } },
+    ] }));
+    assert.ok(events.some(event => event.type === "assistant_text_delta" && (event.data as { fullText?: string }).fullText === "起始"));
+    assert.ok(!events.some(event => event.type === "transcript_sync"));
+  } finally { client.dispose(); }
+});
+
+test("a late completed turn header republishes the transcript with its work duration", async () => {
+  const { client, state, events } = fixture();
+  const frame = (fromSeq: number, toSeq: number, payload: unknown) => ({
+    topic: "conversation/A", subscriptionId: "late-header", fromSeq, toSeq, payload,
+  });
+  state.sendRequest = async method => {
+    if (method === "v4/conversation/subscribe") {
+      state.handleConversationFrame(frame(0, 1, { kind: "snapshot", snapshot: {
+        logEpoch: "epoch", seq: 1, rows: { window: [
+          { rowId: 2, kind: "userInput", turnId: "turn", entityId: "question", origin: "realUser", text: "问题" },
+          { rowId: 3, kind: "reasoning", turnId: "turn", text: "思考", state: "complete" },
+        ] },
+      } }));
+      return { ack: { subscriptionId: "late-header", logEpoch: "epoch" } };
+    }
+    return {};
+  };
+  try {
+    await client.prepareViewChange();
+    await state.subscribeConversation();
+    client.endViewChange();
+    const before = events.filter(event => event.type === "transcript_sync").length;
+    state.handleConversationFrame(frame(1, 2, { kind: "deltas", deltas: [
+      { op: "row.appended", row: { rowId: 1, kind: "turnHeader", turnId: "turn", state: "completedSuccess",
+        startedAt: 1000, endedAt: 121000, activeMs: 65000 } },
+    ] }));
+    const updates = events.filter(event => event.type === "transcript_sync").slice(before);
+    assert.equal(updates.length, 1, "completed timing update did not redraw history");
+    const items = (updates[0].data as { items?: HistoryItem[] }).items ?? [];
+    const work = items.find(item => item.role === "assistant");
+    assert.equal(work?.workDurationMs, 65000);
+    assert.equal(work?.endedAt, 121000);
+
+    const beforeCorrection = events.filter(event => event.type === "transcript_sync").length;
+    state.handleConversationFrame(frame(2, 3, { kind: "deltas", deltas: [
+      { op: "row.upserted", row: { rowId: 1, kind: "turnHeader", turnId: "turn", state: "completedSuccess",
+        startedAt: 1000, endedAt: 126000, activeMs: 70000 } },
+    ] }));
+    const corrections = events.filter(event => event.type === "transcript_sync").slice(beforeCorrection);
+    assert.equal(corrections.length, 1, "corrected turn timing did not redraw history");
+    const corrected = (corrections[0].data as { items?: HistoryItem[] }).items ?? [];
+    assert.equal(corrected.find(item => item.role === "assistant")?.workDurationMs, 70000);
+  } finally { client.dispose(); }
+});
+
 test("a failed switch does not block the next switch", async () => {
   const { client, state } = fixture();
   state.afterSessionAttached = async () => {};
@@ -855,6 +1079,71 @@ test("a failed switch does not block the next switch", async () => {
   await assert.rejects(bad, /missing/);
   await good;
   assert.equal(client.currentSessionId, "B");
+});
+
+test("a timed-out switch can be retried for the same session", async () => {
+  const { client, state } = fixture();
+  let attempts = 0;
+  state.afterSessionAttached = async () => {};
+  state.adoptResumedModel = async () => {};
+  state.sendRequest = async (method, _params, timeoutMs) => {
+    if (method === "session/resume") {
+      attempts++;
+      if (attempts === 1) throw new Error(`Request session/resume timed out after ${timeoutMs}ms`);
+      return {};
+    }
+    return { sessions: [], messages: [] };
+  };
+  await assert.rejects(client.switchSession("B"), /timed out/);
+  assert.equal(client.currentSessionId, "B");
+  assert.equal(client.sessionAttached, false);
+  await client.switchSession("B");
+  assert.equal(attempts, 2);
+  assert.equal(client.currentSessionId, "B");
+  assert.equal(client.sessionAttached, true);
+});
+
+test("a conversation subscribe timeout keeps the resumed session readable and retryable", async () => {
+  const { client, state } = fixture();
+  let conversationSubscribes = 0;
+  const settings = {
+    model: { current: { providerId: "p", modelId: "m" } },
+    mode: { current: "build" },
+    permission: { mode: "build" },
+    thoughtLevel: { enabled: false },
+  };
+  state.sendRequest = async (method, params) => {
+    if (method === "session/list") return { sessions: [] };
+    if (method === "session/resume") return {};
+    if (method === "session/subscribe") {
+      return { snapshot: { session: { sessionId: "B", title: "B", model: settings.model.current }, settings } };
+    }
+    if (method === "session/read") {
+      return { session: { sessionId: "B", title: "B", model: settings.model.current }, settings };
+    }
+    if (method === "v4/conversation/subscribe") {
+      conversationSubscribes++;
+      if (conversationSubscribes === 1) throw new Error("Request v4/conversation/subscribe timed out after 30000ms");
+      const topic = (params as { topic?: string } | undefined)?.topic ?? "conversation/B";
+      state.handleConversationFrame({
+        topic, subscriptionId: "retry-sub", fromSeq: 0, toSeq: 1,
+        payload: { kind: "snapshot", snapshot: { logEpoch: "epoch", seq: 1, rows: { window: [] } } },
+      });
+      return { ack: { subscriptionId: "retry-sub", logEpoch: "epoch" } };
+    }
+    return {};
+  };
+  try {
+    await assert.rejects(client.switchSession("B"), /v4\/conversation\/subscribe timed out/);
+    assert.equal(client.currentSessionId, "B");
+    assert.equal((client as unknown as { sessionReadable: boolean }).sessionReadable, true);
+    assert.equal(client.sessionAttached, false);
+    assert.equal(client.diagnosticSummary().sessionAttached, false);
+    await client.switchSession("B");
+    assert.equal(conversationSubscribes, 2);
+    assert.equal(client.currentSessionId, "B");
+    assert.equal(client.sessionAttached, true);
+  } finally { client.dispose(); }
 });
 
 test("sanitized backend snapshot hides runtime inputs so they cannot split a workbar", async () => {
@@ -913,7 +1202,7 @@ test("session_ready carries the snapshot's builtin and custom slash commands", a
     return { sessions: [], messages: [] };
   };
   try {
-    await client.start({ createNew: true });
+    await state.createSession(true);
     const ready = events.find(event => event.type === "session_ready");
     assert.deepEqual(client.confirmedModel(), { providerId: "test-provider", modelId: "test-model" });
     assert.deepEqual((ready?.data as { slashCommands?: unknown }).slashCommands, [
@@ -921,6 +1210,85 @@ test("session_ready carries the snapshot's builtin and custom slash commands", a
       { name: "my-report", description: "Custom user command.", inputHint: "/my-report [args]" },
     ]);
   } finally { client.dispose(); }
+});
+
+function acceptSpawnedSession(state: Internals): void {
+  const coldSnapshot = { session: {}, settings: { model: { available: [] } } };
+  state.sendRequest = async (method: string) => {
+    if (method === "session/create") { state.sessionId = "NEW"; return {}; }
+    if (method === "session/read") return coldSnapshot;
+    if (method === "v4/conversation/subscribe") {
+      state.handleConversationFrame({ topic: "conversation/NEW", subscriptionId: "conv", fromSeq: 0, toSeq: 1,
+        payload: { kind: "snapshot", snapshot: { logEpoch: "epoch", seq: 1, rows: { window: [] } } } });
+      return { ack: { subscriptionId: "conv" } };
+    }
+    if (method === "session/subscribe") return { snapshot: coldSnapshot };
+    return {};
+  };
+}
+
+test("dispose does not signal a child that failed to start", async () => {
+  const { client, state } = fixture();
+  acceptSpawnedSession(state);
+  const kills: Array<NodeJS.Signals | number | undefined> = [];
+  let proc: ChildProcess | null = null;
+  try {
+    await client.start({ createNew: true });
+    proc = (client as unknown as { proc: ChildProcess | null }).proc;
+    assert.ok(proc, "startup must retain the child until dispose");
+    assert.equal(proc.pid, undefined);
+    // A failed spawn still has a live handle. Calling the real kill() here can
+    // signal pid 0 and terminate the test process group.
+    proc.kill = (signal) => {
+      kills.push(signal);
+      return true;
+    };
+    client.dispose();
+    assert.deepEqual(kills, []);
+  } finally {
+    const current = (client as unknown as { proc: ChildProcess | null }).proc ?? proc;
+    if (current) current.kill = () => true;
+    client.dispose();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+});
+
+test("dispose terminates a running app-server", async (t) => {
+  const os = require("os") as typeof import("os");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-client-dispose-"));
+  const script = path.join(root, "stay-alive.js");
+  fs.writeFileSync(script, "setInterval(() => {}, 1000);\n");
+  let client: ZCodeClient | undefined;
+  let proc: ChildProcess | null = null;
+  t.after(() => {
+    const live = proc ?? (client as unknown as { proc?: ChildProcess | null } | undefined)?.proc ?? null;
+    if (live && live.exitCode === null && live.signalCode === null) {
+      try { ChildProcess.prototype.kill.call(live, "SIGKILL"); } catch { /* already exited */ }
+    }
+    client?.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  client = new ZCodeClient({ binaryPath: script, workspacePath: root, onEvent: () => undefined });
+  const state = client as unknown as Internals;
+  acceptSpawnedSession(state);
+  await client.start({ createNew: true });
+  proc = (client as unknown as { proc: ChildProcess | null }).proc;
+  assert.ok(proc?.pid && proc.pid > 0);
+  const signals: Array<NodeJS.Signals | number | undefined> = [];
+  const kill = proc.kill.bind(proc);
+  proc.kill = (signal) => {
+    signals.push(signal);
+    return kill(signal);
+  };
+  client.dispose();
+  assert.deepEqual(signals, ["SIGTERM"]);
+  if (proc.exitCode === null && proc.signalCode === null) {
+    await Promise.race([
+      new Promise<void>((resolve) => proc!.once("exit", resolve)),
+      new Promise<void>((resolve) => setTimeout(resolve, 1000)),
+    ]);
+  }
+  assert.equal(proc.signalCode, "SIGTERM");
 });
 
 test("stopping A leaves B's permission and input requests pending", async () => {
@@ -1348,6 +1716,52 @@ test("fresh snapshot settings skip another session read", async () => {
   client.dispose();
 });
 
+test("startup consumes an explicit model catalog once and never reuses it across session generations", async () => {
+  const { client, state } = fixture();
+  const internal = client as unknown as { noteSnapshotCompleteness: (snapshot: unknown) => void };
+  let reads = 0;
+  state.sendRequest = async () => { reads++; return { settings: { model: { available: [] } } }; };
+  const snapshot = { session: { model: { providerId: "test", modelId: "one" } },
+    settings: { model: { available: [{ ref: { providerId: "test", modelId: "one" }, disabledReason: "disabled" }] } } };
+  try {
+    internal.noteSnapshotCompleteness(snapshot);
+    const models = await client.readAvailableModels(true);
+    assert.equal(reads, 0);
+    assert.equal(models.available[0].disabledReason, "disabled");
+    await client.readAvailableModels(true);
+    assert.equal(reads, 1, "the snapshot catalog is only a one-shot startup optimization");
+    internal.noteSnapshotCompleteness(snapshot);
+    state.sessionGeneration++;
+    await client.readAvailableModels(true);
+    assert.equal(reads, 2, "a changed session generation invalidates the catalog");
+    internal.noteSnapshotCompleteness(snapshot);
+    await client.readAvailableModels();
+    assert.equal(reads, 3, "an explicit model refresh still queries the backend");
+    internal.noteSnapshotCompleteness({ settings: { model: { available: [] } } });
+    assert.deepEqual((await client.readAvailableModels(true)).available, []);
+    assert.equal(reads, 3, "an explicitly empty catalog is authoritative too");
+  } finally { client.dispose(); }
+});
+
+test("initial quota refresh starts only after conversation subscription completes", async () => {
+  const { client, state } = fixture();
+  const subscribed = deferred<void>();
+  const order: string[] = [];
+  const internal = client as unknown as { startPlanQuota: () => void; ensureSessionModel: () => Promise<void> };
+  state.sendRequest = async () => ({});
+  internal.ensureSessionModel = async () => {};
+  internal.startPlanQuota = () => { order.push("quota"); };
+  state.subscribeConversation = async () => { order.push("subscribe"); await subscribed.promise; };
+  try {
+    const attached = state.afterSessionAttached();
+    for (let i = 0; i < 10 && !order.length; i++) await Promise.resolve();
+    assert.deepEqual(order, ["subscribe"]);
+    subscribed.resolve();
+    await attached;
+    assert.deepEqual(order, ["subscribe", "quota"]);
+  } finally { subscribed.resolve(); client.dispose(); }
+});
+
 test("late login resolution cannot overwrite runtime or emit model metadata after a switch", async () => {
   const events: ZCodeEvent[] = [];
   const response = deferred<null>();
@@ -1679,7 +2093,7 @@ for (const change of ["switch", "dispose", "snapshot"]) {
   });
 }
 
-test("Linux session listing makes one scoped request and excludes other workspace casing", async () => {
+test("session listing makes one scoped request and follows host workspace casing", async () => {
   const {client, state} = fixture();
   let calls = 0;
   state.sendRequest = async (method, params) => {
@@ -1690,8 +2104,100 @@ test("Linux session listing makes one scoped request and excludes other workspac
       {sessionId: "other", workspace: {workspacePath: "/Test"}},
     ]};
   };
-  assert.deepEqual((await client.listSessions(true)).map(s => s.sessionId), ["ours"]);
+  assert.deepEqual((await client.listSessions(true)).map(s => s.sessionId), process.platform === "win32" ? ["ours", "other"] : ["ours"]);
   assert.equal(calls, 1);
+});
+
+test("session pages expand past eighty entries and report whether the raw page is complete", async () => {
+  const { client, state } = fixture();
+  const all = Array.from({ length: 81 }, (_, index) => ({ sessionId: `session-${index}`, updatedAt: index }));
+  const limits: number[] = [];
+  state.sendRequest = async (method, params) => {
+    assert.equal(method, "session/list");
+    const { limit } = params as { limit: number };
+    limits.push(limit);
+    return { sessions: all.slice(0, limit) };
+  };
+  try {
+    const first = await client.listSessionsPage(true);
+    assert.equal(first.sessions.length, 80);
+    assert.equal(first.hasMore, true);
+    const expanded = await client.listSessionsPage(true, 160);
+    assert.equal(expanded.sessions.length, 81);
+    assert.equal(expanded.sessions[0].sessionId, "session-80");
+    assert.equal(expanded.hasMore, false);
+    assert.deepEqual(limits, [80, 160]);
+  } finally { client.dispose(); }
+});
+
+test("Windows page truncation survives deduplication across workspace path variants", t => {
+  const home = isolatedHome(t);
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  t.after(() => Object.defineProperty(process, "platform", descriptor));
+  const cliPath = path.join(home, ".zcode/cli/db/db.sqlite");
+  fs.mkdirSync(path.dirname(cliPath), { recursive: true });
+  const { DatabaseSync } = require("node:sqlite") as {
+    DatabaseSync: new (file: string) => { exec(sql: string): void; close(): void };
+  };
+  const db = new DatabaseSync(cliPath);
+  db.exec("CREATE TABLE session (directory TEXT); INSERT INTO session VALUES ('c:/work/')");
+  db.close();
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "C:\\Work", onEvent() {} });
+  const state = client as unknown as Internals;
+  let calls = 0;
+  state.sendRequest = async (method, params) => {
+    assert.equal(method, "session/list");
+    const request = params as { workspace: { workspacePath: string }; limit: number };
+    assert.equal(request.limit, 3); calls++;
+    return { sessions: Array.from({ length: 3 }, (_, index) => ({
+      sessionId: "same", updatedAt: index,
+      workspace: { workspacePath: request.workspace.workspacePath },
+    })) };
+  };
+  return client.listSessionsPage(true, 3).then(page => {
+    assert.equal(calls, 2);
+    assert.equal(page.sessions.length, 1);
+    assert.equal(page.sessions[0].updatedAt, 2);
+    assert.equal(page.hasMore, true);
+  }).finally(() => client.dispose());
+});
+
+test("session page compatibility fallback preserves the requested limit", async () => {
+  const { client, state } = fixture();
+  const requests: Array<{ limit: number; includeArchived?: boolean }> = [];
+  state.sendRequest = async (_method, params) => {
+    const request = params as { limit: number; includeArchived?: boolean };
+    requests.push(request);
+    if (Object.hasOwn(request, "includeArchived")) throw new Error('ZCode error -32602: Unrecognized key: "includeArchived"');
+    return { sessions: [{ sessionId: "active" }] };
+  };
+  try {
+    assert.equal((await client.listSessionsPage(true, 160)).hasMore, false);
+    await client.listSessionsPage(false, 320);
+    assert.deepEqual(requests.map(request => request.limit), [160, 160, 320]);
+    assert.equal(Object.hasOwn(requests[1], "includeArchived"), false);
+    assert.equal(Object.hasOwn(requests[2], "includeArchived"), false);
+  } finally { client.dispose(); }
+});
+
+test("a failed session page remains a failure rather than a complete empty page", async () => {
+  const { client, state } = fixture();
+  state.sendRequest = async () => { throw new Error("page unavailable"); };
+  try { await assert.rejects(client.listSessionsPage(true, 160), /page unavailable/); }
+  finally { client.dispose(); }
+});
+
+test("session pages reject invalid limits before making requests", async () => {
+  const { client, state } = fixture();
+  let calls = 0;
+  state.sendRequest = async () => { calls++; return {}; };
+  try {
+    for (const limit of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(client.listSessionsPage(true, limit), RangeError);
+    }
+    assert.equal(calls, 0);
+  } finally { client.dispose(); }
 });
 
 test("session listing retries without includeArchived on Desktop 3.16.2 and remembers the capability", async () => {
@@ -1848,7 +2354,7 @@ test("new-session defaults apply model before model-specific reasoning and befor
   });
   state.subscribeConversation = async () => {};
   state.sendRequest = async (method, params) => {
-    if (method === "session/create") { state.sessionId = "NEW_DEFAULTS"; return {}; }
+    if (method === "session/create") { assert.equal((params as { mode: string }).mode, "yolo", "create with the requested permission before indexing the empty identity"); state.sessionId = "NEW_DEFAULTS"; return {}; }
     if (method === "session/subscribe") return { snapshot: snapshot() };
     if (method === "session/read") return snapshot();
     if (method === "v4/command") {
@@ -2197,6 +2703,97 @@ test("settled startup login cannot reinstall its old key after invalidation", as
   } finally {client.dispose();}
 });
 
+for (const scenario of ["current", "advanced", "wrong-owner", "legacy", "partial"] as const) {
+  test(`initial model selection reuses only a current attached catalog (${scenario})`, async () => {
+    const validated: string[] = [];
+    const { client, state } = fixture(undefined, async model => {
+      validated.push(model.modelId);
+      return null;
+    });
+    state.lastRevision = 5;
+    const snapshot = {
+      session: { sessionId: "A" }, runtime: { stateRevision: 5 },
+      settings: { model: { available: [{ ref: { providerId: "prov", modelId: "attached" } }] } },
+    };
+    const supplied: unknown = scenario === "wrong-owner" ? { ...snapshot, session: { sessionId: "B" } }
+      : scenario === "legacy" ? { ...snapshot, runtime: {} }
+      : scenario === "partial" ? { ...snapshot, settings: {} } : snapshot;
+    if (scenario === "advanced") state.lastRevision = 6;
+    let reads = 0;
+    const selected: string[] = [];
+    state.sendRequest = async method => {
+      assert.equal(method, "session/read");
+      reads++;
+      return { settings: { model: { available: [{ ref: { providerId: "prov", modelId: "fresh" } }] } } };
+    };
+    state.setModel = async (_provider, model) => { selected.push(model); };
+    try {
+      await state.ensureSessionModel(supplied);
+      assert.equal(reads, scenario === "current" ? 0 : 1);
+      assert.deepEqual(selected, [scenario === "current" ? "attached" : "fresh"]);
+      assert.deepEqual(validated, selected, "reusing a catalog must still validate the desktop provider");
+    } finally { client.dispose(); }
+  });
+}
+
+test("resuming an unset model uses the subscribed catalog without another snapshot read", async () => {
+  const { client, state } = fixture();
+  const model = { providerId: "prov", modelId: "m1" };
+  const snapshot = { session: { sessionId: "A" }, runtime: { stateRevision: 5, eventSeq: 7 },
+    settings: { model: { available: [{ ref: model }] } } };
+  state.subscribeConversation = async () => {};
+  client.emitSessionControls = async () => client.confirmedControls();
+  const selected: string[] = [];
+  state.setModel = async (_provider, model) => { selected.push(model); state.liveModelReady = true; };
+  state.sendRequest = async method => {
+    if (method === "session/resume") return snapshot;
+    if (method === "session/subscribe") return { eventSeq: 7 };
+    if (method === "session/read") assert.fail("an unchanged attached catalog was read again");
+    return {};
+  };
+  try {
+    await client.resumeSession("A", { sessionId: "A", title: "Empty", updatedAt: 1 });
+    assert.deepEqual(selected, [model.modelId]);
+  } finally { client.dispose(); }
+});
+
+test("an attached catalog cannot revive a model rejected by the desktop inventory", async () => {
+  const { client, state } = fixture(undefined, async () => false);
+  state.lastRevision = 5;
+  const snapshot = { session: { sessionId: "A" }, runtime: { stateRevision: 5 },
+    settings: { model: { available: [{ ref: { providerId: "prov", modelId: "removed" } }] } } };
+  let reads = 0;
+  state.sendRequest = async method => {
+    assert.equal(method, "session/read", "a rejected model must not be selected");
+    reads++; return snapshot;
+  };
+  try {
+    await assert.rejects(() => state.ensureSessionModel(snapshot), /暂时没有可用的模型/);
+    assert.equal(reads, 1);
+    assert.equal(state.liveModelReady, false);
+  } finally { client.dispose(); }
+});
+
+test("an empty attached catalog refreshes when its configured default is no longer available", async () => {
+  const removed = { providerId: "removed", modelId: "old" };
+  const current = { providerId: "prov", modelId: "replacement" };
+  const { client, state } = fixture(removed, async model => model.providerId === "removed" ? false : null);
+  state.lastRevision = 5;
+  let reads = 0;
+  state.sendRequest = async method => {
+    assert.equal(method, "session/read"); reads++;
+    return { settings: { model: { available: [{ ref: current }] } } };
+  };
+  const selected: string[] = [];
+  state.setModel = async (_provider, model) => { selected.push(model); };
+  try {
+    await state.ensureSessionModel({ session: { sessionId: "A" }, runtime: { stateRevision: 5 },
+      settings: { model: { available: [] } } });
+    assert.equal(reads, 1);
+    assert.deepEqual(selected, [current.modelId]);
+  } finally { client.dispose(); }
+});
+
 test("partial subscribe settings still read the model-dependent reasoning controls", async () => {
   const {client,state}=fixture();let reads=0;
   state.subscribeConversation=async()=>{};state.alignAndEmitModel=async()=>{};
@@ -2417,5 +3014,56 @@ test("PAT-backed runtime always resolves request auth instead of freezing its st
     ]);
     await state.handleProviderRuntimeHeaders(3, { providerId: runtime.providerId, expectedAccountScope: "OTHER-ACCOUNT" });
     assert.equal(replies[2].result.requestAuth, undefined);
+  } finally { client.dispose(); }
+});
+
+
+test("permission changes serialize so a queued plan keeps the acknowledged base permission", async () => {
+  const { client, state } = fixture();
+  const response = deferred<unknown>();
+  const calls: string[] = [];
+  state.sendRequest = async (_method, params) => {
+    calls.push((params as { mode: string }).mode);
+    if (calls.length === 1) return response.promise;
+    return {};
+  };
+  try {
+    const first = client.setMode("edit");
+    const second = client.setMode("plan");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(calls, ["edit"]);
+    response.resolve({});
+    await Promise.all([first, second]);
+    assert.deepEqual(calls, ["edit", "plan"]);
+    assert.equal(client.confirmedControls().baseMode, "edit");
+    assert.equal(client.currentMode(), "plan");
+  } finally { client.dispose(); }
+});
+
+test("a rejected permission change does not block the next change", async () => {
+  const { client, state } = fixture();
+  let attempts = 0;
+  state.sendRequest = async () => { if (++attempts === 1) throw new Error("rejected"); return {}; };
+  try {
+    await assert.rejects(client.setMode("yolo"), /rejected/);
+    await client.setMode("edit");
+    assert.equal(client.currentMode(), "edit");
+  } finally { client.dispose(); }
+});
+
+
+test("the create response wins over a previous chat's late runtime-preferences identity", async () => {
+  const { client, state } = fixture();
+  state.sendRequest = async (method) => {
+    if (method === "session/create") {
+      state.sessionId = "PREVIOUS";
+      return { session: { sessionId: "CREATED" } };
+    }
+    return {};
+  };
+  (client as unknown as { afterSessionAttached: () => Promise<void> }).afterSessionAttached = async () => {};
+  try {
+    await client.newSession();
+    assert.equal(client.currentSessionId, "CREATED");
   } finally { client.dispose(); }
 });

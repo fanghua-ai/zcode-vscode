@@ -1,16 +1,37 @@
 (async()=>{
  // Timer-backed frames keep layout-dependent scenarios deterministic in virtual-time Chrome.
  window.auditFrameKeepAlive=setInterval(()=>{},50);
- const tests=[]; const emit=data=>window.dispatchEvent(new MessageEvent('message',{data}));
+ const tests=[]; const emit=data=>{window.dispatchEvent(new MessageEvent('message',{data}));if(data.type==='assistant_text_delta')window.flushTestFrames();};
  const activeCommandChip=()=>document.getElementById('active-command');
  const check=(c,m)=>{if(!c)throw new Error(m)};
  let auditAborted=false;
  const test=async(name,fn)=>{if(auditAborted){tests.push({name,pass:true,skipped:true});return;}document.body.dataset.auditTest=name;let timer;try{await Promise.race([Promise.resolve().then(fn),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('scenario timed out after 15 seconds')),15000);})]);tests.push({name,pass:true});}catch(e){const error=e instanceof Error?e.message:String(e);tests.push({name,pass:false,error});if(error.includes('scenario timed out'))auditAborted=true;}finally{clearTimeout(timer);}};
- let gen=100;const reset=(sessionId='A')=>{emit({type:'view_reset',clear:true,viewGen:++gen});emit({type:'session_ready',sessionId,viewGen:gen,title:'自定义会话头发发布'});emit({type:'history',sessionId,viewGen:gen,items:[]});emit({type:'stream_release'});document.getElementById('input').value='';document.getElementById('input').dispatchEvent(new Event('input'));document.querySelectorAll('#attachments .ctx-chip button').forEach(button=>button.click());document.getElementById('active-command')?.click();window.sent.length=0;};
+ let gen=100;const reset=(sessionId='A')=>{emit({type:'view_reset',clear:true,viewGen:++gen});emit({type:'session_ready',sessionId,viewGen:gen,title:'自定义会话头发发布'});emit({type:'history',sessionId,viewGen:gen,items:[]});emit({type:'stream_release'});document.getElementById('input').value='';document.getElementById('input').dispatchEvent(new Event('input'));document.querySelectorAll('#attachments .ctx-chip button, #selected-skills button').forEach(button=>button.click());document.getElementById('active-command')?.click();window.sent.length=0;};
  const input=document.getElementById('input');const sendBtn=document.getElementById('send-btn');const messages=document.getElementById('messages');const type=text=>{input.value=text;input.dispatchEvent(new Event('input'));};
 
 
 
+ await test('suppressed skill opens one host confirmation without a duplicate toast',()=>{
+  reset('plugin-confirm');
+  emit({type:'skill_catalog',sessionId:'plugin-confirm',skills:[{name:'docx',description:'Word',path:'zcode-desktop-plugin-skill:docx',gated:true}]});
+  input.focus();type('/docx');
+  const before=document.getElementById('toast').textContent;
+  input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(sent.filter(m=>m.type==='promptDesktopPluginSkill').length===1,'confirmation not requested exactly once');
+  check(document.getElementById('toast').textContent===before,'duplicate toast appeared');
+  check(!document.querySelector('#selected-skills button'),'suppressed skill was attached');
+ });
+ await test('plugin switches send individual choices and reflect confirmed allowlist',()=>{
+  reset('plugin-settings');
+  const boxes=[...document.querySelectorAll('[data-desktop-plugin]')];
+  check(boxes.length===7,'missing plugin controls');
+  emit({type:'desktop_plugins',allowed:['pdf']});
+  check(boxes.find(b=>b.dataset.desktopPlugin==='pdf').checked&&!boxes.find(b=>b.dataset.desktopPlugin==='documents').checked,'allowlist not reflected');
+  const word=boxes.find(b=>b.dataset.desktopPlugin==='documents');word.click();
+  check(sent.some(m=>m.type==='setDesktopPlugins'&&m.text==='documents'&&m.enabled===true),'Word did not send an individual choice');
+  emit({type:'desktop_plugins',allowed:[]});
+  check(boxes.every(b=>!b.checked),'confirmed state did not reset controls');
+ });
  await test('loading older history preserves the exact editor, selection and image edit state',()=>{
   reset();const images=[{ref:'original-one',fileName:'one.png',mime:'image/png',bytes:100},{ref:'original-two',fileName:'two.png',mime:'image/png',bytes:100}];
   const items=[{id:'preserved-editor-q',role:'user',text:'ORIGINAL_EDIT',attachments:images},{id:'preserved-editor-a',role:'assistant',text:'ORIGINAL_REPLY'}];
@@ -365,6 +386,11 @@
   const textBox=textRange.getBoundingClientRect();
   check(triple.textContent==='100'&&tripleFrame.borderRadius==='4px','three-digit marker did not keep its rounded rectangle');
   check(tripleBox.width>=textBox.width+8&&textBox.left>=tripleBox.left+2&&textBox.right<=tripleBox.right-2,'three-digit marker is clipped by its active frame');
+  for(const dot of [dots[0],dots[9],dots[99]]){
+   const box=dot.getBoundingClientRect(),number=dot.querySelector('span').getBoundingClientRect();
+   check(Math.abs((box.top+box.bottom-number.top-number.bottom)/2)<1,'question number is not vertically centered');
+   check(Math.abs((box.left+box.right-number.left-number.right)/2)<1,'question number is not horizontally centered');
+  }
  });
  await test('current question follows the topbar reading line after folding',async()=>{
   reset('rail-active-fold');
@@ -519,6 +545,13 @@
  await test('transcript redraw without an index keeps the existing question dots',()=>{reset('dots-keep');emit({type:'history',sessionId:'dots-keep',viewGen:gen,items:[{id:'keep-visible-q',role:'user',text:'KEEP_VISIBLE'}]});emit({type:'question_index',sessionId:'dots-keep',viewGen:gen,questions:[{id:'keep-older-q',text:'KEEP_OLDER'},{id:'keep-visible-q',text:'KEEP_VISIBLE'}]});const older=()=>[...document.querySelectorAll('.q-dot')].some(dot=>dot.dataset.preview==='KEEP_OLDER');check(older(),'fixture index missing');emit({type:'history',sessionId:'dots-keep',viewGen:gen,items:[{id:'keep-visible-q',role:'user',text:'KEEP_VISIBLE'},{id:'keep-a',role:'assistant',text:'KEEP_ANSWER'}]});check(older(),'transcript redraw dropped the older question dot');check(messages.textContent.includes('KEEP_ANSWER'),'redraw lost the new content');reset('dots-other');check(!older(),'question index survived a session reset');});
  await test('model errors provide recovery guidance and preserve untranslated original details',()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});const raw='No available model: 原始诊断 <img src=x onerror=alert(1)>';emit({type:'session_error',message:raw});const card=messages.querySelector('.message.error');check(card.querySelector('.err-guidance').textContent.includes('重新选择一次模型'),'no model recovery instructions');check(card.querySelector('details pre').textContent===raw&&!card.querySelector('details').open,'diagnostic changed or initially expanded');check(!card.querySelector('img'),'diagnostic became executable markup');card.querySelector('details').open=true;emit({type:'ui_language',language:'en',setting:'en'});check(card.querySelector('.err-title').textContent==='The model is not ready yet','title did not localize');check(!/[\u4e00-\u9fff]/.test(card.querySelector('.err-guidance').textContent),'English recovery hint contains Chinese');check(card.querySelector('details pre').textContent===raw&&card.querySelector('details').open,'language switch altered raw details or expansion');card.querySelector('[data-act="copyDiagnostics"]').click();card.querySelector('[data-act="community"]').click();check(sent.some(message=>message.type==='copyDiagnostics')&&sent.some(message=>message.type==='openCommunity'),'diagnostics or community action missing');card.querySelector('[data-act="pickModel"]').click();check(document.getElementById('popover').classList.contains('open'),'model recovery action did not open picker');});
  await test('custom installation and runtime failures expose exact settings actions',()=>{for(const [raw,setting] of [['找不到 ZCode app-server。请填写 zcode.binaryPath。','binaryPath'],['Cannot start node runtime; set zcode.nodePath','nodePath']]){reset();emit({type:'session_error',message:raw});const card=messages.querySelector('.message.error');check(card.querySelector('.err-guidance').textContent.includes('zcode.'+setting),'missing usable configuration instruction');card.querySelector('[data-act="'+setting+'"]').click();check(sent.some(message=>message.type==='openRecoverySettings'&&message.setting===setting),'settings action missing');check(!card.querySelector('[data-act="retryLast"]'),'empty session offered a phantom retry');}});
+ await test('session sync errors reconnect without asking users to change the model',()=>{
+  reset();type('Keep this draft');emit({type:'session_error',message:'Session sync failed: snapshot unavailable'});
+  const card=messages.querySelector('.message.error');check(card.querySelector('[data-act="retry"]'),'synchronization recovery does not offer reconnect');
+  check(!card.querySelector('[data-act="pickModel"]'),'synchronization error misleadingly suggests a model change');
+  card.querySelector('[data-act="retry"]').click();
+  check(sent.some(message=>message.type==='retry')&&input.value==='Keep this draft','reconnect action erased the draft or was not sent');
+ });
  await test('setup without usable credentials offers sign-in diagnostics and community recovery',()=>{reset();emit({type:'setup',reason:'No saved credentials',hint:'Original backend hint',picker:[]});const recovery=document.getElementById('setup-recovery');check(document.getElementById('setup-hint').textContent.length>20,'setup has no guidance');check(recovery.querySelector('details pre').textContent.includes('Original backend hint'),'setup lost original hint');recovery.querySelector('[data-act="community"]').click();recovery.querySelector('[data-act="copyDiagnostics"]').click();check(sent.some(message=>message.type==='openCommunity')&&sent.some(message=>message.type==='copyDiagnostics'),'setup recovery actions missing');recovery.querySelector('[data-act="retry"]').click();check(sent.some(message=>message.type==='retry'),'setup cannot reload sign-in');});
  await test('math renders securely outside code, updates after closure and loads bundled fonts',()=>{reset();emit({type:'assistant_text_delta',partId:'formula-stream',fullText:'Incomplete $x_1'});check(!messages.querySelector('.katex'),'unfinished formula rendered too early');const text=String.raw`Inline $x_1^2$ and \(\frac{1}{2}\).
 
@@ -530,7 +563,8 @@ Cost $3 and $5.
 
 $\unknownCommand{<script>}$
 
-$\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit({type:'assistant_text_delta',partId:'formula-stream',fullText:text});check(messages.querySelectorAll('.katex').length>=4,'expected four formulas or code/currency misclassified');check(messages.querySelector('math')&&messages.querySelector('.katex-html'),'sanitizer damaged math accessibility or visual markup');check(messages.querySelector('code').textContent==='$raw_code$','inline code changed');check(messages.textContent.includes('Cost $3 and $5.'),'prices converted to math');check(!messages.querySelector('img[src^="https:"]')&&!messages.querySelector('script'),'unsafe formula markup survived');const font=[...document.fonts].find(face=>face.family.replaceAll('"','')==='KaTeX_Main');check(font,'bundled math stylesheet has no font faces');const katex=messages.querySelector('.katex');check(getComputedStyle(katex).fontFamily.includes('KaTeX'),'math stylesheet missing');});
+$\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit({type:'assistant_text_delta',partId:'formula-stream',fullText:text});check(messages.querySelectorAll('.katex').length>=4,'expected four formulas or code/currency misclassified');check(messages.querySelector('math')&&messages.querySelector('.katex-html'),'sanitizer damaged math accessibility or visual markup');check(messages.querySelector('code').textContent==='$raw_code$','inline code changed');check(messages.textContent.includes('Cost $3 and $5.'),'prices converted to math');check(!messages.querySelector('img[src^="https:"]')&&!messages.querySelector('script'),'unsafe formula markup survived');check(![...document.fonts].some(face=>face.family.replaceAll('"','')==='KaTeX_Main'),'formula fonts are still bundled');const katex=messages.querySelector('.katex');check(getComputedStyle(katex).fontFamily.includes('KaTeX'),'math stylesheet missing');emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});emit({type:'status',sessionId:'A',status:'completedSuccess'});const hint=messages.querySelector('.math-font-hint');check(hint?.textContent==='美化公式','completed formula reply has no font hint');hint.click();check(sent.some(message=>message.type==='installMathFonts'),'font hint did not request the download');emit({type:'math_fonts',mode:'on',status:'downloading'});check(messages.querySelector('.math-font-hint')?.textContent==='正在下载','download state missing');check(messages.querySelector('.math-font-hint').disabled,'download hint stayed clickable');emit({type:'math_fonts',mode:'on',status:'ready',css:`@font-face{font-family:\"KaTeX_Main\";src:url(\"${mathFontFixture}\") format(\"woff2\");font-weight:400;font-style:normal;font-display:swap}`});check(!messages.querySelector('.math-font-hint'),'font hint stayed after fonts were ready');check(document.getElementById('math-font-faces')?.textContent.includes('KaTeX_Main'),'ready fonts were not applied');emit({type:'math_fonts',mode:'off',status:'disabled',css:''});check(!document.getElementById('math-font-faces'),'disabled formula fonts kept their stylesheet');});
+ await test('formula font hint stays on the latest formula reply',()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});emit({type:'math_fonts',mode:'auto',status:'absent'});emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'font-q1',role:'user',text:'FIRST_FORMULA'},{id:'font-a1',role:'assistant',text:'First $x$.'},{id:'font-q2',role:'user',text:'SECOND_PLAIN'},{id:'font-a2',role:'assistant',text:'No math here.'},{id:'font-q3',role:'user',text:'THIRD_FORMULA'},{id:'font-a3',role:'assistant',text:'Third $y$.'}]});const hints=[...messages.querySelectorAll('.math-font-hint')];check(hints.length===1,'expected one formula font hint');check(hints[0].closest('.reply-meta')?.dataset.copyText?.includes('Third'),'hint was not on the latest formula reply');emit({type:'math_fonts',mode:'off',status:'disabled'});check(!messages.querySelector('.math-font-hint'),'font hint remained after it was turned off');});
  await test('partial history never mounts a floating collapse button above its process',()=>{reset();emit({type:'history',sessionId:'A',viewGen:gen,truncated:true,items:[{id:'partial-work',role:'assistant',text:'PARTIAL_FINAL',steps:[{kind:'reasoning',text:'PARTIAL_WORK'},{kind:'text',text:'PARTIAL_FINAL'}]}]});check(messages.querySelector('.history-more'),'more history button missing');check(!messages.querySelector('.turn-collapse-btn'),'orphan collapse icon appears without question footer');emit({type:'historyOlder',sessionId:'A',viewGen:gen,more:false,items:[{id:'partial-root',role:'user',text:'PARTIAL_QUESTION'}]});check(messages.querySelector('.message.user + .msg-meta .turn-collapse-btn'),'actual question lost collapse action');});
  await test('long task pagination joins process blocks and every fold remains usable',()=>{reset();const row=(id,role,text,n,extra={})=>({id,role,text,rowId:n,logEpoch:'long-epoch',turnId:'long-task',...extra});emit({type:'history',sessionId:'A',viewGen:gen,truncated:true,items:[row('p3','assistant','FINAL_LONG_ANSWER',3,{steps:[{kind:'reasoning',text:'LAST_THOUGHT'},{kind:'text',text:'FINAL_LONG_ANSWER'}]})]});check(!messages.querySelector('.turn-hidden'),'partial task hidden without a question');messages.querySelector('.history-more').click();emit({type:'historyOlder',sessionId:'A',viewGen:gen,more:true,items:[row('p2','assistant','',2,{steps:[{kind:'reasoning',text:'MIDDLE_THOUGHT'}]})]});check(messages.querySelectorAll('.work-fold').length===1,'pagination split one task into duplicate work blocks');messages.querySelector('.history-more').click();emit({type:'historyOlder',sessionId:'A',viewGen:gen,more:false,items:[row('p1','user','LONG_TASK_QUESTION',1)]});const user=messages.querySelector('.message.user');user.nextElementSibling.querySelector('.turn-collapse-btn').click();check(messages.querySelectorAll('.turn-fold-bar').length===1,'stale fold bars survived loading');messages.querySelector('.turn-fold-bar').click();check(!messages.querySelector('.turn-hidden'),'fold cannot reopen after paging');emit({type:'history',sessionId:'A',viewGen:gen,truncated:true,items:[row('p3','assistant','UPDATED_FINAL_ANSWER',3,{steps:[{kind:'reasoning',text:'LAST_THOUGHT'},{kind:'text',text:'UPDATED_FINAL_ANSWER'}]})]});check(messages.textContent.includes('LONG_TASK_QUESTION')&&messages.textContent.includes('MIDDLE_THOUGHT'),'live snapshot erased loaded pages');check(!messages.querySelector('.history-more'),'completed pagination reset by limited snapshot');check(!messages.querySelector('.turn-hidden'),'open task reset after snapshot');emit({type:'history',sessionId:'A',viewGen:gen,truncated:true,items:[{id:'new-epoch-answer',role:'assistant',text:'NEW_EPOCH',rowId:3,logEpoch:'new-epoch',turnId:'new-task'}]});check(!messages.textContent.includes('LONG_TASK_QUESTION'),'new log epoch retained stale loaded pages');});
  await test('inserted prompt preserves chronology and charges task duration only once',()=>{reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'task-start',role:'user',turnId:'one-task',text:'TASK_START'},{id:'before-insert',role:'assistant',turnId:'one-task',text:'',createdAt:1000,endedAt:121000,workDurationMs:65000,steps:[{kind:'reasoning',text:'BEFORE_INSERT'}]},{id:'inserted-input',role:'user',turnId:'one-task',text:'INSERTED_INPUT'},{id:'after-insert',role:'assistant',turnId:'one-task',text:'FINAL_AFTER_INSERT',createdAt:1000,endedAt:121000,workDurationMs:65000,steps:[{kind:'reasoning',text:'AFTER_INSERT'},{kind:'text',text:'FINAL_AFTER_INSERT'},{kind:'reasoning',text:'TRAILING_SETTLING'}]}]});const folds=[...messages.querySelectorAll('.work-fold')];check(folds.filter(f=>f.dataset.durationMs==='65000').length===1,'task total repeated for inserted segments');check(folds.filter(f=>f.dataset.continuation==='1').length===2,'continuations presented as unrelated work totals');check(messages.textContent.indexOf('BEFORE_INSERT')<messages.textContent.indexOf('INSERTED_INPUT')&&messages.textContent.indexOf('INSERTED_INPUT')<messages.textContent.indexOf('AFTER_INSERT'),'insert chronology lost');messages.querySelector('.turn-collapse-btn').click();check(messages.querySelectorAll('.turn-fold-bar').length===1,'inserted message split one canonical task into independent rounds');messages.querySelector('.turn-fold-bar').click();check(!messages.querySelector('.turn-hidden'),'inserted task cannot reopen');});
@@ -627,6 +661,7 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
  await test('running history keeps an intermediate answer inside later thinking',()=>{reset();emit({type:'history',sessionId:'A',viewGen:gen,activeSince:Date.now()-4000,items:[{id:'mid-q',role:'user',text:'MID_Q'},{id:'mid-a',role:'assistant',turnId:'mid-task',text:'',running:true,steps:[{kind:'reasoning',text:'MID_ONE',partId:'mid-1'},{kind:'text',text:'MID_REPLY',partId:'mid-text'},{kind:'reasoning',text:'MID_TWO',partId:'mid-2'}]}]});const body=messages.querySelector('.work-fold-body');const order=[...body.children].map(node=>node.classList.contains('work-note')?node.textContent:node.classList.contains('message')?node.dataset.copyText:'');check(order.filter(Boolean).join('|')==='MID_ONE|MID_REPLY|MID_TWO','intermediate answer left the running fold');check(!messages.querySelector(':scope > .message.assistant'),'intermediate answer rendered below the fold');});
  await test('finishing history keeps the live work duration',()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});const started=Date.now()-12000;emit({type:'history',sessionId:'A',viewGen:gen,activeSince:started,items:[{id:'live-q',role:'user',text:'LIVE_Q'},{id:'live-thought',role:'assistant',turnId:'live-task',text:'',running:true,work:{text:'LIVE_THOUGHT'},steps:[{kind:'reasoning',text:'LIVE_THOUGHT'}]}]});emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'live-q',role:'user',text:'LIVE_Q'},{id:'live-thought',role:'assistant',turnId:'live-task',text:'',work:{text:'LIVE_THOUGHT'},steps:[{kind:'reasoning',text:'LIVE_THOUGHT'}]},{id:'live-answer',role:'assistant',turnId:'live-task',text:'LIVE_ANSWER',steps:[{kind:'text',text:'LIVE_ANSWER'}]}]});const label=messages.querySelector('.work-fold-label').textContent;check(label.startsWith('已工作 ')&&label!=='已工作','finished turn dropped the live duration');});
  await test('settled work keeps its duration when the completion redraw has no server time',()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});const started=Date.now()-12000;emit({type:'history',sessionId:'A',viewGen:gen,activeSince:started,items:[{id:'done-q',role:'user',text:'DONE_Q'},{id:'done-thought',role:'assistant',turnId:'done-task',text:'',running:true,work:{text:'DONE_THOUGHT'},steps:[{kind:'reasoning',text:'DONE_THOUGHT'}]}]});emit({type:'status',sessionId:'A',status:'completedSuccess'});const frozen=messages.querySelector('.work-fold').dataset.durationMs;check(!!frozen&&messages.querySelector('.work-fold-label').textContent.startsWith('已工作 '),'settle did not freeze the live duration');const finished=[{id:'done-q',role:'user',text:'DONE_Q'},{id:'done-thought',role:'assistant',turnId:'done-task',text:'',work:{text:'DONE_THOUGHT'},steps:[{kind:'reasoning',text:'DONE_THOUGHT'}]},{id:'done-answer',role:'assistant',turnId:'done-task',text:'DONE_ANSWER',steps:[{kind:'text',text:'DONE_ANSWER'}]}];emit({type:'history',sessionId:'A',viewGen:gen,items:finished});const fold=messages.querySelector('.work-fold');check(fold.dataset.durationMs===frozen&&fold.querySelector('.work-fold-label').textContent.startsWith('已工作 ')&&fold.querySelector('.work-fold-label').textContent!=='已工作','completion redraw dropped the settled duration');emit({type:'history',sessionId:'A',viewGen:gen,items:finished});check(messages.querySelector('.work-fold').dataset.durationMs===frozen,'later redraw grew the finished duration');});
+ await test('late turn timing refresh replaces the generic work label with elapsed time',()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});const initial=[{id:'late-q',role:'user',text:'LATE_Q'},{id:'late-work',role:'assistant',turnId:'late-turn',text:'',steps:[{kind:'reasoning',text:'LATE_THOUGHT'}]}];emit({type:'history',sessionId:'A',viewGen:gen,items:initial});check(messages.querySelector('.work-fold-label').textContent==='已工作','missing timing did not use the generic label');emit({type:'history',sessionId:'A',viewGen:gen,items:initial.map(item=>item.id==='late-work'?{...item,createdAt:1000,endedAt:121000,workDurationMs:65000}:item)});check(messages.querySelector('.work-fold-label').textContent==='已工作 1 分 5 秒','late turn timing was not rendered');});
  await test('work after an inserted prompt restarts its clock from the insert',()=>{
   reset();
   const T0=Date.now()-27*60000,T1=Date.now()-3*60000,T2=Date.now();
@@ -670,6 +705,18 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   const liveFold=messages.querySelector('.work-fold[data-state="running"]');
   check(liveFold&&Math.abs(Number(liveFold.dataset.startedAt)-T5)<4000,'live delta reset the clock past the insert: '+(liveFold?.dataset.startedAt??'none'));
  });
+ await test('slash keyboard navigation keeps the active entry visible without scrolling the chat',()=>{
+  reset('slash-keyboard');emit({type:'session_ready',sessionId:'slash-keyboard',viewGen:gen,slashCommands:[]});
+  emit({type:'skill_catalog',sessionId:'slash-keyboard',skills:Array.from({length:25},(_,index)=>({name:'skill-'+index,description:'A skill',path:'/skills/'+index+'/SKILL.md'}))});
+  input.focus();type('/$');const menu=document.getElementById('slash-menu'),chatScroll=messages.scrollTop;
+  const visible=()=>{const box=menu.getBoundingClientRect(),item=menu.querySelector('.slash-item.active').getBoundingClientRect();check(item.top>=box.top-1&&item.bottom<=box.bottom+1,'active slash option left the menu viewport');};
+  for(let i=0;i<20;i++){input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));visible();}
+  check(menu.scrollTop>0&&messages.scrollTop===chatScroll,'slash navigation scrolled the chat or failed to scroll the menu');
+  input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(document.querySelector('#selected-skills button')?.textContent.includes('skill-20'),'Enter chose a different visible skill');
+  type('/$');for(let i=0;i<20;i++)input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+  for(let i=0;i<20;i++){input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true,cancelable:true}));visible();}
+ });
  await test('slash menu reopens from a restored / draft on focus',()=>{
   reset('slash-refocus');
   emit({type:'session_ready',sessionId:'slash-refocus',viewGen:gen,title:'T',slashCommands:[{name:'goal',description:'goal',inputHint:'/goal [objective]'}]});
@@ -680,6 +727,105 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(!menu.classList.contains('open'),'blur did not close the menu');
   input.focus();
   check(menu.classList.contains('open'),'refocusing a / draft did not reopen the menu');
+ });
+ await test('catalog refresh preserves the highlighted slash item by identity',()=>{
+  reset('slash-refresh-selection');
+  emit({type:'session_ready',sessionId:'slash-refresh-selection',viewGen:gen,slashCommands:[]});
+  emit({type:'skill_catalog',sessionId:'slash-refresh-selection',skills:[{name:'alpha',description:'',path:'/alpha/SKILL.md'},{name:'beta',description:'',path:'/beta/SKILL.md'}]});
+  input.focus();type('/$');input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+  check(document.querySelector('#slash-menu .active .slash-name')?.textContent==='beta','beta was not highlighted');
+  emit({type:'skill_catalog',sessionId:'slash-refresh-selection',skills:[{name:'new',description:'',path:'/new/SKILL.md'},{name:'alpha',description:'',path:'/alpha/SKILL.md'},{name:'beta',description:'',path:'/beta/SKILL.md'}]});
+  check(document.querySelector('#slash-menu .active .slash-name')?.textContent==='beta','refresh changed the highlighted skill');
+  input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(document.querySelector('#selected-skills button')?.textContent.includes('beta'),'Enter selected a different skill after refresh');
+  document.querySelector('#selected-skills button').click();type('/$');input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+  emit({type:'skill_catalog',sessionId:'slash-refresh-selection',skills:[{name:'new',description:'',path:'/new/SKILL.md'},{name:'beta',description:'',path:'/beta/SKILL.md'}]});
+  check(document.querySelector('#slash-menu .active .slash-name')?.textContent==='new','removed selection did not fall back to the first item');
+ });
+ await test('multiple skills remain visible and survive draft switching and send failure',()=>{
+  reset('skills-owner');
+  emit({type:'skill_catalog',sessionId:'skills-owner',skills:[{name:'alpha',description:'first',path:'/My Skills/alpha/SKILL.md'},{name:'beta',description:'second',path:'C:\\Skills\\beta\\SKILL.md'}]});
+  const choose=name=>{input.focus();type('/'+name);input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));};
+  input.focus();type('/alpha');const option=document.querySelector('#slash-menu .slash-item.skill');
+  check(option?.querySelector('.slash-icon')?.textContent==='$'&&option.querySelector('.slash-name')?.textContent==='alpha','skill menu repeated the dollar sign');
+  choose('alpha');type('What is this? /beta');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(input.value==='What is this? '&&document.querySelectorAll('#selected-skills button').length===2,'multiple skills or existing prompt text were not retained');
+  check(document.getElementById('selected-skills').parentElement===document.getElementById('active-command').parentElement,'skills are not in the command toolbar');
+  emit({type:'view_reset',viewGen:++gen});emit({type:'session_ready',sessionId:'other-skill-owner',viewGen:gen});
+  check(document.querySelectorAll('#selected-skills button').length===0,'skills leaked to another session');
+  emit({type:'view_reset',viewGen:++gen});emit({type:'session_ready',sessionId:'skills-owner',viewGen:gen});emit({type:'history',sessionId:'skills-owner',viewGen:gen,items:[]});emit({type:'stream_release'});
+  check(document.querySelectorAll('#selected-skills button').length===2,'skills did not restore with the draft');
+  emit({type:'addChip',chip:{path:'/test/example.ts',relPath:'example.ts'}});
+  sendBtn.click();const request=sent.find(message=>message.type==='send');
+  check(request?.text.includes('[$alpha](</My Skills/alpha/SKILL.md>)')&&request.text.includes('[$beta](C:/Skills/beta/SKILL.md)')&&request.chips.length===1,'serialized skill paths or file reference missing: '+JSON.stringify(request?.text));
+  let bubble=[...messages.querySelectorAll('.message.user:not(.queued)')].at(-1);
+  check(bubble.querySelectorAll('.skill-ref-chip').length===2&&bubble.querySelector('.user-chips')?.textContent.includes('example.ts')&&!bubble.textContent.includes('SKILL.md'),'sent message did not render skills with the file reference');
+  emit({type:'send_rejected',commandId:request.commandId,sessionId:'skills-owner',message:'rejected'});
+  check(input.value==='What is this?'&&document.querySelectorAll('#selected-skills button').length===2,'send failure did not restore skills');
+  document.querySelector('#selected-skills button').click();
+  check(document.querySelectorAll('#selected-skills button').length===1,'skill removal did not work');
+  sendBtn.click();const retry=sent.filter(message=>message.type==='send').at(-1);
+  check(!retry.text.includes('[$alpha]')&&retry.text.includes('[$beta]'),'removed skill was still submitted');
+ });
+ await test('multiple skill labels remain reachable in the command toolbar',()=>{
+  reset('skills-layout');const skills=Array.from({length:6},(_,index)=>({name:'long-skill-'+index,description:'',path:'/skills/'+index+'/SKILL.md'}));
+  emit({type:'skill_catalog',sessionId:'skills-layout',skills});
+  for(const skill of skills){input.focus();type('/'+skill.name);input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));const row=document.getElementById('selected-skills'),item=row.querySelector('button:last-child'),box=row.getBoundingClientRect(),rect=item.getBoundingClientRect();check(rect.right<=box.right+1&&rect.left>=box.left-1,'newly selected skill is not visible');}
+  const row=document.getElementById('selected-skills'),last=row.querySelector('button:last-child'),bounds=row.getBoundingClientRect();
+  check(row.clientWidth>0&&row.scrollWidth>row.clientWidth,'multiple skill labels cannot be scrolled');
+  row.scrollLeft=row.scrollWidth;const lastBounds=last.getBoundingClientRect();
+  check(lastBounds.right<=bounds.right+1&&lastBounds.left>=bounds.left-1,'last skill is not reachable');
+  const sendBounds=sendBtn.getBoundingClientRect(),cardBounds=document.querySelector('.composer-card').getBoundingClientRect();
+  check(sendBounds.width>0&&sendBounds.right<=cardBounds.right,'skill labels hid the send button');
+  last.click();check(row.querySelectorAll('button').length===5,'scrolled skill label cannot be removed');
+ });
+ await test('skill-only requests can be queued and recovered after rejection',()=>{
+  reset('skills-queue');emit({type:'skill_catalog',sessionId:'skills-queue',skills:[{name:'alpha',description:'',path:'/skills/alpha/SKILL.md'}]});
+  input.focus();type('/alpha');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  emit({type:'status',sessionId:'skills-queue',status:'running'});sendBtn.click();
+  const request=sent.find(message=>message.type==='insert');
+  check(request?.text==='[$alpha](/skills/alpha/SKILL.md)'&&document.querySelector('#queue-zone .skill-ref-chip'),'skill-only draft was not queued visibly');
+  emit({type:'queue_rejected',commandId:request.queueItemId,sessionId:'skills-queue',message:'rejected'});
+  check(document.querySelector('#selected-skills button')?.textContent.includes('alpha'),'rejected queue lost the selected skill');
+ });
+ await test('restored user messages render skills inline with their question',()=>{
+  reset('skills-history');
+  emit({type:'history',sessionId:'skills-history',viewGen:gen,items:[{id:'skill-history',role:'user',text:'[example.ts](./example.ts)\n\n[$alpha](/skills/alpha/SKILL.md)\n\nExplain this'}]});
+  const bubble=messages.querySelector('.message.user');
+  check(bubble?.querySelector('.user-chips')?.textContent.includes('example.ts')&&bubble.querySelector('.user-body .skill-ref-chip')?.textContent==='alpha'&&bubble.querySelector('.user-body')?.textContent.includes('Explain this'),'restored skill message lost its label or question');
+  check(!bubble.textContent.includes('SKILL.md'),'restored skill path leaked into the message');
+ });
+ await test('skills and multiple subagents share composer chips and render after sending',()=>{
+  reset('agent-owner');
+  emit({type:'skill_catalog',sessionId:'agent-owner',skills:[{name:'alpha',description:'',path:'/skills/alpha/SKILL.md'}]});
+  emit({type:'subagent_catalog',sessionId:'agent-owner',agents:[{name:'Explore',description:'Search',source:'built-in'},{name:'demo:reviewer',description:'Review',source:'plugin'}]});
+  const choose=query=>{input.focus();type(query);input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));};
+  choose('/alpha');choose('/@Explore');choose('/@demo:reviewer');
+  check(document.querySelectorAll('#selected-skills button').length===3,'combined selections missing');
+  type('Check the changes');sendBtn.click();const request=sent.find(message=>message.type==='send');
+  check(request?.text==='[$alpha](/skills/alpha/SKILL.md)\n\n@Explore @demo:reviewer Check the changes','subagent prompt was not serialized correctly: '+JSON.stringify(request?.text));
+  const bubble=[...messages.querySelectorAll('.message.user:not(.queued)')].at(-1);
+  check(bubble.querySelectorAll('.skill-ref-chip').length===1&&bubble.querySelectorAll('.agent-ref-chip').length===2&&!bubble.textContent.includes('SKILL.md'),'sent references did not render inline');
+  emit({type:'send_rejected',commandId:request.commandId,sessionId:'agent-owner',message:'rejected'});
+  check(input.value==='Check the changes'&&document.querySelectorAll('#selected-skills button').length===3,'rejected send lost selected subagents');
+ });
+ await test('commands refuse selected capabilities without losing the draft',()=>{
+  reset('goal-capability');
+  emit({type:'session_ready',sessionId:'goal-capability',viewGen:gen,slashCommands:[{name:'goal',description:'goal',inputHint:'/goal [objective]'}]});
+  emit({type:'skill_catalog',sessionId:'goal-capability',skills:[{name:'alpha',description:'',path:'/skills/alpha/SKILL.md'}]});
+  input.focus();type('/alpha');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  type('/goal');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('目标');sendBtn.click();
+  check(!sent.some(message=>message.type==='send'||message.type==='insert'),'goal with a skill was submitted as text');
+  check(input.value==='目标'&&document.querySelector('#selected-skills button'),'blocked goal lost its draft');
+ });
+ await test('ordinary mentions stay plain in submitted messages',()=>{
+  reset('plain-mention');type('通知 @someone');sendBtn.click();
+  const bubble=[...messages.querySelectorAll('.message.user:not(.queued)')].at(-1);
+  check(bubble?.textContent.includes('@someone')&&!bubble.querySelector('.agent-ref-chip'),'ordinary mention was rendered as a subagent');
+ });
+ await test('opening the slash menu refreshes the active reference catalog',()=>{
+  reset('refresh-catalog');input.focus();type('/');
+  check(sent.some(message=>message.type==='refreshReferenceCatalog'&&message.sessionId==='refresh-catalog'),'catalog refresh was not requested');
  });
  await test('goal verification timeline renders as a pass or fail marker',()=>{
   reset();
@@ -800,10 +946,10 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(body&&chip.parentElement===body&&(chip.nextSibling?.textContent??'').trim().startsWith('完成发布'),'badge must be inline before the body text');
   check(bubble.dataset.rawText.startsWith('/goal ')&&bubble.dataset.retryText.startsWith('/goal '),'raw texts must keep the /goal prefix for editing');
  });
- await test('/plan switches the session mode and sends only its task body',()=>{reset('plan-command-owner');emit({type:'session_ready',sessionId:'plan-command-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Explain the change');sendBtn.click();const send=sent.find(message=>message.type==='send');check(send?.text==='Explain the change'&&send.planMode===true&&send.sessionId==='plan-command-owner','/plan task was not routed as a session-owned plan submission');check(!messages.querySelector('.message.user .cmd-chip'),'the /plan command leaked into the submitted question');check(!document.getElementById('plan-indicator').hidden,'Plan mode indicator disappeared after submitting its task');});
- await test('/plan during generation queues only the task body with plan mode',()=>{reset('plan-queue-owner');emit({type:'session_ready',sessionId:'plan-queue-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});emit({type:'status',sessionId:'plan-queue-owner',status:'running'});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Queue this plan');sendBtn.click();const insert=sent.find(message=>message.type==='insert');check(insert?.text==='Queue this plan'&&insert.planMode===true&&insert.sessionId==='plan-queue-owner','queued /plan retained the slash prefix or lost its session mode');});
- await test('empty /plan switches mode without sending a message',()=>{reset('plan-empty-owner');emit({type:'session_ready',sessionId:'plan-empty-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));sendBtn.click();check(sent.some(message=>message.type==='setMode'&&message.mode==='plan'&&message.sessionId==='plan-empty-owner'),'empty /plan did not switch mode');check(!sent.some(message=>message.type==='send'||message.type==='insert'),'empty /plan sent a prompt');check(!document.getElementById('plan-indicator').hidden,'empty /plan did not leave the mode indicator on');});
- await test('/plan refuses context references without consuming the draft',()=>{reset('plan-context-owner');emit({type:'session_ready',sessionId:'plan-context-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Keep this task');emit({type:'addChip',chip:{path:'/test/plan.ts',relPath:'plan.ts',selectedText:'PLAN_CONTEXT'}});sendBtn.click();check(!sent.some(message=>message.type==='send'||message.type==='insert'||message.type==='setMode'),'unsupported /plan context was submitted');check(input.value==='Keep this task'&&document.querySelector('#attachments .ctx-chip'),'blocked /plan context was consumed');check(document.getElementById('toast').textContent.toLowerCase().includes('plan'),'blocked /plan context did not explain the restriction');});
+ await test('local Plan action is available without a backend command and preserves surrounding text',()=>{reset('plan-command-owner');emit({type:'session_ready',sessionId:'plan-command-owner',viewGen:gen,slashCommands:[]});input.focus();type('Explain /plan the change');input.setSelectionRange(13,13);input.dispatchEvent(new Event('input',{bubbles:true}));check(document.querySelector('#slash-menu .slash-item.command')&&document.getElementById('slash-menu').classList.contains('open'),'local Plan action missing: '+document.getElementById('slash-menu').textContent);input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));check(input.value==='Explain  the change','Plan selection consumed surrounding text');check(!sent.some(m=>m.type==='setMode'||m.type==='send'),'selection changed the running session');sendBtn.click();check(sent.find(m=>m.type==='send')?.text==='Explain  the change'&&sent.find(m=>m.type==='send')?.planMode===true,'task lost draft Plan mode');});
+ await test('Plan action preserves a running reply and queues ordinary task text',()=>{reset('plan-queue-owner');emit({type:'status',sessionId:'plan-queue-owner',status:'running'});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));check(!sent.some(m=>m.type==='insert'||m.type==='setMode'),'Plan selection touched the running session');type('Queue this plan');sendBtn.click();check(sent.find(m=>m.type==='insert')?.text==='Queue this plan'&&sent.find(m=>m.type==='insert')?.planMode===true,'queued task lost draft Plan');});
+ await test('empty Plan selection remains a draft until there is content to send',()=>{reset('plan-empty-owner');type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));sendBtn.click();check(!sent.some(m=>m.type==='setMode'||m.type==='send'||m.type==='insert'),'empty draft changed session mode');check(!document.getElementById('plan-indicator').hidden,'draft Plan indicator missing');});
+ await test('Plan action preserves file references and allows normal submission',()=>{reset('plan-context-owner');emit({type:'addChip',chip:{path:'/test/plan.ts',relPath:'plan.ts'}});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));check(document.querySelector('#attachments .ctx-chip'),'Plan selection dropped context');type('Keep this task');sendBtn.click();check(sent.find(m=>m.type==='send')?.chips.length===1,'Plan blocked context submission');});
  await test('slash commands offer a completion menu with builtin and custom entries',()=>{
   reset('slash-owner');
   emit({type:'session_ready',sessionId:'slash-owner',viewGen:gen,title:'T',slashCommands:[
@@ -813,9 +959,9 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   ]});
   type('/');
   const menu=document.getElementById('slash-menu');
-  check(menu.classList.contains('open')&&menu.querySelectorAll('.slash-item').length===3,'slash menu did not list all commands');
+  check(menu.classList.contains('open')&&menu.querySelectorAll('.slash-item').length===4,'slash menu did not list commands and local Plan action');
   check(menu.querySelector('.slash-item .slash-icon svg'),'slash commands lost their icons');
-  check(menu.querySelectorAll('.slash-icon svg').length===3,'not every command carries a glyph');
+  check(menu.querySelectorAll('.slash-icon svg').length===4,'not every command carries a glyph');
   type('/co');
   check(menu.classList.contains('open')&&menu.querySelectorAll('.slash-item').length===1&&menu.querySelector('.slash-name').textContent==='/compact','prefix filtering failed');
   input.dispatchEvent(new KeyboardEvent('keydown',{key:'Tab',bubbles:true,cancelable:true}));
@@ -1089,6 +1235,21 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
  await test('permissions cannot be answered after interruption',()=>{reset();emit({type:'permission_request',requestId:'audit-permission',toolName:'edit',options:[{optionId:'allow_once',kind:'allow_once',name:'Allow'}]});emit({type:'status',sessionId:'A',status:'completedInterrupted'});document.querySelector('#perm-audit-permission button').click();check(!sent.some(m=>m.type==='permissionAnswer'),'resolved permission accepted a second answer');});
  await test('tool status terminal acknowledgement rejects regression',()=>{reset();emit({type:'tool_call',toolCallId:'audit-tool',toolName:'read',status:'completed',outputText:'完整输出'});emit({type:'tool_call',toolCallId:'audit-tool',status:'running'});const tool=document.getElementById('tool-audit-tool');check(tool.dataset.toolStatus==='completed','completed tool regressed');check(tool.textContent.includes('完整输出'),'tool output lost');});
  await test('unsafe Markdown is sanitized',()=>{reset();emit({type:'assistant_text_delta',partId:'safe',authoritative:true,streaming:false,fullText:'<img src=x onerror="window.auditXss=true"><script>window.auditXss=true</script><a href="javascript:alert(1)">bad</a>\n\n```js\nconst x = "<script>";\n```'});check(!messages.querySelector('script,[onerror],[onclick],a[href^="javascript:"]'),'unsafe markup survived');check(messages.querySelector('.code-block code')?.textContent.includes('const x'),'code block lost content');});
+ await test('literal backticks do not add Markdown cards or change code across stream and history',()=>{
+  for(const text of ['```javascript\nconst fence = "```";\n```','````markdown\n```javascript\nconst x = 1;\n````','~~~javascript\nconst x = "<tag>";','```typescript\nconst example = "**Z.ai Built-in Tool: webReader**";\n```']){
+   reset();emit({type:'assistant_text_delta',partId:'literal-fences',fullText:text,authoritative:true});
+   const inspect=()=>{check(messages.querySelectorAll('.code-block').length===1,'literal/open fence created an extra code card');check(!messages.querySelector('.md > p'),'synthetic closing fence became prose');check(!messages.querySelector('.tool-call'),'code content became a tool card');};
+   inspect();const original=messages.querySelector('.code-block code').textContent;
+   emit({type:'assistant_text_delta',partId:'literal-fences',fullText:text,authoritative:true,streaming:false});inspect();
+   check(messages.querySelector('.code-block code').textContent===original,'settling changed code contents');
+   emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'fence-q',role:'user',text:'Show code'},{id:'fence-a',role:'assistant',text}]});inspect();
+   check(messages.querySelector('.code-block code').textContent===original,'history changed code contents');
+  }
+  reset();emit({type:'assistant_text_delta',partId:'inline-fences',fullText:'Inline triple ticks: ` ``` `',authoritative:true,streaming:false});
+  check(messages.querySelector('.md').textContent.trim()==='Inline triple ticks: ```','inline ticks gained a synthetic fence');
+  reset();emit({type:'assistant_text_delta',partId:'inline-tool-label',fullText:'Inline tool: `**Z.ai Built-in Tool: webReader**` 后续说明。',authoritative:true,streaming:false});
+  check(!messages.querySelector('.tool-call')&&messages.querySelector('.md').textContent.includes('webReader** 后续说明。'),'inline code became a tool or lost its trailing prose');
+ });
  for(const language of ['zh-CN','zh-TW','en']) {
   await test(`usage bounds and clear ${language}`,()=>{reset();emit({type:'ui_language',language,setting:language});emit({type:'context_usage',used:0,max:128000,quota:[{label:'5 小时',remainingPercent:100,usedPercent:0},{label:'每周',remainingPercent:-5,usedPercent:105}]});check(document.getElementById('usage-context-percent').textContent==='0%','zero context must be known');check(document.getElementById('usage-weekly').getAttribute('aria-valuenow')==='100','weekly overlimit unbounded');emit({type:'context_usage',used:NaN,max:Infinity,quota:[{label:'每周',remainingPercent:NaN,usedPercent:NaN}]});check([...document.querySelectorAll('.usage-cell-value')].every(n=>n.textContent==='—'),'nonfinite usage displayed');check(!document.getElementById('context-meter').hidden,'quota toggle unavailable while waiting');});
   await test(`usage narrow layout ${language}`,()=>{reset();emit({type:'ui_language',language,setting:language});emit({type:'context_usage',used:99999,max:128000,quota:[{label:'5 小时',remainingPercent:0,usedPercent:100},{label:'每周',remainingPercent:0,usedPercent:100}]});const panel=document.getElementById('usage-panel');if(panel.hidden)document.getElementById('context-meter').click();const rects=[...panel.querySelectorAll('.usage-cell')].map(n=>n.getBoundingClientRect());check(panel.getBoundingClientRect().height<=52,'usage panel taller than compact labels and details');check(rects.every(r=>r.top===rects[0].top),'usage cells wrapped');check(panel.scrollWidth<=panel.clientWidth,'usage overflow');check(document.documentElement.scrollWidth<=document.documentElement.clientWidth,'whole sidebar horizontal overflow');});
@@ -1096,6 +1257,57 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   await test(`language refreshes existing Markdown code copy button ${language}`,()=>{reset();emit({type:'ui_language',language:'en',setting:'en'});emit({type:'assistant_text_delta',partId:'code',authoritative:true,streaming:false,fullText:'```js\nconsole.log("hello");\n```'});emit({type:'ui_language',language,setting:language});const label=messages.querySelector('.code-block .copy-btn')?.textContent;check(label===(language==='en'?'Copy':'复制') || language==='zh-TW'&&label==='複製',`copy label is ${label}`);});
  }
  await test('restored completed history stays idle after shorter replay',()=>{reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'completed',role:'assistant',text:'已完成的完整正文',running:false,steps:[{kind:'text',partId:'completed-body',text:'已完成的完整正文'}]}]});emit({type:'assistant_text_delta',partId:'completed-body',fullText:'已完成的完整',streaming:false,authoritative:true});check(!sendBtn.classList.contains('stop'),'complete metadata made generation active');});
+ await test('retry ignores repeated clicks and other error cards until the retry ends',()=>{
+  reset();type('RETRY_ONCE');sendBtn.click();
+  emit({type:'status',sessionId:'A',status:'error',message:'First failure'});emit({type:'session_error',message:'Second failure'});
+  const buttons=[...messages.querySelectorAll('.message.error [data-act="retryLast"]')];
+  buttons[0].click();buttons[0].click();buttons[1].click();
+  check(buttons[0].disabled&&sent.filter(message=>message.type==='retryLast').length===1,'retry submitted multiple immediate messages');
+  emit({type:'status',sessionId:'A',status:'error',message:'Retry failed'});
+  [...messages.querySelectorAll('.message.error [data-act="retryLast"]')].at(-1).click();
+  check(sent.filter(message=>message.type==='retryLast').length===2,'a later failure cannot be retried');
+ });
+ await test('retry consumes the exact recovered draft and restores its capabilities and attachments if rejected again',async()=>{
+  reset('retry-draft');
+  emit({type:'skill_catalog',sessionId:'retry-draft',skills:[{name:'retry-skill',description:'',path:'/skills/retry/SKILL.md'}]});
+  emit({type:'subagent_catalog',sessionId:'retry-draft',agents:[{name:'Explore',description:'',source:'built-in'}]});
+  for(const name of ['retry-skill','Explore']){type('/'+name);input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));}
+  emit({type:'sessions',currentId:'retry-draft',includeArchived:false,sessions:[{sessionId:'sess_retry_ref',title:'Retry reference'}],referenceSessions:[{sessionId:'sess_retry_ref',title:'Retry reference'}]});
+  type('@Retry');input.setSelectionRange(input.value.length,input.value.length);input.dispatchEvent(new Event('input'));await new Promise(resolve=>setTimeout(resolve,150));
+  const search=sent.filter(message=>message.type==='searchWorkspaceFiles').at(-1);emit({type:'workspace_files',sessionId:'retry-draft',requestId:search.requestId,files:[]});
+  input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(document.querySelector('#attachments .session-ref-chip'),'fixture did not select a conversation reference');
+  emit({type:'addChip',chip:{path:'/test/retry.ts',relPath:'retry.ts',selectionStart:1,selectionEnd:2,selectedText:'CAPTURED_CONTEXT'}});
+  const image={ref:'retry-image',fileName:'retry.png',mime:'image/png',bytes:100};
+  emit({type:'image_pending',sessionId:'retry-draft',imageId:'retry-image',fileName:image.fileName,mime:image.mime,bytes:image.bytes});
+  emit({type:'image_ready',sessionId:'retry-draft',imageId:'retry-image',attachment:image});
+  type('Original retry question');sendBtn.click();const original=sent.find(message=>message.type==='send');
+  emit({...original,type:'send_rejected',message:'Rejected'});
+  const recovered=JSON.stringify(savedState.composerDrafts['retry-draft']);
+  messages.querySelector('.message.error [data-act="retryLast"]').click();
+  const retry=sent.find(message=>message.type==='retryLast');
+  check(retry?.commandId&&retry.attachments[0].ref===image.ref,'retry lost its command identity or image');
+  check(retry.text.includes('[#Retry reference](#sess_retry_ref)')&&retry.text.includes('CAPTURED_CONTEXT'),'retry lost its serialized conversation or captured file reference');
+  check(input.value===''&&!document.querySelector('#attachments .ctx-chip, #image-drafts .image-chip, #selected-skills button'),'retry left the submitted recovery draft in the composer');
+  check(!savedState.composerDrafts['retry-draft'],'consumed recovery draft remained persisted');
+  emit({...retry,type:'send_rejected',message:'Rejected again'});
+  check(JSON.stringify(savedState.composerDrafts['retry-draft'])===recovered,'retry failure did not restore the exact original draft');
+  [...messages.querySelectorAll('.message.error [data-act="retryLast"]')].at(-1).click();
+  const second=sent.filter(message=>message.type==='retryLast').at(-1);emit({type:'send_admitted',sessionId:'retry-draft',commandId:second.commandId});
+  check(!savedState.composerDrafts['retry-draft']&&input.value==='','successful retry resurrected its submitted draft');
+ });
+ for(const change of ['text','image'])await test(`retry preserves a recovery draft with new ${change}`,()=>{
+  reset('retry-new-'+change);const owner='retry-new-'+change;type('Original retry question');sendBtn.click();const original=sent.find(message=>message.type==='send');
+  emit({...original,type:'send_rejected',message:'Rejected'});
+  if(change==='text')type('Original retry question\nFollow-up note');
+  else{const image={ref:'new-image',fileName:'new.png',mime:'image/png',bytes:100};emit({type:'image_pending',sessionId:owner,imageId:'new-image',fileName:image.fileName,mime:image.mime,bytes:image.bytes});emit({type:'image_ready',sessionId:owner,imageId:'new-image',attachment:image});}
+  const before=JSON.stringify(savedState.composerDrafts[owner]);messages.querySelector('.message.error [data-act="retryLast"]').click();
+  check(JSON.stringify(savedState.composerDrafts[owner])===before,'retry consumed a different unsent draft');
+  const retry=sent.filter(message=>message.type==='retryLast').at(-1);emit({...retry,type:'send_rejected',message:'Retry rejected again'});
+  check(JSON.stringify(savedState.composerDrafts[owner])===before,'retry rejection merged an already retained recovery draft again');
+ });
+ await test('draft Plan survives session switches, rejection and cancellation without changing the server',()=>{reset('draft-plan-A');type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Draft task');emit({type:'view_reset',viewGen:++gen});emit({type:'session_ready',sessionId:'draft-plan-B',viewGen:gen});check(document.getElementById('plan-indicator').hidden,'draft Plan leaked across sessions');emit({type:'view_reset',viewGen:++gen});emit({type:'session_ready',sessionId:'draft-plan-A',viewGen:gen});emit({type:'history',sessionId:'draft-plan-A',viewGen:gen,items:[]});emit({type:'stream_release'});check(!document.getElementById('plan-indicator').hidden&&input.value==='Draft task','draft Plan did not restore');sendBtn.click();const send=sent.find(m=>m.type==='send');check(send?.planMode===true,'restored draft lost mode');emit({...send,type:'send_rejected',message:'Rejected'});check(input.value==='Draft task'&&!document.getElementById('plan-indicator').hidden,'rejection lost draft Plan');sent.length=0;document.getElementById('plan-indicator').click();check(document.getElementById('plan-indicator').hidden&&!sent.some(m=>m.type==='setMode'),'cancel changed backend mode');sendBtn.click();check(!sent.find(m=>m.type==='send')?.planMode,'cancelled draft still requested Plan');});
+ await test('raw /plan text stays literal after Escape and draft restoration',()=>{reset('plan-raw');emit({type:'session_ready',sessionId:'plan-raw',viewGen:gen,slashCommands:[{name:'plan',description:'legacy',inputHint:'/plan [task]'}]});type('/plan');check(document.querySelectorAll('#slash-menu .slash-item.command').length===1,'legacy command duplicated local Plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));type('/plan Explain this');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));sendBtn.click();check(sent.find(m=>m.type==='send')?.text==='/plan Explain this','raw Plan text was interpreted');check(!sent.some(m=>m.type==='setMode'),'Escape changed mode');});
  await test('retry after switch uses the current session prompt',()=>{reset('A');type('QUESTION_FROM_A');sendBtn.click();reset('B');emit({type:'history',sessionId:'B',viewGen:gen,items:[{id:'user-B',role:'user',text:'QUESTION_FROM_B',tools:[]}]});emit({type:'session_error',message:'Model failed in B'});messages.querySelector('.err-actions [data-act="retryLast"]').click();check(sent.some(m=>m.type==='retryLast'&&m.sessionId==='B'&&m.text==='QUESTION_FROM_B'),'Retry lost the current session owner '+JSON.stringify(sent.filter(m=>m.type==='retryLast')));});
  await test('empty new session cannot retry an old session question',()=>{reset('A');type('OLD_PRIVATE_QUESTION_A');sendBtn.click();reset('B');emit({type:'session_error',message:'B failed before a question'});messages.querySelector('.err-actions [data-act="retryLast"]')?.click();check(!sent.some(m=>m.type==='retryLast'&&m.text==='OLD_PRIVATE_QUESTION_A'),'old question sent into empty B');});
  await test('a detached retry action cannot send after its session changes',()=>{reset('A');type('STALE_RETRY_QUESTION_A');sendBtn.click();emit({type:'status',sessionId:'A',status:'error',message:'Retry this failure'});const button=messages.querySelector('.message.error .err-actions [data-act="retryLast"]');check(button,'retry action was not created');reset('B');button.click();check(!sent.some(m=>m.type==='retryLast'),'stale error action sent into the new session');});
@@ -1143,7 +1355,8 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   const body=messages.querySelector('.work-fold-body');
   check(body.scrollHeight-body.scrollTop-body.clientHeight<=2,'fixture was not following');
   emit({type:'permission_request',requestId:'follow-perm',toolName:'Bash',options:[{optionId:'allow',kind:'allow',name:'Allow'}]});
-  document.querySelector('#perm-follow-perm button[data-opt="allow"]').click();
+  const allow=document.querySelector('#perm-follow-perm button[data-opt="allow"]');allow.focus();
+  allow.dispatchEvent(new KeyboardEvent('keydown',{key:' ',bubbles:true,cancelable:true}));allow.click();
   emit({type:'assistant_reasoning_delta',partId:'follow-thought',authoritative:true,fullText:long+'\nAFTER_APPROVAL'});
   check(body.scrollHeight-body.scrollTop-body.clientHeight<=2,'approval dropped work follow');
   body.scrollTop=0;
@@ -1303,7 +1516,76 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
  await test('restored history groups tools once and keeps collapsed thought expandable',()=>{reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'history-process',role:'assistant',text:'DONE',steps:[{kind:'reasoning',partId:'restored-thought',text:'RESTORED_THOUGHT'},{kind:'tool',toolCallId:'restored-one',toolName:'shell',status:'completed',inputText:'{"command":"echo one"}'},{kind:'tool',toolCallId:'restored-two',toolName:'shell',status:'completed',inputText:'{"command":"echo two"}'},{kind:'text',text:'DONE'}]}]});const fold=messages.querySelector('.work-fold');fold.querySelector('.work-fold-btn').click();const note=fold.querySelector('.work-note');check(note.hidden&&fold.querySelector('.process-group'),'restored process not compact or grouped');fold.querySelector('.reasoning-head').click();check(!note.hidden&&note.textContent==='RESTORED_THOUGHT','restored thought missing');fold.querySelector('.process-group').click();check(!document.getElementById('tool-restored-two').classList.contains('group-hidden'),'restored tool inaccessible');});
  await test('active tools start compact and respect explicit expansion',()=>{reset();emit({type:'tool_call',toolCallId:'compact-terminal',toolName:'shell',status:'running',inputText:'{"command":"echo hello"}'});const tool=document.getElementById('tool-compact-terminal');check(tool.classList.contains('collapsed')&&tool.querySelector('.tool-status.running'),'running terminal not compact or status lost');tool.querySelector('.tool-head').click();emit({type:'tool_call',toolCallId:'compact-terminal',status:'running',outputText:'NEW_OUTPUT'});check(!tool.classList.contains('collapsed')&&tool.querySelector('.tool-io.out').textContent==='NEW_OUTPUT','expanded terminal reset during output');emit({type:'tool_call',toolCallId:'compact-generic',toolName:'customTool',status:'running',inputText:'{}'});const generic=document.getElementById('tool-compact-generic');check(generic.classList.contains('collapsed')&&generic.querySelector('.tool-status.running'),'running generic tool did not share the collapsed default');});
  await test('terminal label and shell preview share a stable text baseline',()=>{reset();emit({type:'tool_call',toolCallId:'aligned-terminal',toolName:'shell',status:'running',inputText:'{"command":"Bash"}'});const card=document.getElementById('tool-aligned-terminal');const label=card.querySelector('.tool-name');const preview=card.querySelector('.tool-preview');check(label.dataset.i18nKey==='终端'&&preview.textContent==='Bash','terminal translation key or shell name changed');check(getComputedStyle(label).lineHeight==='18px'&&getComputedStyle(preview).lineHeight==='18px','terminal label and shell preview use different line heights');const a=label.getBoundingClientRect(),b=preview.getBoundingClientRect();check(Math.abs((a.top+a.bottom-b.top-b.bottom)/2)<=0.25,'terminal label and shell preview are vertically misaligned');});
- await test('reasoning and process headers align icons and labels across tool types',()=>{reset();emit({type:'assistant_reasoning_delta',partId:'aligned-thought',authoritative:true,fullText:'THOUGHT'});emit({type:'tool_call',toolCallId:'aligned-group-one',toolName:'shell',status:'completed',inputText:'{"command":"echo one"}'});emit({type:'tool_call',toolCallId:'aligned-group-two',toolName:'shell',status:'completed',inputText:'{"command":"echo two"}'});emit({type:'tool_call',toolCallId:'aligned-read',toolName:'read_file',status:'completed',inputText:'{"path":"README.md"}'});emit({type:'tool_call',toolCallId:'aligned-generic',toolName:'apply_patch',status:'completed',inputText:'{}'});const headers=[...messages.querySelectorAll('.reasoning-head,.process-group,.tool-head')].filter(header=>header.querySelector(':scope > .process-icon'));check(headers.length>=5,'expected reasoning, grouped process and tool headers');check(messages.querySelector('.reasoning-head .process-icon')?.dataset.lucide==='brain','reasoning icon does not match the desktop Lucide icon');check(messages.querySelector('.process-group .process-icon')?.dataset.lucide==='squareTerminal','terminal group icon does not match the desktop Lucide icon');check(document.querySelector('#tool-aligned-read .process-icon')?.dataset.lucide==='search','lookup icon does not match the desktop Lucide icon');check(document.querySelector('#tool-aligned-generic .process-icon')?.dataset.lucide==='codeXml','generic tool icon does not match the desktop Lucide icon');check(document.querySelector('#tool-aligned-generic .tool-head')?.classList.contains('raw-tool-head'),'raw tool label lost its optical alignment class');for(const header of headers){if(!header.getClientRects().length)continue;check(getComputedStyle(header).lineHeight==='18px','header does not use the shared 18px line height');const icon=header.querySelector(':scope > .process-icon');const label=header.querySelector(':scope > span:not(.tool-preview):not(.tool-status)');check(icon&&label,'icon or primary label missing');check(parseFloat(icon.getAttribute('stroke-width'))===1.5,'process icon stroke changed');const i=icon.getBoundingClientRect(),l=label.getBoundingClientRect(),expected=icon.dataset.lucide==='brain'?-1.5:icon.dataset.lucide==='codeXml'&&header.classList.contains('raw-tool-head')?0:-1;check(Math.abs((i.top+i.bottom-l.top-l.bottom)/2-expected)<=0.25,'icon and label centers differ in '+header.className);}});
+ await test('process headers share a neutral center across font stacks, languages and scaling',()=>{
+  reset();emit({type:'assistant_reasoning_delta',partId:'aligned-thought',authoritative:true,fullText:'THOUGHT'});
+  for(const [id,name,inputText] of [
+   ['group-one','shell','{"command":"echo one"}'],['group-two','shell','{"command":"echo two"}'],
+   ['read','read_file','{"path":"README.md"}'],['generic','apply_patch','{}'],['image','analyze_image','{}']
+  ])emit({type:'tool_call',toolCallId:'aligned-'+id,toolName:name,status:'completed',inputText});
+  emit({type:'user_input_request',sessionId:'A',requestId:'aligned-question',questions:[{question:'Choose',options:[{value:'yes',label:'Yes'}]}]});
+  document.querySelector('#ask-aligned-question button[data-val]').click();
+  messages.querySelectorAll('.process-group').forEach(button=>button.click());
+  const headers=[...messages.querySelectorAll('.reasoning-head,.process-group,.tool-head,.ask-summary')].filter(header=>header.querySelector(':scope > .process-icon'));
+  const kinds=new Set(headers.map(header=>header.querySelector('.process-icon').dataset.lucide));
+  for(const kind of ['brain','squareTerminal','search','codeXml','circleQuestionMark'])check(kinds.has(kind),'missing alignment fixture: '+kind);
+  check(document.querySelector('#tool-aligned-generic .tool-name').textContent==='apply_patch','raw tool name changed');
+  const previous=messages.style.cssText,styles=headers.map(header=>header.style.cssText);
+  // Native stacks are exercised with whatever fallback exists on the host.
+  // Extra installed CJK/Latin families cover different metrics on Linux; this
+  // does not pretend to run the native Windows/macOS font renderer there.
+  const fonts=[
+   'Ubuntu, "Noto Sans CJK SC", sans-serif',
+   '"Segoe WPC", "Segoe UI", "Microsoft YaHei", sans-serif',
+   '-apple-system, BlinkMacSystemFont, "Helvetica Neue", "PingFang SC", sans-serif',
+   '"Noto Sans CJK SC", sans-serif','"Liberation Sans", sans-serif'
+  ];
+  try{
+   for(const language of ['zh-CN','zh-TW','en']){
+    emit({type:'ui_language',language,setting:language});
+    for(const font of fonts)for(const size of [12,14])for(const zoom of [1,1.25,1.5,2]){
+     messages.style.fontFamily=font;messages.style.zoom=String(zoom);
+     for(const header of headers){
+      header.style.fontSize=size+'px';
+      if(!header.getClientRects().length)continue;
+      check(getComputedStyle(header).lineHeight==='18px','process row lost its shared line height');
+      const icon=header.querySelector(':scope > .process-icon'),label=header.querySelector(':scope > span:not(.tool-preview):not(.tool-status)');
+      check(icon&&label,'icon or label missing');
+      check(parseFloat(icon.getAttribute('stroke-width'))===1.5,'process icon stroke changed');
+      const a=icon.getBoundingClientRect(),b=label.getBoundingClientRect();
+      check(Math.abs((a.top+a.bottom-b.top-b.bottom)/2)<=0.5,`icon center shifted for ${language}, ${font}, ${size}px, ${zoom}x: ${icon.dataset.lucide}`);
+      const arrow=header.querySelector(':scope > .process-chevron');
+      if(arrow){const c=arrow.getBoundingClientRect();check(Math.abs((c.top+c.bottom-b.top-b.bottom)/2)<=0.5,'expand arrow does not share the label center');}
+      const preview=header.querySelector('.tool-preview');
+      if(preview){const c=preview.getBoundingClientRect();check(Math.abs((c.top+c.bottom-b.top-b.bottom)/2)<=0.5,'tool preview and label are misaligned');}
+     }
+    }
+   }
+  }finally{messages.style.cssText=previous;headers.forEach((header,index)=>header.style.cssText=styles[index]);emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});}
+ });
+ await test('folding the final thought keeps the complete title inside its viewport',()=>{
+  const original=messages.style.cssText;
+  try{
+   for(const zoom of [1,1.25,1.5,2])for(const language of ['zh-CN','en']){
+    reset();messages.style.zoom=String(zoom);emit({type:'ui_language',language,setting:language});
+    emit({type:'status',sessionId:'A',status:'running'});
+    emit({type:'assistant_reasoning_delta',partId:'last-thought',fullText:'Thought line\n'.repeat(80),authoritative:true});
+    const body=messages.querySelector('.work-fold-body'),head=body.querySelector('.reasoning-head'),note=body.querySelector('.work-note');
+    for(let round=0;round<2;round++){
+     body.scrollTop=round?body.scrollHeight:0;head.click();
+     check(note.hidden,'thought did not fold');
+     check(body.clientHeight>=head.offsetHeight,'collapsed title lost layout height');
+     check(body.scrollHeight<=body.clientHeight+1,'a single collapsed title unnecessarily scrolls');
+     const viewport=body.getBoundingClientRect();
+     for(const element of [head,head.querySelector('.process-icon'),head.querySelector('span'),head.querySelector('.process-chevron')]){
+      const rect=element.getBoundingClientRect();
+      check(rect.top>=viewport.top-0.5&&rect.bottom<=viewport.bottom+0.5,'collapsed thought title was clipped');
+     }
+     head.click();check(!note.hidden,'thought did not reopen');
+     check(Math.abs(note.getBoundingClientRect().top-head.getBoundingClientRect().bottom-4*zoom)<=0.5,'expanded thought spacing changed');
+    }
+   }
+  }finally{messages.style.cssText=original;emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});}
+ });
  await test('new-chat greeting localizes without touching drafts and disappears on history',()=>{reset();type('GREETING_DRAFT');for(const language of ['zh-CN','en','zh-TW']){emit({type:'ui_language',language,setting:language});const title=messages.querySelector('.empty-title');check(title&&title.dataset.i18nKey,'missing time greeting');check(title.textContent!=='开始新的对话'&&title.textContent!=='Start a new chat','generic title still present');if(language==='en')check(!/[\u4e00-\u9fff]/.test(title.textContent),'English greeting contains Chinese');check(input.value==='GREETING_DRAFT','greeting language change erased draft');check(messages.querySelector('.empty-mark path')?.getAttribute('vector-effect')==='non-scaling-stroke'&&!messages.querySelector('.empty-mark filter'),'new-chat outline loses sharp edges at sidebar scale');check(document.documentElement.scrollWidth<=document.documentElement.clientWidth,'empty chat overflows');}emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'greeting-history',role:'user',text:'HISTORICAL_QUESTION'}]});check(!messages.querySelector('.empty'),'greeting remained on populated history');check(messages.textContent.includes('HISTORICAL_QUESTION'),'history altered');});
 
  await test('long questions collapse by default independently of whole-turn folding',()=>{reset();const long='LONG_QUESTION_LINE\n'.repeat(8);const items=[];for(let i=0;i<11;i++){items.push({id:'fold-q-'+i,rowId:i*2+1,turnId:'fold-turn-'+i,role:'user',text:i===0?long:'SHORT_QUESTION_'+i});items.push({id:'fold-a-'+i,rowId:i*2+2,turnId:'fold-turn-'+i,role:'assistant',text:'ANSWER_'+i});}emit({type:'history',sessionId:'A',viewGen:gen,items});const bar=messages.querySelector('.turn-fold-bar');check(bar,'older whole turn did not fold');bar.click();const user=messages.querySelector('.message.user[data-jump="fold-q-0"]');let questionToggle=user.nextElementSibling.querySelector('.question-fold-btn');check(user.classList.contains('question-collapsed')&&questionToggle,'long question did not default to collapsed');questionToggle.click();check(!user.classList.contains('question-collapsed')&&questionToggle.getAttribute('aria-expanded')==='true','question toggle did not expand only the prompt');check(!messages.querySelector('.turn-fold-bar'),'question toggle affected whole-turn state');emit({type:'history',sessionId:'A',viewGen:gen,items});const redrawn=messages.querySelector('.message.user[data-jump="fold-q-0"]');check(!redrawn.classList.contains('question-collapsed'),'explicit question expansion was lost on transcript redraw');redrawn.nextElementSibling.querySelector('.turn-collapse-btn').click();check(redrawn.classList.contains('turn-hidden')&&redrawn.nextElementSibling.querySelector('.question-fold-btn').hidden,'whole-turn fold did not hide its question action');messages.querySelector('.turn-fold-bar').click();check(!redrawn.classList.contains('turn-hidden')&&!redrawn.classList.contains('question-collapsed'),'reopening whole turn changed independent question state');const short=messages.querySelector('.message.user[data-jump="fold-q-1"]');check(!short.nextElementSibling.querySelector('.question-fold-btn'),'short prompt gained a redundant fold action');});
@@ -1394,6 +1676,66 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(document.activeElement===document.getElementById('btn-settings'),'settings focus not restored');
  });
 
+ await test('manual question navigation and fold choices override automatic following',async()=>{
+  reset();emit({type:'history',sessionId:'A',viewGen:gen,items:Array.from({length:12},(_,i)=>[{id:'manual-q'+i,role:'user',text:'Question '+i},{id:'manual-a'+i,role:'assistant',text:'Long history\n'.repeat(20)}]).flat()});
+  emit({type:'status',sessionId:'A',status:'running'});emit({type:'user_input_request',sessionId:'A',requestId:'manual-prompt',questions:[{question:'Choose',options:[{value:'yes',label:'Yes'}]}]});
+  const pending=document.getElementById('pending-action'),card=document.getElementById('ask-manual-prompt');pending.click();await new Promise(resolve=>setTimeout(resolve,80));
+  card.dispatchEvent(new KeyboardEvent('keydown',{key:'PageUp',bubbles:true,cancelable:true}));messages.scrollTop=0;messages.dispatchEvent(new Event('scroll'));
+  await new Promise(resolve=>setTimeout(resolve,1200));
+  check(messages.scrollTop===0,'work ticker pulled the reader back to the prompt');
+  card.querySelector('.ask-q > div').textContent+=' More question text';await new Promise(resolve=>setTimeout(resolve,40));
+  check(messages.scrollTop===0,'card update ignored cancelled prompt following');
+  pending.click();await new Promise(resolve=>setTimeout(resolve,40));check(messages.scrollTop>0,'explicit View failed to resume prompt navigation');
+  const scrollbar=document.getElementById('messages-scrollbar'),capture=scrollbar.setPointerCapture;scrollbar.setPointerCapture=()=>{};
+  try{scrollbar.dispatchEvent(new PointerEvent('pointerdown',{button:0,pointerId:9,clientY:scrollbar.getBoundingClientRect().top,bubbles:true,cancelable:true}));scrollbar.dispatchEvent(new PointerEvent('pointerup',{button:0,pointerId:9,bubbles:true}));}finally{scrollbar.setPointerCapture=capture;}
+  messages.scrollTop=0;messages.dispatchEvent(new Event('scroll'));card.querySelector('.ask-q > div').textContent+=' Changed again';await new Promise(resolve=>setTimeout(resolve,60));
+  check(messages.scrollTop===0,'scrollbar navigation did not cancel prompt following');
+  reset();emit({type:'status',sessionId:'A',status:'running'});emit({type:'permission_request',sessionId:'A',requestId:'fold-prompt',toolName:'Bash',options:[{optionId:'allow',kind:'allow_once'}]});
+  pending.click();await new Promise(resolve=>setTimeout(resolve,40));const fold=messages.querySelector('.work-fold');fold.querySelector('.work-fold-btn').click();await new Promise(resolve=>setTimeout(resolve,80));
+  check(!fold.classList.contains('open')&&fold.dataset.userToggle==='closed','automatic prompt following reopened a manually closed fold');
+  document.getElementById('perm-fold-prompt').querySelector('.perm-title').textContent+=' Updated';await new Promise(resolve=>setTimeout(resolve,40));
+  check(!fold.classList.contains('open'),'card update reopened a manually closed fold');pending.click();
+  check(fold.classList.contains('open'),'explicit View did not open the pending fold');
+ });
+ for(const kind of ['question','permission']) for(const answered of [false,true]) await test(`manual scrolling immediately after ${kind} ${answered?'answer':'appearance'} cancels queued following`,async()=>{
+  reset();emit({type:'history',sessionId:'A',viewGen:gen,items:Array.from({length:12},(_,i)=>[
+   {id:'race-q'+i,role:'user',text:'Question '+i},{id:'race-a'+i,role:'assistant',text:'Long history\n'.repeat(20)}
+  ]).flat()});
+  emit({type:'status',sessionId:'A',status:'running'});
+  emit({type:'assistant_reasoning_delta',partId:'race-reasoning',fullText:'Long reasoning\n'.repeat(150),authoritative:true});
+  await new Promise(resolve=>setTimeout(resolve,40));
+  const body=messages.querySelector('.work-fold-body');body.scrollTop=body.scrollHeight;document.getElementById('jump-latest').click();
+  if(kind==='question')emit({type:'user_input_request',sessionId:'A',requestId:'race',questions:[{question:'Choose',options:[{value:'yes',label:'Yes'}]}]});
+  else emit({type:'permission_request',sessionId:'A',requestId:'race',toolName:'Bash',options:[{optionId:'allow',kind:'allow_once'}]});
+  const card=document.getElementById((kind==='question'?'ask-':'perm-')+'race');
+  if(answered)card.querySelector(kind==='question'?'button[data-val]':'button[data-opt]').click();
+  // Navigate in the same task, before the prompt's layout/answer callbacks run.
+  if(kind==='question')body.dispatchEvent(new WheelEvent('wheel',{deltaY:-80,bubbles:true}));
+  else messages.dispatchEvent(new KeyboardEvent('keydown',{key:'PageUp',bubbles:true,cancelable:true}));
+  body.scrollTop=0;messages.scrollTop=0;messages.dispatchEvent(new Event('scroll'));
+  await new Promise(resolve=>setTimeout(resolve,80));
+  check(messages.scrollTop===0,'queued prompt callback moved the outer transcript');
+  check(body.scrollTop===0,'queued prompt callback moved the reasoning viewport');
+  // Cancelling a pending scroll must also leave subsequent user scrolls active.
+  messages.scrollTop=100;messages.dispatchEvent(new Event('scroll'));
+  emit({type:'assistant_reasoning_delta',partId:'race-reasoning',fullText:'Long reasoning\n'.repeat(150)+'New content',authoritative:true});
+  check(body.scrollTop===0,'new reasoning resumed cancelled work following');
+  await new Promise(resolve=>setTimeout(resolve,40));
+  check(Math.abs(messages.scrollTop-100)<=1,'new content resumed cancelled transcript following');
+ });
+ await test('newest pending question controls remain above the floating composer',async()=>{
+  reset();emit({type:'status',sessionId:'A',status:'running'});
+  emit({type:'assistant_reasoning_delta',partId:'prompt-scroll',fullText:'思考内容\n'.repeat(150),authoritative:true});
+  emit({type:'user_input_request',sessionId:'A',requestId:'prompt-old',questions:[{question:'Old',options:[{value:'a',label:'A'}]}]});
+  emit({type:'user_input_request',sessionId:'A',requestId:'prompt-new',prompt:'问题说明\n'.repeat(30),questions:[{question:'Newest',options:[{value:'b',label:'B'}]}]});
+  document.getElementById('pending-action').click();
+  const card=document.getElementById('ask-prompt-new');check(document.activeElement===card,'pending action focused an older question');
+  await new Promise(resolve=>setTimeout(resolve,60));
+  const actions=card.querySelector('.ask-details > .ask-actions').getBoundingClientRect(),composer=document.querySelector('.composer-card').getBoundingClientRect();
+  check(actions.bottom<=composer.top-4,'question controls are hidden behind the composer');
+  check(actions.bottom<=document.getElementById('pending-action').getBoundingClientRect().top-4,'question controls overlap the pending-request shortcut');
+  check(actions.top>=document.getElementById('topbar').getBoundingClientRect().bottom,'question controls are hidden above the transcript');
+ });
  await test('pending user question is reachable and resolved decision returns keyboard focus',async()=>{
   reset();emit({type:'status',sessionId:'A',status:'running'});
   emit({type:'assistant_reasoning_delta',partId:'question-long',fullText:'Long reasoning.\n'.repeat(180),authoritative:true});
@@ -1409,7 +1751,7 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
 
  const imageFixture={ref:'image-ref',fileName:'sample.png',mime:'image/png',bytes:100};
  const addImage=(owner='A',id='image-test')=>{emit({type:'image_pending',sessionId:owner,imageId:id,fileName:imageFixture.fileName,mime:imageFixture.mime,bytes:100});emit({type:'image_ready',sessionId:owner,imageId:id,attachment:imageFixture});};
- await test('/plan refuses images without consuming the draft',()=>{reset('plan-image-owner');emit({type:'session_ready',sessionId:'plan-image-owner',viewGen:gen,title:'T',slashCommands:[{name:'plan',description:'Switch to Plan mode',inputHint:'/plan [task]'}]});type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));type('Keep this task');addImage('plan-image-owner');sendBtn.click();check(!sent.some(message=>message.type==='send'||message.type==='insert'||message.type==='setMode'),'unsupported /plan image was submitted');check(input.value==='Keep this task'&&document.querySelector('#image-drafts .image-chip'),'blocked /plan image was consumed');check(document.getElementById('toast').textContent.toLowerCase().includes('plan'),`blocked /plan image did not explain the restriction: ${document.getElementById('toast').textContent}`);});
+ await test('Plan action retains images for ordinary submission',()=>{reset('plan-image-owner');addImage('plan-image-owner');type('/plan');input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));check(document.querySelector('#image-drafts .image-chip'),'Plan selection consumed image');type('Describe this');sendBtn.click();check(sent.find(m=>m.type==='send')?.attachments.length===1,'Plan blocked image submission');});
  await test('draft image preview opens full data, preserves draft and rejects stale responses',()=>{
   reset('preview-draft');type('PREVIEW_CAPTION');addImage('preview-draft');
   const button=document.querySelector('#image-drafts .image-preview-btn');
@@ -1514,6 +1856,56 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
  });
 
 
+ await test('recorded truncated image summary is readable across live, completed and restored paths',()=>{
+  const raw=truncatedImageFixture;
+  const summary=raw.slice(raw.indexOf('**Output:**')+'**Output:**'.length).split(/\n[ \t]{8,}(?=\S)/,1)[0].trim();
+  const payload=summary.replace(/^\*\*analyze_image_result_summary:\*\*\s*/,'');
+  const inspect=()=>{
+   const card=messages.querySelector('.tool-call');check(card,'image tool card missing');
+   const output=card.querySelector('.tool-io.out')?.textContent||'';
+   check(output.startsWith('# 图片内容描述\n\n## 界面布局'),'nested string was not decoded into readable lines');
+   check(output.includes('圆形按钮')&&output.includes('Tool AskUserQuestion requires user interaction'),'received image content was discarded');
+   check(!output.includes('result_summary')&&!output.includes('[{"text"')&&!output.includes('\\n'),'transport wrapper or escaped newlines remain visible');
+   check(output.includes('图片分析结果不完整，仅显示已收到的内容。'),'truncated image output has no incomplete-result notice');
+   check(!output.includes('看到了，这张截图'),'following assistant prose was absorbed into the tool result');
+  };
+  const begin=()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'truncated-q',role:'user',text:'分析图片'}]});emit({type:'status',sessionId:'A',status:'running'});};
+  begin();emit({type:'assistant_reasoning_delta',partId:'truncated-reasoning',fullText:raw,authoritative:true});inspect();
+  check(messages.textContent.includes('还想试试多选题或带预览面板的形态吗？'),'live reasoning lost the following reply');
+  emit({type:'status',sessionId:'A',status:'completedSuccess'});inspect();
+  begin();emit({type:'tool_call',toolCallId:'truncated-native',toolName:'analyze_image',status:'completed',inputText:'{"imageSource":"image"}',outputText:payload});inspect();
+  begin();emit({type:'assistant_text_delta',partId:'truncated-text',fullText:raw,authoritative:true,streaming:false});inspect();
+  check(messages.textContent.includes('还想试试多选题或带预览面板的形态吗？'),'assistant text lost the following reply');
+  for(const kind of ['reasoning','text']){
+   begin();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'truncated-q',role:'user',text:'分析图片'},{id:'truncated-history',role:'assistant',text:'',steps:[{kind,partId:'truncated-history',text:raw}]}]});inspect();
+   check(messages.textContent.includes('还想试试多选题或带预览面板的形态吗？'),'restored '+kind+' lost the following reply');
+  }
+  begin();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'truncated-q',role:'user',text:'分析图片'},{id:'truncated-native-history',role:'assistant',text:'',steps:[{kind:'tool',toolCallId:'truncated-native-history',toolName:'analyze_image',status:'completed',inputText:'{"imageSource":"image"}',outputText:payload}]}]});inspect();
+ });
+ await test('tool-like labels in image parameters and descriptions cannot split cards or erase the reply',()=>{
+  reset();const literal='图片文字 **Z.ai Built-in Tool: webReader** 和 **Output:** 后面还有正文。';
+  const raw='**Z.ai Built-in Tool: analyze_image**\n```json\n'+JSON.stringify({prompt:literal})+'\n```\n**Output:**\n**analyze_image_result_summary:** '+JSON.stringify([{text:literal}])+'\n\n最终回复保留。';
+  emit({type:'assistant_text_delta',partId:'quoted-tool-heading',fullText:raw,authoritative:true});
+  check(messages.querySelectorAll('.tool-call').length===1,'image text created a phantom tool');
+  check(messages.querySelector('.tool-io.out')?.textContent===literal,'image description was truncated at a quoted tool heading');
+  check(messages.textContent.includes('最终回复保留。'),'quoted tool heading erased the following reply');
+  emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'quoted-q',role:'user',text:'图片'},{id:'quoted-r',role:'assistant',text:'',steps:[{kind:'reasoning',text:raw}]}]});
+  check(messages.querySelectorAll('.tool-call').length===1&&messages.querySelector('.tool-io.out')?.textContent===literal,'history reinterpreted image text as a tool');
+ });
+ await test('recorded image-service error is readable in live reasoning and restored tool cards',()=>{
+  reset();const output="**Output:**\n**analyze_image_result_summary:** [{\"text\": \"MCP error 400: 400 Bad Request: \\\"{\\\"error\\\":{\\\"code\\\":\\\"1210\\\",\\\"message\\\":\\\"图片输入格式/解析错误\\\"}}\\\"\", \"type\": \"text\"}]";
+  const raw='图片已上传，我用视觉模型读取截图内容：**🌐 Z.ai Built-in Tool: analyze_image**\n\n**Input:**\n```json\n{}\n```\n*Executing on server...*\n'+output;
+  const checkOutput=()=>{const card=messages.querySelector('.tool-call');check(card,'image tool card missing');const text=card.querySelector('.tool-io.out')?.textContent||'';check(text.includes('MCP error 400')&&text.includes('图片输入格式/解析错误'),'actual image-service failure missing');check(!text.includes('result_summary')&&!text.includes('[{"text"'),'raw wrapper remains visible');};
+  emit({type:'assistant_reasoning_delta',partId:'recorded-image',fullText:raw,authoritative:true});checkOutput();
+  emit({type:'assistant_reasoning_delta',partId:'recorded-image-output',fullText:output,authoritative:true});
+  const separate=messages.querySelector('.work-note[data-part-id="recorded-image-output"]');
+  check(separate?.textContent.includes('图片输入格式/解析错误')&&!separate.textContent.includes('result_summary'),'separate image result part exposed its JSON envelope');
+  emit({type:'status',sessionId:'A',status:'completedSuccess'});
+  check(!separate.textContent.includes('result_summary')&&separate.textContent.includes('MCP error 400'),'completion restored the raw image result');
+  emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'recorded-q',role:'user',text:'识别图片'},{id:'recorded-r',role:'assistant',text:'',steps:[{kind:'reasoning',partId:'recorded-image',text:raw}]}]});checkOutput();
+  emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'recorded-q',role:'user',text:'识别图片'},{id:'recorded-r',role:'assistant',text:'',steps:[{kind:'reasoning',partId:'recorded-output-history',text:output}]}]});
+  const restored=messages.querySelector('.work-note');check(restored?.textContent.includes('图片输入格式/解析错误')&&!restored.textContent.includes('result_summary'),'restored separate result exposed its JSON envelope');
+ });
  await test('reasoning image-analysis builtin renders a card and retains raw identity across restores',()=>{
   reset(); emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'u-image',role:'user',text:'image question'}]}); emit({type:'status',sessionId:'A',status:'running'});
   const raw='Before analysis\n**Z.ai Built-in Tool: analyze_image**\n```json\n{"imageSource":"image"}\n```\n*Executing on server...*';
@@ -1589,12 +1981,12 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
  });
  await test('signed numeric tilde ranges stay literal in streamed and restored replies',()=>{
   reset();type('SIGNED_RANGES');sendBtn.click();
-  const ranges='范围 −3.2~−0.8米；第二段 -4.5~-2.2米；进度 0~+2.50%；小数 0~.5 与 1~.8。';
-  const text=ranges+'\n\n~~过期说明~~ 和 ~旧说明~\n\n`-2~-1`\n\n```text\n0~+1\n```';
+  const ranges='约 ~2秒，另一次 ~3秒；区间 2~3秒；约 ~ 2秒 和 ~−0.5秒、~+.5秒。范围 −3.2~−0.8米；第二段 -4.5~-2.2米；进度 0~+2.50%；小数 0~.5 与 1~.8。几百毫秒~3 秒，总启动则是 4~6 秒。';
+  const text=ranges+'\n\n~~过期说明~~ 和 ~旧说明~；~~123~~、2~~old~~、~~2秒~~\n\n`-2~-1`\n\n```text\n0~+1\n```';
   const checkReply=()=>{
    const prose=messages.querySelector('.message.assistant .md');
    check(prose?.textContent.includes(ranges),'signed range text changed');
-   check([...prose.querySelectorAll('del')].map(node=>node.textContent).join('|')==='过期说明|旧说明','signed ranges became strikethrough or intentional strikethrough broke');
+   check([...prose.querySelectorAll('del')].map(node=>node.textContent).join('|')==='过期说明|旧说明|123|old|2秒','signed ranges became strikethrough or intentional strikethrough broke');
    check([...prose.querySelectorAll('code')].some(node=>node.textContent==='-2~-1'),'inline code changed');
    check(prose.querySelector('pre code')?.textContent.trim()==='0~+1','fenced code changed');
   };
@@ -1617,13 +2009,14 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(messages.querySelector('.tool-call').dataset.toolStatus===expected,'late settled text revived running status');
   check([...messages.querySelectorAll('.message.assistant')].some(node=>node.textContent.includes('VISIBLE_FINAL_IMAGE_REPLY')&&!node.closest('.work-fold')),'final answer folded into analysis');
  });
- await test('protocol image analysis cannot remain running after success or revive from a late update',()=>{
+ for(const terminal of ['completedSuccess','completedInterrupted'])await test('protocol image analysis cannot remain running after '+terminal+' or revive from a late update',()=>{
   reset();emit({type:'status',sessionId:'A',status:'running'});
   emit({type:'tool_call',toolCallId:'image-terminal',toolName:'analyze_image',status:'running',inputText:'{"imageSource":"local:test"}'});
-  emit({type:'status',sessionId:'A',status:'completedSuccess'});
-  check(document.getElementById('tool-image-terminal').dataset.toolStatus==='completed','protocol image analysis stayed running');
+  emit({type:'status',sessionId:'A',status:terminal});
+  const expected=terminal==='completedSuccess'?'completed':'cancelled';
+  check(document.getElementById('tool-image-terminal').dataset.toolStatus===expected,'protocol image analysis stayed running');
   emit({type:'tool_call',toolCallId:'image-terminal',toolName:'analyze_image',status:'running',outputText:'LATE_COMPLETE_IMAGE_RESULT'});
-  check(document.getElementById('tool-image-terminal').dataset.toolStatus==='completed'&&messages.textContent.includes('LATE_COMPLETE_IMAGE_RESULT'),'late output revived or lost image result');
+  check(document.getElementById('tool-image-terminal').dataset.toolStatus===expected&&messages.textContent.includes('LATE_COMPLETE_IMAGE_RESULT'),'late output revived or lost image result');
   check(!messages.querySelector('.work-fold[data-state="running"]'),'late image result restarted a settled work clock');
  });
  await test('workspace @ menu selects files without sending and ignores stale replies',async()=>{
@@ -1651,7 +2044,7 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(getComputedStyle(send).borderRadius==='50%','send button is no longer circular');
   const first={sessionId:'sess_11111111-1111-4111-8111-111111111111',title:'Review current plan'};
   const second={sessionId:'sess_22222222-2222-4222-8222-222222222222',title:'Review older notes'};
-  emit({type:'sessions',currentId:'mention-sessions',includeArchived:false,sessions:[{sessionId:'mention-sessions',title:'Current'},first,second,{sessionId:'sess_archived',title:'Review archived',archivedAt:1}]});
+  emit({type:'sessions',currentId:'mention-sessions',includeArchived:false,sessions:[{sessionId:'mention-sessions',title:'Current'},first,second,{sessionId:'sess_archived',title:'Review archived',archivedAt:1}],referenceSessions:[{sessionId:'mention-sessions',title:'Current'},first,second]});
   input.focus();type('@review');input.setSelectionRange(input.value.length,input.value.length);input.dispatchEvent(new Event('input'));
   await new Promise(r=>setTimeout(r,150));
   const request=[...sent].reverse().find(item=>item.type==='searchWorkspaceFiles');check(request?.text==='review','merged @ did not search workspace files');
@@ -1665,13 +2058,29 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(input.value===''&&menu.hidden,'session selection did not consume @ query');
   check(document.querySelector('#attachments .session-ref-chip')?.textContent.includes(first.title),'selected session did not become a visible reference');
   check(!sent.some(item=>item.type==='switchSession'),'referencing a session switched the active conversation');
+  emit({type:'sessions',currentId:'mention-sessions',includeArchived:true,sessions:[{sessionId:'sess_archived',title:'Review archived',archivedAt:1}],referenceSessions:[first,second]});
+  check(document.querySelector('#attachments .session-ref-chip')?.textContent.includes(first.title),'opening archives lost the selected reference');
+  type('@review');input.setSelectionRange(input.value.length,input.value.length);input.dispatchEvent(new Event('input'));
+  await new Promise(r=>setTimeout(r,150));
+  const archiveRequest=[...sent].reverse().find(item=>item.type==='searchWorkspaceFiles');
+  emit({type:'workspace_files',requestId:archiveRequest.requestId,sessionId:archiveRequest.sessionId,files:[]});
+  check(menu.textContent.includes(first.title)&&menu.textContent.includes(second.title)&&!menu.textContent.includes('Review archived'),'archive tab replaced active conversation suggestions');
+  const secondChoice=[...menu.querySelectorAll('button[role="option"]')].find(button=>button.textContent.includes(second.title));secondChoice.click();
+  check(document.querySelectorAll('#attachments .session-ref-chip').length===2,'an active reference could not be added after viewing archives');
   type('Compare this conversation');sendBtn.click();
   const message=sent.find(item=>item.type==='send');
-  check(message?.sessionRefs?.length===1&&message.sessionRefs[0].sessionId===first.sessionId,'session reference was mixed with file chips or omitted');
+  check(message?.sessionRefs?.length===2&&message.sessionRefs[0].sessionId===first.sessionId&&message.sessionRefs[1].sessionId===second.sessionId,'session reference was mixed with file chips or omitted after viewing archives');
   check(messages.querySelector('.message.user .session-ref-chip')?.textContent.includes(first.title),'sent bubble did not show its conversation reference');
   emit({type:'send_rejected',sessionId:'mention-sessions',commandId:message.commandId,text:message.text,sessionRefs:message.sessionRefs,message:'fixture rejection'});
   check(document.querySelector('#attachments .session-ref-chip')?.textContent.includes(first.title),'failed send did not restore the session reference');
-  emit({type:'sessions',currentId:'mention-sessions',includeArchived:false,sessions:[]});
+  type('@Review');input.setSelectionRange(input.value.length,input.value.length);input.dispatchEvent(new Event('input'));
+  await new Promise(r=>setTimeout(r,150));
+  const renameRequest=[...sent].reverse().find(item=>item.type==='searchWorkspaceFiles');
+  emit({type:'workspace_files',requestId:renameRequest.requestId,sessionId:renameRequest.sessionId,files:[]});
+  emit({type:'session_title',sessionId:first.sessionId,title:'Review renamed conversation'});
+  check(menu.textContent.includes('Review renamed conversation')&&!menu.textContent.includes(first.title),'renaming did not refresh the open conversation suggestions');
+  emit({type:'sessions',currentId:'mention-sessions',includeArchived:false,sessions:[],referenceSessions:[]});
+  check(!menu.querySelector('button[role="option"]'),'workspace cache reset left old conversation suggestions');
   emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});
  });
 
@@ -1856,6 +2265,21 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
     check((getComputedStyle(pop).backdropFilter||'').includes('blur'), 'option menu is not frosted');
     pop.querySelector('.overlay-item').click();
     check(!pop.classList.contains('open'), 'menu stayed open after a choice');
+
+    const current = {providerId:'vendor',modelId:'GLM-5.3'};
+    const many = Array.from({length: 40}, (_, index) => ({
+      providerId: index === 20 ? current.providerId : `vendor-${index}`,
+      modelId: index === 20 ? current.modelId : `model-${String(index + 1).padStart(2, '0')}`,
+      label: index === 20 ? current.modelId : `model-${String(index + 1).padStart(2, '0')}`,
+      hasKey: true
+    }));
+    document.getElementById('model-chip').click();
+    emit({type:'models', current, available: many});
+    const active = pop.querySelector('.overlay-item.active');
+    check(active && active.textContent.includes('GLM-5.3'), 'current model is not marked active');
+    check(active && Math.abs(active.getBoundingClientRect().bottom - pop.getBoundingClientRect().bottom) < 2,
+      'model picker did not reveal the current choice');
+    document.body.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
     document.getElementById('btn-settings').click();
     const settings=document.getElementById('settings-menu');
     check(!settings.hidden && (getComputedStyle(settings).backdropFilter||'').includes('blur'), 'settings menu is not frosted');
@@ -2379,6 +2803,82 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(document.getElementById('thought-chip').getAttribute('aria-label').includes('Low')||document.getElementById('thought-chip').getAttribute('aria-label').includes('低'),'reasoning rollback did not restore the confirmed choice');
   document.getElementById('plan-indicator').click();const request=sent.filter(item=>item.type==='setMode').at(-1);check(request?.mode==='build'&&request.sessionId==='A'&&request.viewGen===gen,'leaving plan used an unconfirmed permission or lost ownership');
  });
+await test('startup status separates service startup from restoring the last chat',async()=>{
+ reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});
+ const label=document.getElementById('conn-label');
+ const original=Date.now;let now=original();Date.now=()=>now;
+ try{
+  emit({type:'status',status:'connecting',phase:'starting'});
+  check(label.textContent==='正在启动服务','service startup was not named');
+  emit({type:'status',status:'connecting',phase:'restoring',waitedSeconds:8});
+  check(label.textContent.includes('正在恢复上次会话')&&label.textContent.includes('已等待 8 秒')&&label.textContent.includes('草稿会保留'),'long restore did not explain the wait and preserved draft');
+  now+=1000;await new Promise(resolve=>setTimeout(resolve,1100));check(label.textContent.includes('已等待 9 秒'),'visible startup wait did not advance');
+  emit({type:'session_ready',sessionId:'A',viewGen:gen});
+  check(label.textContent==='已连接','connected session kept the startup wait');
+ }finally{Date.now=original;}
+});
+await test('session list failures stay inside the list and remain distinct from an empty workspace',()=>{
+ reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});
+ document.getElementById('btn-sessions').click();
+ emit({type:'sessions',includeArchived:false,currentId:'A',sessions:[],notice:'initial'});
+ const first=document.getElementById('session-list-notice');
+ check(!first.hidden&&first.textContent.includes('会话列表加载失败')&&!!first.querySelector('button'),'first failure looked like an empty workspace or had no retry');
+ check(!document.querySelector('#overlay-list').textContent.includes('没有匹配项'),'first failure used the empty-result message');
+ first.querySelector('button').click();
+ const firstRetry=sent.at(-1);
+ check(firstRetry?.type==='listSessions'&&firstRetry.includeArchived===false&&firstRetry.listVisible===true,'first failure did not retry the visible list');
+ emit({type:'sessions',includeArchived:false,currentId:'A',sessions:[{sessionId:'A',title:'上次会话'}],notice:'stale'});
+ const notice=document.getElementById('session-list-notice');
+ check(!notice.hidden&&notice.textContent.includes('刷新失败，当前显示上次结果')&&document.querySelector('#overlay-list').textContent.includes('上次会话'),'stale refresh replaced the previous result or hid the notice');
+ notice.querySelector('button').click();
+ const staleRetry=sent.at(-1);
+ check(staleRetry?.type==='listSessions'&&staleRetry.includeArchived===false&&staleRetry.listVisible===true,'session notice did not retry');
+ emit({type:'sessions',includeArchived:true,currentId:'A',sessions:[],notice:'initial'});
+ check(!document.querySelector('#overlay-list').textContent.includes('上次会话')&&document.getElementById('session-list-notice').textContent.includes('会话列表加载失败'),'archived first failure kept the active page');
+ emit({type:'sessions',includeArchived:false,currentId:'A',sessions:[{sessionId:'A',title:'上次会话'}],notice:'ready'});
+ check(document.getElementById('session-list-notice').hidden,'successful refresh left the failure notice');
+});
+await test('session lists can load older results without losing search or archive scope',()=>{
+ reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});
+ document.getElementById('btn-sessions').click();
+ emit({type:'sessions',currentId:'A',includeArchived:false,sessions:[],referenceSessions:[],hasMore:true,notice:'ready'});
+ const notice=document.getElementById('session-list-notice');const button=notice.querySelector('button');
+ check(!notice.hidden&&button.textContent==='加载更多会话'&&notice.textContent.includes('仅显示已加载'),'a capped empty page looked complete');
+ const search=document.getElementById('overlay-search');search.value='Earlier';search.dispatchEvent(new Event('input'));
+ check(!notice.hidden,'filtering hid the load-more action');
+ button.click();const request=sent.at(-1);
+ check(request.type==='listSessions'&&request.loadMore===true&&request.includeArchived===false&&button.disabled,'load-more did not request the active page or show pending state');
+ const pending=sent.length;button.click();check(sent.length===pending,'double-click duplicated a pending page request');
+ emit({type:'sessions',currentId:'A',includeArchived:false,sessions:[{sessionId:'earlier',title:'Earlier conversation'}],referenceSessions:[{sessionId:'earlier',title:'Earlier conversation'}],hasMore:false,notice:'ready'});
+ check(notice.hidden&&document.getElementById('overlay-list').textContent.includes('Earlier conversation')&&search.value==='Earlier','older results lost the filter or kept a completed-page warning');
+ emit({type:'sessions',currentId:'A',includeArchived:true,sessions:[{sessionId:'archived',title:'Earlier archived'}],referenceSessions:[],hasMore:true,notice:'ready'});
+ button.click();check(sent.at(-1)?.loadMore===true&&sent.at(-1)?.includeArchived===true,'load-more lost archived scope');
+ const cancelled=sent.at(-1).requestId;
+ emit({type:'session_list_complete',requestId:'unrelated-request'});
+ check(button.disabled,'unrelated completion released an active request');
+ emit({type:'session_list_complete',requestId:cancelled});
+ check(!button.disabled&&document.getElementById('overlay-list').textContent.includes('Earlier archived'),'cancelled expansion remained stuck or discarded the list');
+ button.click();
+ emit({type:'session_list_complete',requestId:cancelled});
+ check(button.disabled,'an old completion released a newer request');
+ emit({type:'sessions',currentId:'A',includeArchived:true,sessions:[{sessionId:'archived',title:'Earlier archived'}],referenceSessions:[],hasMore:true,notice:'stale'});
+ check(!button.disabled&&button.textContent==='重试'&&document.getElementById('overlay-list').textContent.includes('Earlier archived'),'failed expansion discarded cached rows or blocked retry');
+});
+await test('reply selections survive VS Code clipboard command focus recovery',()=>{
+ reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'copy-q1',role:'user',text:'One'},{id:'copy-a1',role:'assistant',text:'First selection'},{id:'copy-q2',role:'user',text:'Two'},{id:'copy-a2',role:'assistant',text:'Second selection'}]});
+ const replies=[...messages.querySelectorAll('.message.assistant .md')];
+ for(const [index,expected] of ['First selection','Second selection'].entries()){
+  input.focus();input.blur();messages.focus();
+  const range=document.createRange();range.selectNodeContents(replies[index]);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);
+  // VS Code's webview wrapper restores the last focused control before copy
+  // when the document body has focus. The transcript must retain its selection.
+  if(document.activeElement===document.body||document.activeElement===document.documentElement)input.focus();
+  check(selection.toString().trim()===expected,'clipboard focus recovery erased the selected reply');
+ }
+ input.focus();input.value='Composer text';input.setSelectionRange(0,8);
+ check(document.activeElement===input&&input.value.slice(input.selectionStart,input.selectionEnd)==='Composer','transcript focus interfered with input selection');
+ getSelection().removeAllRanges();
+});
  await new Promise(r=>setTimeout(r,30));
  clearInterval(window.auditFrameKeepAlive);
  const pre=document.createElement('pre');pre.id='audit-results';pre.textContent=JSON.stringify({tests,errors:window.browserErrors || []});document.body.appendChild(pre);if(tests.some(t=>!t.pass)) document.body.setAttribute('data-smoke','failed');

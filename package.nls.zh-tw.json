@@ -1,5 +1,6 @@
 {
   "command.showChromeSettings.title": "ZCode: 開啟顯示設定",
+  "config.showSuppressedPluginSkills.description": "這些外掛關閉時，仍在 / 選單列出文件、PDF、簡報、表格和瀏覽器技能。選取後不傳送該技能。啟用會記住，之後啟動會拉起這些 MCP。",
   "command.setQuotaApiKey.title": "ZCode: 設定額度 API Key",
   "config.quotaAdapters.description": "可為自訂供應商設定唯讀額度介面。providerId 必須與目前模型完全一致。欄位使用 JSON Pointer，例如 /data/balance；金鑰透過「設定額度 API Key」命令儲存，不寫入 settings。除無認證的本機 HTTP 外必須使用 HTTPS。",
   "quotaAdapter.schemaVersion.description": "選用的配接器協定版本；省略時視為 v1，後續版本會繼續相容既有 v1 設定。",
@@ -60,5 +61,10 @@
   "quotaAdapter.field.budgetLimitDivisor.description": "上限金額的選用正數除數，例如用 100 將分換算為元。",
   "quotaAdapter.field.budgetUsedPath.description": "已用金額的 JSON Pointer。多請求時以請求 ID 開頭，例如 /usage/total。",
   "quotaAdapter.field.budgetUsedDivisor.description": "相減前用來縮放已用金額的除數；例如額度使用元、介面回傳分時填 100。",
-  "capabilities.untrustedWorkspaces.description": "ZCode Chat 需要啟動本機 ZCode 程序，因此僅在受信任的工作區中執行。"
+  "capabilities.untrustedWorkspaces.description": "ZCode Chat 需要啟動本機 ZCode 程序，因此僅在受信任的工作區中執行。",
+  "config.formulaFonts.description": "遇到公式時是否下載 KaTeX 字型。auto 在回覆旁詢問，on 下載並保留字型，off 使用系統字型且不再詢問。",
+  "config.formulaFonts.auto": "在公式回覆旁詢問",
+  "config.formulaFonts.on": "下載並使用公式字型",
+  "config.formulaFonts.off": "使用系統字型，不再詢問",
+  "config.allowedDesktopPlugins.description": "允許在擴充功能中啟用的外掛，仍遵循桌面端原有開關。修改會重新啟動目前對話。瀏覽器和電腦控制共用 JavaScript REPL。"
 }

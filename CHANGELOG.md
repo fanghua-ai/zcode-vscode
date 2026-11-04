@@ -1,5 +1,192 @@
 # 更新日志 / Changelog
 
+## 2.2.0 — 2026-11-04
+
+本版本汇总并正式发布 2.1.0–2.1.7 预览版中经过验证的改进。以下为相较上一稳定版 2.0.2 的主要变化；与 2.1.7 预览版相比没有新增功能。
+
+This stable release brings together the improvements validated in previews 2.1.0–2.1.7. The highlights below describe changes since stable version 2.0.2. There are no new features compared with preview 2.1.7.
+
+### 中文
+- **默认行为变化：**扩展内默认关闭 Word、PDF、演示文稿、表格、浏览器、电脑控制和 Sites 插件，以减少后台服务和内存占用。需要相关能力时，可在聊天设置中分别允许；允许后仍遵循桌面端原有开关。修改会重启当前会话，不改变桌面端保存的插件开关。
+- `/` 菜单支持命令、技能和子智能体；技能与子智能体以标签显示，支持同时选择多个。计划模式随草稿保存，在发送时应用。
+- 优化启动和会话恢复，减少重复认证、模型查询与历史渲染开销。
+- 改善插件与桌面端的会话互见、项目归属和归档同步，兼容旧会话及 Windows 路径差异。
+- 会话列表支持加载更早的记录，并改善搜索、引用和刷新失败后的重试。
+- 修复连续复制、图片分析结果显示、问答卡片定位及跨平台图标和文字对齐问题。
+- 改善流式回复渲染，减少长回复及代码内容更新时的卡顿。
+- 修复会话切换和重启后的权限、计划模式及草稿恢复，避免附件遗漏和重复发送。
+- 增加协议不兼容、连接失败和模型不可用时的提示与恢复操作。
+- 使用 VS Code 内置 SQLite，移除 WASM 回退库；公式字体按需下载，减小安装包体积。
+
+### English
+- **Default behavior change:** Word, PDF, presentation, spreadsheet, browser, computer-use, and Sites plugins are suppressed in the extension by default to reduce background services and memory use. Allow them individually in chat settings when needed; desktop preferences still apply. Changes restart the current chat without changing saved desktop plugin switches.
+- Select commands, skills, and subagents from the `/` menu. Skills and subagents appear as tags, with multiple selections supported. Plan mode stays with the draft and takes effect on submission.
+- Improve startup and session restoration by reducing repeated authentication, model queries, and history-rendering work.
+- Improve session visibility, project association, and archive synchronization between the extension and desktop app, including older sessions and Windows path variations.
+- Load older sessions and improve search, conversation references, and retry after refresh failures.
+- Fix repeated copying, image-analysis output rendering, question-card navigation, and cross-platform icon and text alignment.
+- Improve streaming rendering to reduce stalls during long replies and code updates.
+- Restore permissions, Plan mode, and drafts across session switches and restarts, and prevent missing attachments and duplicate submissions.
+- Provide clearer guidance and recovery actions for protocol incompatibility, connection failures, and unavailable models.
+- Use VS Code's built-in SQLite and remove the WASM fallback. Download math fonts on demand to reduce package size.
+
+## 2.1.7 — 2026-11-03
+
+### 中文
+- `/` 菜单内置「计划模式」入口，选择保存在草稿中，发送时才应用；支持正文、附件、会话切换和失败恢复。
+- 在聊天设置中分别控制 Word、PDF、演示文稿、表格、浏览器、电脑控制和 Sites 插件。默认关闭，允许启用后仍遵循桌面端原有开关；修改会重启当前会话。
+- 选择被关闭的文档或浏览器技能时，只询问是否允许对应插件，不再同时启用整组服务。当前运行时无法应用关闭设置时显示提示。
+
+### English
+- The `/` menu provides a local Plan mode action. The choice stays in the draft until submission and survives attachments, session switches, and failed sends.
+- Control Word, PDF, presentation, spreadsheet, browser, computer-use, and Sites plugins separately in chat settings. They are suppressed by default; allowing a plugin still follows desktop preferences. Changes restart the current chat.
+- Choosing a suppressed document or browser skill offers to allow only its plugin. Show a warning when the runtime cannot apply plugin suppression.
+
+## 2.1.6 — 2026-10-30
+
+### 中文
+- 会话重启或切换后正确恢复保存的权限和计划模式；新建会话的默认权限及空会话中的手动调整也会保留。
+- 新建会话优先使用创建响应中的标识，避免后台请求使其误关联到旧会话。
+- 自动恢复和切换会话前核对 CLI 归档状态，避免重新打开已归档的会话。
+- 会话列表支持继续加载更早的记录，避免较早的活动会话被归档记录挤出；搜索和引用随已加载记录更新。
+- 同时拖入图片和普通文件时保留整批附件，避免遗漏或重复上传。
+- 连接或切换会话期间添加附件时显示提示，避免粘贴图片后没有反馈。
+- 通用错误优先提供重新连接，模型不可用时仍提供切换模型；协议错误提供对应的处理提示，启动排查操作失败时显示反馈。
+- 未标注有效语言的代码块按纯文本显示，减少恢复长代码历史时的卡顿；保留明确语言的语法高亮。
+- 恢复尚未选定模型的会话时复用有效的模型目录，减少初始化等待。
+
+### English
+- Restore saved permissions and Plan mode after restarts and session switches, including defaults and manual permission changes in empty conversations.
+- Use the identity returned by session creation so background requests cannot attach a new chat to the previous one.
+- Check CLI archive state before automatic session selection to avoid reopening archived conversations.
+- Load older session records on demand so archived records do not hide earlier active chats; search and references update with loaded records.
+- Preserve mixed image and file drops without missing files or duplicate uploads.
+- Explain when attachments cannot be added during connection or session switching.
+- Offer reconnect for generic errors and model selection for unavailable models, provide relevant protocol error guidance, and report failed startup guidance actions.
+- Keep code without a supported language label as plain text to reduce history-rendering stalls, while retaining explicit-language highlighting.
+- Reuse a current model catalog when restoring a session without a selected model, reducing initialization waits.
+
+## 2.1.5 — 2026-10-28
+
+### 中文
+- 修复图片分析结果在截断、嵌套编码或单独到达时露出 JSON 包装和转义字符的问题；保留参数和结果中引用的工具标题、Output 标签等文字，并提示结果不完整。
+- 问答卡片定位到最下方的操作区，并避开浮动输入框；多个待处理请求时优先查看最新一张，自动跟随尊重手动浏览和折叠。
+- 使用方向键浏览较长的命令与能力菜单时，高亮项始终保持可见。
+- 查看归档页后仍可选择和发送正常会话引用；工作区切换与会话重命名及时更新引用候选。
+- 避免连续点击重试重复发送；重试保留 Plan 模式，正确处理恢复草稿及后来新增的输入和附件。
+- 修复代码中的反引号产生多余代码块、代码示例被误识别为工具调用的问题。
+- 已停止的工具不再因迟到更新重新显示为运行中；会话同步失败时提供重新连接指引。
+- 调整问题跳转数字和选中边框的居中对齐。
+- 统一工作过程图标、文字和展开箭头的垂直对齐，减少不同系统字体和显示缩放下的偏移，并保留折叠标题的完整高度。
+- 修复消息中技能和子智能体标签与正文的文字基线不齐。
+- 整理 MIT 许可证和第三方图标声明，便于自动识别项目许可证，并完整保留第三方署名与许可。
+
+### English
+- Decode truncated, nested, and standalone image-analysis results instead of showing JSON envelopes and escape sequences; preserve quoted tool headings and Output labels in parameters and results, and identify incomplete results.
+- Reveal the bottom actions of question cards above the floating composer, open the newest pending request first, and respect manual reading and folding.
+- Keep the highlighted entry visible while navigating long command and capability menus with the arrow keys.
+- Keep active conversation references available after viewing archives, and update suggestions when the workspace or session title changes.
+- Prevent repeated retry clicks from sending duplicate messages; retain Plan mode and handle recovered drafts without discarding or duplicating newer input and attachments.
+- Preserve literal backticks without extra code blocks, and keep tool examples inside code from becoming real tool calls.
+- Keep stopped tools from returning to a running state after late updates, and offer reconnect guidance for session synchronization failures.
+- Center question navigation numbers and their active outline.
+- Center work-step icons, labels, and expand arrows consistently across system fonts and display scales, and preserve the full height of collapsed thought headers.
+- Align inline skill and subagent labels with the surrounding message text.
+- Separate the MIT license from third-party icon notices for license detection while preserving all third-party attribution and license text.
+
+## 2.1.4 — 2026-10-27
+
+### 中文
+- 修复工作耗时信息晚到后仍只显示“已工作”的问题。
+- 修复图片分析结果显示为转义 JSON 文本的问题。
+- 在输入 `/` 时提供技能和子智能体建议；可选择多个引用，并在输入区管理。
+
+### English
+- Refresh completed work durations when turn timing arrives after the initial transcript.
+- Render image-analysis results as readable text instead of escaped JSON.
+- Show ZCode skills and subagents in the slash menu and manage multiple references in the composer.
+
+## 2.1.3 — 2026-10-26
+
+### 中文
+- 修复选中回复后 Ctrl+C 或右键复制无效、或只能复制一次的问题。
+
+### English
+- Fix selected reply text failing to copy with Ctrl+C or the context menu, including copies failing after the first attempt.
+
+## 2.1.2 — 2026-10-26
+
+### 中文
+- 修复个人与团队套餐并发认证时相互干扰、导致偶发登录失败的问题。
+- 遇到 ZCode 服务端请求或参数不兼容时，提示检查桌面端与扩展版本，并提供重新连接和诊断反馈指引，避免误判为登录或额度问题。
+- 插件市场页的输入区示意图继续使用已发布的 GitHub 图片。图片无法显示时，说明通常是访问 GitHub 的网络连接异常，并保留分区文字说明。
+- 启动时区分“正在启动服务”和“正在恢复上次会话”。等待较久时显示已等待时间，并说明草稿会保留。
+- 会话列表刷新失败时在列表内提示，并可以重试。已有结果时继续显示该页上次结果；首次加载失败会提供重试，不再显示为没有会话。活动页和归档页互不借用对方的结果。
+- 切换会话失败后可以再次选择同一会话。恢复超时，或恢复后对话订阅超时，都不再停在无法再次点击的空白页。
+
+### English
+- Fix occasional sign-in failures when personal and team plan authentication requests run concurrently.
+- Explain incompatible ZCode server requests or parameters, guide users to check desktop and extension versions, reconnect and share diagnostics, and avoid misleading sign-in or quota guidance.
+- Keep the Marketplace composer illustration on its published GitHub image. If it cannot be shown, explain that the GitHub connection is usually unavailable and keep the section guide visible.
+- Distinguish “Starting service” from “Restoring last chat” during startup. After a longer wait, show the elapsed time and explain that the draft will be kept.
+- Show an in-list notice with retry when a chat list cannot refresh. Keep that page's previous result when one exists, and offer retry after a failed first load instead of showing an empty workspace. Active and archived pages do not reuse each other's results.
+- A failed chat switch can be selected again. A restore timeout, or a conversation subscription timeout after restore, no longer leaves a blank page that ignores the next click.
+
+## 2.1.1 — 2026-10-25
+
+### 中文
+- 减少启动时团队及个人套餐 OAuth 换证的重复请求和模型列表读取，先完成会话订阅再请求额度，缩短进入对话时的等待。
+- 启动时恢复会话等待 90 秒，避免冷启动尚未完成就改开其他会话；超时后不再重复发送恢复请求。
+- 会话恢复进行中刷新侧栏会继续等待，恢复超时但服务端仍在处理时也一样，不再提前报告会话列表超时。
+- 会话尚未恢复完成时不再查询状态，启动和切换时不再出现 Session is not active 警告。
+- Windows 上启动恢复会话超过 20 秒时，提示可能是 Microsoft Defender 扫描 ZCode 插件文件，并可复制排除命令，由用户自行决定；可选择不再提示。
+- 选中模型回复后，始终通过扩展写入系统剪贴板；网页剪贴板即使返回成功，也不再出现选中后无法粘贴的情况。
+- 数字两侧的单个波浪号按范围显示，例如“几百毫秒~3 秒，总启动则是 4~6 秒”，不再把中间内容画成删除线；真正的 `~~删除线~~` 保持不变。
+- 回复生成中切换供应商时，额度面板立即显示所选供应商的额度，并继续在下一条消息应用该模型。
+- 打开模型选择器时自动定位到当前选中的模型，长列表中不再需要手动查找。
+
+### English
+- Reduce repeated team and personal plan OAuth exchanges and model catalog reads during startup, and subscribe to the conversation before fetching quota.
+- Restoring a chat at startup waits 90 seconds, so a cold start does not open another chat before that restore finishes. A timeout does not send a second restore request.
+- Refreshing the sidebar keeps waiting while a chat is being restored, including after a restore times out while the server is still working, instead of reporting a session-list timeout.
+- Session state is no longer read before a chat finishes resuming, so startup and switching no longer report Session is not active.
+- On Windows, when restoring a chat at startup takes over 20 seconds, a notice explains that Microsoft Defender may be scanning ZCode plugin files and can copy an exclusion command. The choice stays with the user, and the notice can be turned off.
+- Copying selected model text always writes it through the extension, so a webview clipboard that reports success can no longer leave the selection unpastable.
+- A single tilde beside a number stays a range marker, so text such as “几百毫秒~3 秒，总启动则是 4~6 秒” is no longer struck through; genuine `~~strikethrough~~` is unchanged.
+- When switching providers while a reply is running, the quota panel follows the selected provider immediately; the model is still applied to the next message.
+- Opening the model picker reveals the currently selected model, so long lists no longer require manual scrolling.
+
+
+## 2.1.0 — 2026-10-24
+
+### 中文
+
+- 更正第三方声明：公式字体不进入安装包。按需下载的字体包附带 SIL OFL 全文；已安装的旧字体包会在下次美化时重新下载。
+- 说明稳定版与预览版的更新通道。手动安装改为按 `zcode-desktop-chat-<版本>.vsix` 选择文件，不再写死旧文件名。
+- 关闭尚未启动成功的 ZCode 时，不再把终止信号发给编辑器自身。
+- 多个窗口同时下载公式字体时各自使用临时目录；其他窗口已经装好时直接复用，不再互相删除缓存。
+- 修复点击美化公式后字形不变的问题。字体随页面注入，不再让 webview 按文件加载 WOFF2。
+- 公式字体缓存不完整时重新下载；下载过程中「美化公式」不再接受重复点击。
+- 公式字体改为按需下载，安装包不再附带字体。回复结束后，可在复制和时间旁选择美化公式；下载一次后可离线使用。
+- 修复 Windows 路径变体导致会话索引冲突、桌面占位会话不可见及归档会话漏关联；跨库同步部分成功时明确提示，并支持重试相同操作。
+- 修复插件会话在新版桌面端落入普通任务的问题；自动复用或创建对应目录的项目，并补齐未关联会话的项目归属。
+- 各平台统一使用 VS Code 内置 SQLite，保留 WAL 快照恢复能力并移除 WASM 运行库，缩小安装包。
+- 合并同一帧内的回复增量，减少流式输出时的重复绘制；代码在生成过程中先以纯文本显示，结束后恢复高亮。
+
+### English
+
+- Correct the third-party notice: formula fonts are not included in the install package. The downloaded font pack includes the full SIL OFL text, and an older installed pack is downloaded again the next time formulas are improved.
+- Document the stable and preview update channels. Manual installation now uses `zcode-desktop-chat-<version>.vsix` instead of a stale filename.
+- Closing a ZCode process that never started no longer signals the editor itself.
+- Give each window its own temporary directory when downloading formula fonts, and reuse a pack another window has already installed instead of deleting the cache.
+- Fix formulas staying on the system font after Improve formulas. The faces are injected into the page instead of loaded as webview WOFF2 files.
+- Download formula fonts again when the saved pack is incomplete, and ignore extra clicks on Improve formulas while a download is running.
+- Download formula fonts on demand instead of including them in the install package. After a reply finishes, Improve formulas appears beside Copy and the time; the download is kept for offline use.
+- Fix session index conflicts with Windows path variants, invisible desktop placeholders, and missing project links for archived sessions. Report partial saves across databases and allow retrying the same operation.
+- Keep plugin sessions in the matching desktop project, creating a project for new workspace directories and associating previously unassigned sessions.
+- Use VS Code’s built-in SQLite across platforms, retain WAL snapshot recovery, and remove the WASM runtime to reduce package size.
+- Combine reply updates within each frame to reduce repeated rendering. Show plain code while streaming and restore syntax highlighting when the text finishes.
+
 ## 2.0.2 — 2026-10-23
 
 ### 中文

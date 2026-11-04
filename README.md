@@ -19,12 +19,14 @@
 
 ![输入区示意](https://raw.githubusercontent.com/fanghua-ai/zcode-vscode/main/media/composer-guide.png)
 
+如果图片没有出现，通常是访问 GitHub 的网络连接异常。可以稍后刷新页面，或查看下面的分区说明。
+
 | 位置 | 用途 |
 |------|------|
 | 输入框上方 | 排队消息和目标；排队项可调整顺序、编辑、删除或立即发送。 |
 | 顶部数字轨道 | 跳转历史问题；右侧三横线可折叠或恢复对话。 |
 | 输入框上沿 | 添加图片或文件、查看引用和连接状态。 |
-| 输入区 | 编写问题；`@` 引用工作区文件或会话，`/` 选择能力。 |
+| 输入区 | 编写问题；`@` 引用工作区文件或会话，`/` 搜索命令、技能和子智能体。 |
 | 左下角 | 切换模型、权限和推理强度；紧凑模式用盾牌图标表示权限，并可收起控件。 |
 | 右下角 | 双环显示上下文和额度概况；发送、立即插入与停止按钮随运行状态切换。 |
 | 下方额度栏 | 展开后查看上下文、5 小时与每周额度的比例和详情；第三方 API 可通过 `zcode.quotaAdapters` 映射显示。 |
@@ -39,11 +41,11 @@
 
 ### 适配范围
 
-**Linux** 已测试，目前使用基本正常；**Windows** 已由作者实际测试，但仍发现过会话互不可见的适配问题；**macOS** 暂未实测，可能存在尚未发现的问题。Windows 和 macOS 的代码均已有适配，仍需在具体安装环境中验证。
+**Linux** 已测试，目前使用基本正常；**Windows** 已由作者实际测试，但仍发现过会话互不可见的适配问题；**macOS ARM64 和 Intel** 已通过 GitHub CI 的类型检查、完整单元测试、构建和打包检查，以及 VS Code 最低支持版 1.106.0 与当前稳定版中的 SQLite 扩展宿主回归。macOS 的真实账号登录、端到端聊天和界面体验仍待验证。[完整验证记录](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917427) · [SQLite 宿主验证记录](https://github.com/fanghua-ai/zcode-vscode/actions/runs/41789711444)
 
-本版本已在 **ZCode 桌面端 3.12.3 和 3.14.4** 上验证；3.14.4 已完成真实会话切换与停止回归。更早的桌面版本不支持，未列出的版本仍需验证兼容性。
+本版本支持 **ZCode 桌面端 3.12.3–3.16.3**。已验证 3.12.3、3.14.4 和 3.16.3；3.14.4 已完成真实会话切换与停止回归，3.16.2 起适配了会话列表协议变化。更早或更新的桌面版本不在支持范围内。
 
-2.0.2 进一步适配桌面端 **3.16.2** 的 Coding Plan 鉴权和自定义 API 配置。3.16.2 已通过隔离配置下的真实运行时会话切换、停止和附件回归；Z.AI 个人套餐仍需真实账号验证，macOS 仍未实测。
+2.0.2 进一步适配桌面端 **3.16.2** 的 Coding Plan 鉴权和自定义 API 配置。3.16.2 已通过隔离配置下的真实运行时会话切换、停止和附件回归；Z.AI 个人套餐仍需真实账号验证；macOS 的 CI 验证不包含桌面端真实账号聊天。
 
 桌面端更新后协议可能变化，建议确认扩展兼容性后再更新。
 
@@ -56,7 +58,7 @@
 | # | 条件 | 如何确认 |
 |---|------|----------|
 | 1 | VS Code **1.106 或更高**，已安装本扩展并 **Reload Window** | 帮助 → 关于 |
-| 2 | 已安装 **ZCode 桌面端 3.12.3 或 3.14.4**，且能找到 `zcode.cjs` | 见下方[探测路径](#zcodecjs-探测顺序) |
+| 2 | 已安装 **ZCode 桌面端 3.12.3–3.16.3**，且能找到 `zcode.cjs` | 见下方[探测路径](#zcodecjs-探测顺序) |
 | 3 | 桌面端 **已经登录过** | 存在 `~/.zcode/v2/setting.json` 和 `~/.zcode/v2/credentials.json` |
 | 4 | 当前桌面选择里有 **还能用的模型凭据**（个人或团队项目，且有额度） | 桌面端能正常开一个新对话 |
 
@@ -64,12 +66,17 @@
 
 在 VS Code 扩展市场搜索 **ZCode Chat**（发布者 **fanghua**）并安装，再执行 **Developer: Reload Window**。
 
-也可以使用 VSIX 安装：
+市场有两条更新通道：
 
-命令面板：**Extensions: Install from VSIX…** → 选择下载的 `zcode-desktop-chat-2.0.1.vsix` → **Developer: Reload Window**。
+- **稳定版**使用偶数次版本号，当前是 **2.2.0**。直接安装会留在稳定版，不会自动升到预览版。
+- **预览版**使用奇数次版本号。只有在扩展页面选择 **Install Pre-Release Version**，或执行 `code --install-extension fanghua.zcode-desktop-chat --pre-release` 的用户才会安装预览版，并继续接收更高的预览版。之后若发布更高版本号的稳定版，预览版会被该稳定版替换。
+
+也可以手动安装 VSIX。文件名是 `zcode-desktop-chat-<版本>.vsix`，请选择与要安装的稳定版或预览版一致的文件：
+
+命令面板：**Extensions: Install from VSIX…** → 选择下载的 VSIX → **Developer: Reload Window**。
 
 ```bash
-code --install-extension zcode-desktop-chat-2.0.1.vsix --force
+code --install-extension zcode-desktop-chat-<版本>.vsix --force
 ```
 
 ### 使用
@@ -94,7 +101,7 @@ code --install-extension zcode-desktop-chat-2.0.1.vsix --force
 
 输入框上方显示手动加入的文件引用标签；选区引用带行号，可点击 × 移除。引用格式与桌面端相同，例如 `[main.ts](./src/main.ts#L12-L34)`。
 
-悬浮引用标签可查看完整路径、整个文件或选中片段，以及未保存修改提示。整文件引用在发送时读取最新编辑器内容；选区引用保留添加时的快照。图片分析卡片默认收起，展开后可分别查看参数和完整结果。
+输入 `/` 可搜索当前会话的命令、技能和子智能体；用上下键移动，Tab 或 Enter 选择。已关闭的文档和浏览器技能仍会列出，选中后可以允许对应插件；选择会记住，并重启当前会话，仍遵循桌面端原有开关。技能和子智能体可多次选择，在输入区下方显示并点击移除。悬浮引用标签可查看完整路径、整个文件或选中片段，以及未保存修改提示。整文件引用在发送时读取最新编辑器内容；选区引用保留添加时的快照。图片分析卡片默认收起，展开后可分别查看参数和完整结果。
 
 问询卡片在回答、拒绝或停止后会缩成工作区内的摘要行，点击可查看原问题和选择；完成后的选项不能重复提交。
 
@@ -103,13 +110,13 @@ code --install-extension zcode-desktop-chat-2.0.1.vsix --force
 - **把选区加入对话** — 钉住选区
 - **把当前文件加入对话** — 钉住文件
 
-在输入框输入 `@` 可搜索当前会话工作区的文件和会话，文件排在前面、会话排在后面；继续输入文件名、路径或会话标题筛选。用上下键选择、Enter／Tab 添加引用，Escape 关闭。文件引用显示在输入框上方；会话引用显示为独立标签，并随草稿和发送失败恢复保留。文件搜索包括 `.vscode` 等隐藏配置文件，跳过 `.git`、依赖和构建目录；支持模糊匹配并优先显示最近打开的文件；输入查询后直接在整个工作区进行定向搜索，不再依赖最初列出的文件。最多展示 40 条文件结果，同一查询缓存约 15 秒；每种搜索模式最多取 5,000 个候选，空查询列出最多 1,000 个文件。失败时可点击重试或按 Enter。含空格的文件名可用 `@"文件 名"` 搜索。能力和技能选择暂未加入。
+在输入框输入 `@` 可搜索当前会话工作区的文件和会话，文件排在前面、会话排在后面；继续输入文件名、路径或会话标题筛选。用上下键选择、Enter／Tab 添加引用，Escape 关闭。文件引用显示在输入框上方；会话引用显示为独立标签，并随草稿和发送失败恢复保留。文件搜索包括 `.vscode` 等隐藏配置文件，跳过 `.git`、依赖和构建目录；支持模糊匹配并优先显示最近打开的文件；输入查询后直接在整个工作区进行定向搜索，不再依赖最初列出的文件。最多展示 40 条文件结果，同一查询缓存约 15 秒；每种搜索模式最多取 5,000 个候选，空查询列出最多 1,000 个文件。失败时可点击重试或按 Enter。含空格的文件名可用 `@"文件 名"` 搜索。技能和子智能体不在此 @ 菜单中；请用 / 搜索。
 
 从 VS Code 文件树拖入文件也可加入引用。跨工作区文件使用相对实际会话根目录的路径；未保存的文件会携带当前内容，过大的未保存文件请选中所需片段。
 
 智能体修改文件后，可在对应工具卡片中打开文件或查看 diff。
 
-回复支持行内公式 `$…$`、`\(...\)` 和独立公式 `$$…$$`、`\[...\]`，公式字体随扩展离线提供。宽公式可横向滚动；不支持的语法保留原文，代码块不做公式转换。
+回复支持行内公式 `$…$`、`\(...\)` 和独立公式 `$$…$$`、`\[...\]`。公式离线显示；回复旁的「美化公式」会下载约 260 KB 字体，之后可离线使用。宽公式可横向滚动；不支持的语法保留原文，代码块不做公式转换。
 
 ### 登录与模型
 
@@ -125,7 +132,7 @@ code --install-extension zcode-desktop-chat-2.0.1.vsix --force
 
 ### 设置
 
-VS Code 设置里搜索 `ZCode`：
+聊天右上角设置菜单提供「扩展中的插件服务」：分别允许 Word、PDF、演示文稿、表格、浏览器、电脑控制和 Sites。默认全部屏蔽，允许后仍遵循桌面端原有开关。修改会重启当前会话，请先结束正在进行的回复。
 
 | 设置 | 默认 | 说明 |
 |------|------|------|
@@ -134,6 +141,8 @@ VS Code 设置里搜索 `ZCode`：
 | `zcode.language` | `auto` | 跟随 VS Code，也可选择简体中文、繁体中文或英文 |
 | `zcode.workspacePath` | 空（当前窗口第一个文件夹） | 发给智能体的工作区根目录 |
 | `zcode.model` | 空（跟桌面默认） | 覆盖项，格式 `providerId/modelId` |
+| `zcode.allowedDesktopPlugins` | `[]` | 用户级允许列表，工作区不能覆盖。支持 documents、pdf、presentations、spreadsheets、browser-use、computer-use、zcode-site；允许不强制启用桌面端已关闭的插件。浏览器和电脑控制共用 REPL。修改后重启会话 |
+| `zcode.showSuppressedPluginSkills` | `true` | 上述插件关闭时，仍在 `/` 菜单列出文档、PDF、演示文稿、表格和浏览器技能。选中后不发送该技能，可以允许对应插件；选择会记住并重启当前会话 |
 | `zcode.quotaAdapters` | 空 | 自定义供应商额度接口；用 `providerId` 精确匹配，并映射或组合 JSON 返回字段。配置后运行 `ZCode: Set quota API key` 保存密钥。详见[额度适配器说明](docs/quota-adapters.md) |
 
 相关命令：`ZCode: Show Log`、`ZCode: Open Chat`、`ZCode: Set quota API key`。
@@ -178,13 +187,13 @@ VS Code 设置里搜索 `ZCode`：
 
 再打开 **ZCode: Show Log**（输出面板频道名 `ZCode`），对照下面的提示。聊天错误卡片上的「重试 / 打开日志 / 重新读取登录 / 选择模型」与这些情况对应。
 
-扩展用 VS Code 自带的运行时启动 app-server：
+扩展用 VS Code 自带的运行时启动 app-server。默认会先加载本扩展的 preload，只让这个进程把文档、浏览器和电脑控制插件看成关闭：
 
 ```text
-<VS Code 运行时> <zcode.cjs> app-server
+<VS Code 运行时> --require <扩展目录>/dist/desktopPluginOverlayPreload.cjs <zcode.cjs> app-server
 ```
 
-`zcode.binaryPath` 填写 `zcode.cjs`。桌面端名为 `zcode` / `ZCode` 的程序是 Electron 主程序，不是这个入口。
+将全部七项加入 `zcode.allowedDesktopPlugins` 后无需加载 preload。原生可执行文件无法加载 preload，关闭设置不能生效时会提示。建议使用桌面端的 `resources/glm/zcode.cjs` 入口。
 
 #### 本机自检
 
@@ -215,15 +224,16 @@ macOS 可再查 `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`。Win
 |------------|----------|------|
 | 一直「连接中」或「读取登录…」然后失败 | 找不到 `zcode.cjs`，或 app-server 起不来 | 看日志里 `Starting app-server` 的 `cmd` / `args`；确认 `zcode.cjs` 存在，`cmd` 是 VS Code 的运行时 |
 | 连接最终成功，但首次等待很长 | 登录、会话恢复或共享扩展宿主阻塞 | 对照 `session timing`；若 `hostEventLoopDelayMaxMs` 达到数千毫秒，可尝试下面的独立宿主设置 |
+| Windows 上长时间未启动后，首次恢复会话要等几十秒；短时间内重开很快 | Microsoft Defender 实时扫描 ZCode 服务端同步读取的插件文件 | 恢复超过 20 秒时扩展会提示一次，可复制排除命令。如自行权衡后需要处理，在管理员 PowerShell 中排除 `<ZCode 安装目录>\resources\glm\packages` 和 `%USERPROFILE%\.zcode\cli\plugins`，不要排除 `Code.exe`；用 `Remove-MpPreference -ExclusionPath` 撤销 |
 | `ZCode credentials not found` | 没有 `~/.zcode/v2/credentials.json` | 打开桌面端登录后再 Reload |
 | `ZCode desktop data not found` | 没有 `~/.zcode/v2` | 先安装并登录桌面端 |
 | `Could not reuse the BigModel team plan` / `coding-plan login` | 桌面 OAuth 过期，或当前选的项目换了 | 桌面端保持登录并选对项目，扩展里「重新读取登录」 |
 | `Provider … has no usable API key` | 选中的供应商在当前登录里没有密钥 | 桌面端切回有密钥的项目，或换模型 |
 | `ZCode startup failed` / `ZCode process exited` | 子进程立刻退出 | 日志 stderr；确认 `binaryPath` 指向 `.cjs`，`cmd` 是 VS Code 的运行时 |
 | `无法定位 CLI ZCode Built-in Provider Config` | 桌面更新后 app-server 找不到内置模型配置 | 确认桌面已打开过一次；扩展会带上 `ZCODE_BUILTIN_PROVIDER_*` 环境变量。若仍失败，检查 `/opt/ZCode/resources/config/provider/zcode-builtin.json`（macOS 在 `ZCode.app/Contents/Resources/config/provider/`） |
-| `Unrecognized key` / `Method not found` / `not in the workspace model registry` | 桌面端版本和本扩展不匹配 | 把 ZCode 桌面升到当前最新，并安装对应的本扩展 vsix |
+| `Unrecognized key` / `Method not found` / `-32602` | 桌面端升级后 app-server 协议发生变化 | 确认桌面端在 3.12.3–3.16.3 内，并安装匹配的扩展版本后重新连接 |
 | `余额不足` / 类似额度错误 | 当前桌面选择的套餐没额度 | 桌面端换有额度的项目，再「重新读取登录」 |
-| `无法安全写入 WAL 数据库` | 当前 VS Code 的 SQLite 写入能力不可用 | 升级 VS Code 后重试；扩展不会把临时快照写入误报为成功 |
+| `当前 VS Code 运行环境不支持原生 SQLite` | 扩展宿主缺少所需的 `node:sqlite` 模块 | 更新 VS Code 后重试；数据库读取和写入都需要原生 SQLite |
 | 历史里归档会话跑到「活动」 | 读不了桌面的 `tasks-index.sqlite`（少见） | 看日志里 sqlite / archive；VS Code 过旧时能力会降级，一般仍能聊 |
 | `会话同步失败` / `会话快照同步超时` | 对话快照同步失败或超时；扩展会逐步延长间隔自动重试 | 稍等后重新切换会话；仍未恢复可重新加载窗口，并提供日志中的 `conversation resync failed`。任务完成时的正常重同步不代表故障 |
 | 已连接但插件与桌面端互相看不到会话 | 工作区路径不同，或 Windows 上同一目录被记录成不同大小写（如 `e:\Projects\项目` 与 `E:\Projects\项目`） | 先确认两端打开同一文件夹，并检查 `zcode.workspacePath` 是否覆盖了路径；Windows 路径大小写兼容问题已在 1.3.5 修复，并由作者初步实测确认会话可对齐；安装 1.3.5 或更高版本后 Reload Window；看不到会话不一定表示数据丢失 |
@@ -241,14 +251,14 @@ macOS 可再查 `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`。Win
 日志里成功启动时会出现类似：
 
 ```text
-Starting app-server { cmd: '…/code', args: [ '…/zcode.cjs', 'app-server' ], cwd: '…' }
+Starting app-server { cmd: '…/code', args: [ '--require', '…/desktopPluginOverlayPreload.cjs', '…/zcode.cjs', 'app-server' ], cwd: '…' }
 ```
 
-`args[0]` 是存在的 `zcode.cjs`。`cmd` 是 VS Code 的运行时。
+`cmd` 是 VS Code 的运行时。`--require` 后面是扩展自带的 preload；它之后的参数是存在的 `zcode.cjs`。允许全部七项插件后，`args` 只剩 `zcode.cjs` 和 `app-server`。
 
 #### 需要请人协助时
 
-可以先把本 README 交给本机智能体，让它按上述步骤排查。Windows 会话互不可见时，重点比较桌面 `setting.json` 中的 `recentProjects`、会话索引的 `workspace_key` 和 VS Code 的实际工作区路径；macOS 尚未实测，遇到异常时先核对安装路径、运行时及工作区是否一致。
+可以先把本 README 交给本机智能体，让它按上述步骤排查。Windows 会话互不可见时，重点比较桌面 `setting.json` 中的 `recentProjects`、会话索引的 `workspace_key` 和 VS Code 的实际工作区路径；macOS 已有上述 CI 与 SQLite 宿主验证，真实账号聊天和界面体验仍待验证，遇到异常时先核对安装路径、运行时及工作区是否一致。
 
 把下面几项一并给出（不要发送 `credentials.json` 原文或任何 API Key）：
 
@@ -274,12 +284,14 @@ Chat with the ZCode agent from the VS Code secondary side bar (the right-hand ch
 
 ![Composer layout](https://raw.githubusercontent.com/fanghua-ai/zcode-vscode/main/media/composer-guide.en.png)
 
+If the image does not appear, the connection to GitHub is usually unavailable. Refresh the page later, or use the section guide below.
+
 | Location | Purpose |
 |----------|---------|
 | Above the composer | Queued messages and goals. Reorder, edit, delete, or send a queued message immediately. |
 | Number rail | Jump to an earlier question; the three-line control collapses or restores conversations. |
 | Top of the composer | Add images or files, review references, and check the connection state. |
-| Prompt area | Write a question; `@` references workspace files or conversations, and `/` selects a capability. |
+| Prompt area | Write a question; `@` references workspace files or conversations, and `/` searches commands, skills, and subagents. |
 | Bottom left | Switch model, permission mode, and reasoning effort. Compact mode shows permission as a shield icon and can collapse the controls. |
 | Bottom right | Two rings summarize context and quota; send, insert-now, and stop controls vary with the running state. |
 | Quota strip | Expand for context, five-hour, and weekly quota details; map third-party API readings with `zcode.quotaAdapters`. |
@@ -294,11 +306,11 @@ For development and contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). This 
 
 ### Compatibility
 
-**Linux** has been tested and is currently working well. **Windows** has been tested by the author, but session visibility issues have still been found. **macOS** has not been tested on a real machine and may have undiscovered issues. Both Windows and macOS have platform adaptations, which still need verification in each installation environment.
+**Linux** has been tested and is currently working well. **Windows** has been tested by the author, but session visibility issues have still been found. **macOS ARM64 and Intel** have passed type checks, the full unit suite, builds and package checks in GitHub CI, plus SQLite regression tests inside real VS Code extension hosts on the minimum supported version 1.106.0 and the current stable version. Real-account sign-in, end-to-end chat and the UI experience on macOS still need verification. [Full verification](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917427) · [SQLite host verification](https://github.com/fanghua-ai/zcode-vscode/actions/runs/41789711444)
 
-This version has been verified with **ZCode desktop 3.12.3 and 3.14.4**, including real session-switching and stop-behavior regression checks on 3.14.4. Earlier desktop versions are unsupported; unlisted versions still require compatibility testing.
+This version supports **ZCode desktop 3.12.3-3.16.3**. Versions 3.12.3, 3.14.4, and 3.16.3 have been verified; 3.14.4 completed real session-switching and stop-behavior checks, and the session-list protocol change starting in 3.16.2 is handled. Earlier or newer desktop versions are outside the supported range.
 
-Version 2.0.2 also adapts Coding Plan authentication and custom API configuration for desktop **3.16.2**. Its actual runtime has passed session-switching, stop, and attachment regressions with isolated fixtures. Z.AI personal plans still need real-account validation; macOS remains untested.
+Version 2.0.2 also adapts Coding Plan authentication and custom API configuration for desktop **3.16.2**. Its actual runtime has passed session-switching, stop, and attachment regressions with isolated fixtures. Z.AI personal plans still need real-account validation; macOS CI does not cover real-account desktop chat.
 
 Desktop updates may change the protocol. Check extension compatibility before updating.
 
@@ -311,7 +323,7 @@ Before starting a chat, check the following:
 | # | Requirement | How to check |
 |---|-------------|--------------|
 | 1 | VS Code **1.106 or newer**, with this extension installed and the window reloaded | Help → About |
-| 2 | **ZCode desktop 3.12.3 or 3.14.4**, with `zcode.cjs` found | See [discovery order](#zcodecjs-discovery-order) below |
+| 2 | **ZCode desktop 3.12.3-3.16.3**, with `zcode.cjs` found | See [discovery order](#zcodecjs-discovery-order) below |
 | 3 | You have **signed in to the desktop app at least once** | `~/.zcode/v2/setting.json` and `~/.zcode/v2/credentials.json` exist |
 | 4 | The current desktop selection has **usable model credentials** (an individual or team project that still has quota) | The desktop app can start a new chat |
 
@@ -319,12 +331,17 @@ Before starting a chat, check the following:
 
 Search for **ZCode Chat** by **fanghua** in the VS Code Extensions Marketplace, install it, then run **Developer: Reload Window**.
 
-Alternatively, install a VSIX:
+The Marketplace has two update channels:
 
-Command Palette: **Extensions: Install from VSIX…** → choose the downloaded `zcode-desktop-chat-2.0.1.vsix` → **Developer: Reload Window**.
+- **Stable** releases use an even minor version. The current stable release is **2.2.0**. A normal install stays on stable and is not upgraded to a preview.
+- **Preview** releases use an odd minor version. Only users who choose **Install Pre-Release Version** on the extension page, or run `code --install-extension fanghua.zcode-desktop-chat --pre-release`, receive a preview and later higher previews. A later stable release with a higher version replaces the preview.
+
+You can also install a VSIX manually. Its name is `zcode-desktop-chat-<version>.vsix`; choose the file for the stable or preview release you want:
+
+Command Palette: **Extensions: Install from VSIX…** → choose the downloaded VSIX → **Developer: Reload Window**.
 
 ```bash
-code --install-extension zcode-desktop-chat-2.0.1.vsix --force
+code --install-extension zcode-desktop-chat-<version>.vsix --force
 ```
 
 ### Usage
@@ -354,7 +371,7 @@ Files dragged from the VS Code file tree can also be referenced. Paths are relat
 
 After the agent changes a file, the tool card can open the file or show a diff.
 
-Replies support inline math with `$…$` or `\(...\)` and display math with `$$…$$` or `\[...\]`. Formula fonts are bundled for offline rendering. Wide formulas scroll horizontally; unsupported syntax remains readable, and code blocks are unchanged.
+Replies support inline math with `$…$` or `\(...\)` and display math with `$$…$$` or `\[...\]`. Formulas render offline with system fonts. Choose Improve formulas beside a reply to download the 260 KB font pack once; later formulas keep those fonts offline. Wide formulas scroll horizontally; unsupported syntax remains readable, and code blocks are unchanged.
 
 ### Sign-in and models
 
@@ -372,7 +389,7 @@ The interface follows the VS Code display language by default (Simplified Chines
 
 The small top-right control above the composer toggles question navigation. Click the context ring and the chevron beside it at the bottom right to toggle the quota panel. The panel uses one compact row of three equal-width progress indicators for context, five-hour quota, and weekly quota. All three display the percentage used; hover over an indicator for exact counts, remaining quota, and reset times. Its expansion state is saved; a waiting message appears until data arrives.
 
-Search for `ZCode` in VS Code settings:
+Chat settings provide individual controls for Word, PDF, presentations, spreadsheets, browser, computer use, and Sites. All are suppressed by default. Allowing one still follows desktop preferences. Changes restart the current chat; finish any running reply first.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -381,6 +398,8 @@ Search for `ZCode` in VS Code settings:
 | `zcode.language` | `auto` | Follow VS Code, or choose Simplified Chinese, Traditional Chinese, or English |
 | `zcode.workspacePath` | Empty (first folder in the window) | Workspace root sent to the agent |
 | `zcode.model` | Empty (desktop default) | Override as `providerId/modelId` |
+| `zcode.allowedDesktopPlugins` | `[]` | User-only allowlist: documents, pdf, presentations, spreadsheets, browser-use, computer-use, zcode-site. Allowing does not force-enable plugins disabled by the desktop. Browser and computer use share the REPL. Changes restart the chat |
+| `zcode.showSuppressedPluginSkills` | `true` | While those plugins are off, still list the document, PDF, presentation, spreadsheet, and browser skills in `/`. Choosing one does not send it. Allowing its plugin is remembered, restarts the chat, and still follows desktop preferences |
 | `zcode.quotaAdapters` | Empty | Custom provider quota endpoints, matched by exact `providerId`, with JSON response fields mapped or combined. Run `ZCode: Set quota API key` to store the secret. See [quota adapter guide](docs/quota-adapters.md). |
 
 Related commands: `ZCode: Show Log`, `ZCode: Open Chat`, `ZCode: Set quota API key`.
@@ -425,13 +444,13 @@ Choose **Settings → Copy diagnostics** in the top-right corner and give the re
 
 Open **ZCode: Show Log** first (Output channel name `ZCode`), then match the message below. The chat error card actions “重试 / 打开日志 / 重新读取登录 / 选择模型” (Retry / Open log / Reload sign-in / Select model) correspond to these cases.
 
-The extension starts app-server with the runtime that ships with VS Code:
+The extension starts app-server with the runtime that ships with VS Code. By default it loads this extension's preload first, so only that process treats the document, browser, and computer-use plugins as disabled:
 
 ```text
-<VS Code runtime> <zcode.cjs> app-server
+<VS Code runtime> --require <extension>/dist/desktopPluginOverlayPreload.cjs <zcode.cjs> app-server
 ```
 
-Set `zcode.binaryPath` to `zcode.cjs`. The desktop program named `zcode` / `ZCode` is the Electron app, and it is not this entry point.
+Allowing all seven plugins skips the preload. Native executables cannot load it; an unsupported suppression request shows a warning. Use the desktop resources/glm/zcode.cjs entry point.
 
 #### Local checks
 
@@ -461,15 +480,16 @@ Error cards provide recovery steps and direct actions for models, connections an
 | What you see | Usual cause | What to do |
 |--------------|-------------|------------|
 | Stays on “连接中” or “读取登录…” and then fails | `zcode.cjs` was not found, or app-server did not start | Check `cmd` / `args` on `Starting app-server` in the log; confirm `zcode.cjs` exists and `cmd` is the VS Code runtime |
+| On Windows, the first chat restore after a long break takes tens of seconds, while reopening soon afterwards is fast | Microsoft Defender scans the plugin files that the ZCode server reads synchronously | The extension shows a one-time notice when a restore takes over 20 seconds and can copy an exclusion command. If you accept the trade-off, exclude `<ZCode install folder>\resources\glm\packages` and `%USERPROFILE%\.zcode\cli\plugins` in an administrator PowerShell, never `Code.exe`; undo with `Remove-MpPreference -ExclusionPath` |
 | `ZCode credentials not found` | `~/.zcode/v2/credentials.json` is missing | Sign in with the desktop app, then Reload |
 | `ZCode desktop data not found` | `~/.zcode/v2` is missing | Install the desktop app and sign in |
 | `Could not reuse the BigModel team plan` / `coding-plan login` | Desktop OAuth expired, or the selected project changed | Stay signed in on the desktop and select the right project, then “重新读取登录” in the extension |
 | `Provider … has no usable API key` | The selected provider has no key in the current sign-in | Switch back to a project that has a key, or change the model |
 | `ZCode startup failed` / `ZCode process exited` | The child process exited immediately | Read stderr in the log; confirm `binaryPath` points at the `.cjs` file and `cmd` is the VS Code runtime |
 | `无法定位 CLI ZCode Built-in Provider Config` | After a desktop update, app-server cannot find the built-in model config | Open the desktop app once; the extension sets `ZCODE_BUILTIN_PROVIDER_*`. If it still fails, check `/opt/ZCode/resources/config/provider/zcode-builtin.json` (on macOS, `ZCode.app/Contents/Resources/config/provider/`) |
-| `Unrecognized key` / `Method not found` / `not in the workspace model registry` | The desktop version and this extension do not match | Update the ZCode desktop to the current latest, and install the matching extension vsix |
+| `Unrecognized key` / `Method not found` / `-32602` | A desktop update changed the app-server protocol | Use desktop 3.12.3-3.16.3, install the matching extension, and reconnect |
 | `余额不足` or a similar quota error | The plan selected in the desktop app has no quota | Switch to a project that has quota, then “重新读取登录” |
-| `无法安全写入 WAL 数据库` | This VS Code runtime cannot safely write the WAL database | Upgrade VS Code and retry; temporary snapshot writes are never reported as saved |
+| `当前 VS Code 运行环境不支持原生 SQLite` | This VS Code runtime does not support native SQLite | Update VS Code and retry |
 | An archived session shows under “活动” (Active) in history | The desktop `tasks-index.sqlite` could not be read (uncommon) | Check sqlite / archive in the log; a very old VS Code degrades this, and chat usually still works |
 | `Conversation synchronization failed` / `Conversation snapshot synchronization timed out` | Snapshot synchronization failed or timed out; the extension retries with increasing delays | Wait, then switch away and back. Reload the window if it does not recover, and include `conversation resync failed` logs. Normal resynchronization at turn completion is not a fault |
 | Connected, but sessions are not visible across the extension and desktop | Different workspace paths, or Windows spelling differences for the same directory, such as `e:\Projects\项目` and `E:\Projects\项目` | Confirm both apps use the same folder and check `zcode.workspacePath`. The Windows path spelling issue was fixed in 1.3.5, and the author confirmed in an initial test that sessions became visible. Install 1.3.5 or later, then reload the window. Missing list entries do not necessarily mean lost data |
@@ -477,14 +497,14 @@ Error cards provide recovery steps and direct actions for models, connections an
 A successful start looks like this in the log:
 
 ```text
-Starting app-server { cmd: '…/code', args: [ '…/zcode.cjs', 'app-server' ], cwd: '…' }
+Starting app-server { cmd: '…/code', args: [ '--require', '…/desktopPluginOverlayPreload.cjs', '…/zcode.cjs', 'app-server' ], cwd: '…' }
 ```
 
-`args[0]` is an existing `zcode.cjs`. `cmd` is the VS Code runtime.
+`cmd` is the VS Code runtime. The entry after `--require` is this extension's preload, followed by an existing `zcode.cjs`. With all seven plugins allowed, `args` contains only `zcode.cjs` and `app-server`.
 
 #### When asking for help
 
-First give this README to a local AI agent and ask it to follow the checks above. For Windows session visibility issues, compare `recentProjects` in the desktop `setting.json`, `workspace_key` in the task index, and the actual VS Code workspace path. macOS has not been tested on a real machine; check the installation path, runtime, and workspace if issues occur.
+First give this README to a local AI agent and ask it to follow the checks above. For Windows session visibility issues, compare `recentProjects` in the desktop `setting.json`, `workspace_key` in the task index, and the actual VS Code workspace path. macOS has the CI and SQLite host coverage described above; real-account chat and visual behavior still need validation. Check the installation path, runtime, and workspace if issues occur.
 
 Include the following (do not send the contents of `credentials.json` or any API key):
 
@@ -493,6 +513,6 @@ Include the following (do not send the contents of `credentials.json` or any API
 - The full sidebar message (a screenshot is fine)
 - The **ZCode: Show Log** section from startup through the error (home-directory user names can be redacted)
 
-Type `@` to search workspace files and conversations, with files first and conversations after them. Continue with a filename, path, or conversation title; use Up/Down and Enter/Tab to add a reference, or Escape to dismiss the menu. File references appear above the composer. Conversation references appear as separate chips and are retained with drafts and rejected-send recovery. File search includes hidden configuration files and skips Git, dependency and build directories. Fuzzy matching prefers recent files. Typed queries search the whole workspace directly rather than relying on the initial listing. Up to 40 file results are shown, with a 15-second query cache, up to 5,000 candidates per pattern and 1,000 files for an empty query. Retry failed searches by clicking Retry or pressing Enter. Use `@"file name"` for names containing spaces. Capability and skill menus are not included.
+Type `@` to search workspace files and conversations, with files first and conversations after them. Continue with a filename, path, or conversation title; use Up/Down and Enter/Tab to add a reference, or Escape to dismiss the menu. File references appear above the composer. Conversation references appear as separate chips and are retained with drafts and rejected-send recovery. File search includes hidden configuration files and skips Git, dependency and build directories. Fuzzy matching prefers recent files. Typed queries search the whole workspace directly rather than relying on the initial listing. Up to 40 file results are shown, with a 15-second query cache, up to 5,000 candidates per pattern and 1,000 files for an empty query. Retry failed searches by clicking Retry or pressing Enter. Use `@"file name"` for names containing spaces. Skills and subagents are not in this @ menu; use / to search for them.
 
-Hover over a file reference to see its full path, scope and unsaved-change status. Whole-file references use the current editor buffer when sent; selected passages retain their captured snapshot. Image-analysis cards start collapsed and show parameters and full results when expanded.
+Type `/` to search the current session’s commands, skills, and subagents, then use Up/Down and Tab or Enter to choose. Document and browser skills that are turned off still appear; choosing one can allow its plugin. The choice is remembered, restarts the chat, and still follows desktop preferences. Select multiple skills and subagents, and click their labels below the input to remove them. Hover over a file reference to see its full path, scope and unsaved-change status. Whole-file references use the current editor buffer when sent; selected passages retain their captured snapshot. Image-analysis cards start collapsed and show parameters and full results when expanded.

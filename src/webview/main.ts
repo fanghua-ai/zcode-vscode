@@ -7,7 +7,7 @@ import { readImageAttachments, IMAGE_MAX_BYTES, IMAGE_MAX_COUNT, IMAGE_MIMES, ty
 import { greetingKey, nextGreetingDelay } from "../greeting";
 import { EMPTY_LOGO } from "./emptyLogo";
 import { t, setUiLanguage, getUiLanguage, resolveUiLanguage, relocalizeUiText, type LanguageSetting } from "../i18n";
-import { ComposerDrafts, type ComposerDraft } from "../composerDrafts";
+import { ComposerDrafts, type ComposerDraft, type SkillReference, type AgentReference } from "../composerDrafts";
 import { renderMarkdown } from "./markdown";
 import { localMarkdownFileLink } from "../markdownFileLink";
 import { QuestionAnswers } from "../userInput";
@@ -18,6 +18,9 @@ import {
   ContextChip,
   chipLabel,
   chipTitle,
+  markdownLinkRef,
+  extractLeadingSkills,
+  extractLeadingAgents,
   parsePromptDisplay,
   buildPrompt,
   stripSessionReferences,
@@ -213,6 +216,7 @@ function bindSoftScrollbar(scroller: HTMLElement, axis: "x" | "y"): () => void {
   });
   rail.addEventListener("pointerdown", (event) => {
     if (event.button !== 0) return;
+    if (axis === "y" && messagesEl.contains(scroller)) cancelPromptFollow();
     const box = thumb.getBoundingClientRect();
     const client = axis === "y" ? event.clientY : event.clientX;
     const start = axis === "y" ? box.top : box.left;
@@ -287,6 +291,8 @@ const setupList = document.getElementById("setup-list")!;
 const toastEl = document.getElementById("toast")!;
 
 let isGenerating = false;
+let mathFontMode: "auto" | "on" | "off" = "auto";
+let mathFontStatus: "absent" | "downloading" | "ready" | "failed" | "disabled" = "absent";
 let revealAfterCompletionArmed = false;
 let completionRevealPending = false;
 let completionRevealJump = "";
@@ -301,6 +307,12 @@ let currentAssistantEl: HTMLElement | null = null;
 let overlayMode: "sessions" | "models" | "mode" | "thought" | null = null;
 let showArchived = false;
 let sessions: Session[] = [];
+let referenceSessions: SessionReference[] = [];
+let sessionListHasMore = false;
+let sessionListRequestId = "";
+let sessionListNotice: "ready" | "stale" | "initial" = "ready";
+let startupWaitTimer = 0;
+let startupWait: { key: string; startedAt: number } | null = null;
 type SessionAction = "rename" | "archive" | "unarchive" | "delete";
 const pendingSessionActions = new Map<string, { action: SessionAction; requestId: string }>();
 let sessionActionRequestSequence = 0;
@@ -330,6 +342,7 @@ let ignoreScroll = false;
 /** Set when a prompt appears while output was being followed; cleared if the user scrolls away. */
 let resumeOuterFollow = false;
 let resumeWorkFollow = false;
+let promptFollowEpoch = 0;
 let jumpSeq = 0;
 let questionDrag: { x: number; left: number; moved: boolean } | null = null;
 let previewAnchor: HTMLButtonElement | null = null;
@@ -363,22 +376,27 @@ interface LocalFile {
 }
 const composerDrafts = new ComposerDrafts(vscode.getState()?.composerDrafts);
 let draftSessionId = typeof vscode.getState()?.draftSessionId === "string" ? String(vscode.getState()!.draftSessionId) : "";
+let draftPlanEnabled = false;
 let explicitChips: ContextChip[] = [];
 let explicitSessionRefs: SessionReference[] = [];
+let selectedSkills: SkillReference[] = [];
+let selectedAgents: AgentReference[] = [];
 let imageDrafts: DraftImage[] = [];
-const pendingInputs = new Map<string, { sessionId: string; draft: ComposerDraft }>();
+const pendingInputs = new Map<string, { sessionId: string; draft: ComposerDraft; restoreOnReject?: boolean }>();
 
 function persistComposerDraft(): void {
   const text = activeCommand ? `/${activeCommand} ${input.value}` : input.value;
-  composerDrafts.set(draftSessionId, text, explicitChips, imageDrafts, explicitSessionRefs);
+  composerDrafts.set(draftSessionId, text, explicitChips, imageDrafts, explicitSessionRefs, selectedSkills, selectedAgents, draftPlanEnabled);
   vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId });
 }
 
 function restoreComposerDraft(draft: ComposerDraft): void {
-  const persisted = /^\/([a-zA-Z][a-zA-Z0-9_-]*) ([\s\S]*)$/.exec(draft.text);
+  draftPlanEnabled = draft.planEnabled === true;
+  const restored = draft.skills?.length ? { text: draft.text, skills: draft.skills } : extractLeadingSkills(draft.text);
+  const persisted = /^\/([a-zA-Z][a-zA-Z0-9_-]*) ([\s\S]*)$/.exec(restored.text);
   const known = !!persisted && slashCommands.some(item => item.name === persisted[1]);
-  activeCommand = persisted && (known || !slashCommands.length) ? persisted[1] : undefined;
-  input.value = activeCommand ? persisted![2] : draft.text;
+  activeCommand = persisted && persisted[1].toLowerCase() !== "plan" && (known || !slashCommands.length) ? persisted[1] : undefined;
+  input.value = activeCommand ? persisted![2] : restored.text;
   if (activeCommand) {
     const entry = slashCommands.find(item => item.name === activeCommand);
     input.placeholder = entry ? commandDescription(entry) : composerPlaceholder();
@@ -386,10 +404,13 @@ function restoreComposerDraft(draft: ComposerDraft): void {
   updateActiveCommandChip();
   explicitChips = draft.chips;
   explicitSessionRefs = draft.sessionRefs ?? [];
+  selectedSkills = restored.skills;
+  selectedAgents = draft.agents ?? [];
   imageDrafts = draft.images ?? [];
   renderImageDrafts();
   resizeComposerInput();
   renderComposerChips();
+  renderSelectedSkills();
   updateComposerActions();
 }
 
@@ -416,16 +437,26 @@ function prepareComposerSwitch(): void {
   persistComposerDraft();
 }
 
-function recoverInput(msg: { commandId?: string; sessionId?: string; text?: string; chips?: ContextChip[]; sessionRefs?: SessionReference[]; attachments?: ImageAttachment[] }): void {
+function recoverInput(msg: { commandId?: string; sessionId?: string; text?: string; chips?: ContextChip[]; sessionRefs?: SessionReference[]; attachments?: ImageAttachment[] }): ComposerDraft | undefined {
   const pending = msg.commandId ? pendingInputs.get(msg.commandId) : undefined;
   const owner = pending ? (pending.sessionId || msg.sessionId || "") : msg.sessionId;
-  const failed = pending?.draft ?? (typeof msg.text === "string" ? { text: msg.text, chips: msg.chips ?? [], sessionRefs: msg.sessionRefs ?? [], images: readImageAttachments(msg.attachments).map(image => ({...image,id:crypto.randomUUID(),sessionId:owner || "",status:"ready" as const})) } : undefined);
+  const recoveredText = typeof msg.text === "string" ? extractLeadingSkills(msg.text) : undefined;
+  const recoveredAgents = recoveredText ? extractLeadingAgents(recoveredText.text) : undefined;
+  const failed = pending?.draft ?? (recoveredText && recoveredAgents ? { ...recoveredText, ...recoveredAgents, chips: msg.chips ?? [], sessionRefs: msg.sessionRefs ?? [], images: readImageAttachments(msg.attachments).map(image => ({...image,id:crypto.randomUUID(),sessionId:owner || "",status:"ready" as const})) } : undefined);
   if (msg.commandId) pendingInputs.delete(msg.commandId);
   if (owner === undefined || !failed) return;
   persistComposerDraft();
+  // A retry can leave an edited recovery draft in place instead of consuming it.
+  if (pending?.restoreOnReject === false) return failed;
   const recovered = composerDrafts.recover(owner, failed);
   if (owner === draftSessionId) restoreComposerDraft(recovered);
   vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId });
+  return failed;
+}
+
+function sameComposerDraft(a: ComposerDraft, b: ComposerDraft): boolean {
+  return a.text === b.text && !!a.planEnabled === !!b.planEnabled && (["chips", "images", "sessionRefs", "skills", "agents"] as const)
+    .every(key => JSON.stringify(a[key] ?? []) === JSON.stringify(b[key] ?? []));
 }
 const attachmentsEl = document.getElementById("attachments")!;
 const editorChipRow = document.getElementById("editor-chip-row")!;
@@ -490,7 +521,7 @@ function imageResult(msg: any): void {
     const attachment = readImageAttachments([msg.attachment])[0];
     images[index] = attachment ? { ...images[index], ...attachment, status: "ready" } : { ...images[index], status: "error" };
   }
-  composerDrafts.set(owner, draft.text, draft.chips, images, draft.sessionRefs);
+  composerDrafts.set(owner, draft.text, draft.chips, images, draft.sessionRefs, draft.skills, draft.agents, draft.planEnabled);
   if (owner === draftSessionId) {
     imageDrafts = composerDrafts.get(owner).images ?? [];
     renderImageDrafts(); updateComposerActions();
@@ -505,14 +536,21 @@ async function cacheThumbnail(dataUrl: string, owner: string, id: string): Promi
     persistComposerDraft(); const draft = composerDrafts.get(owner); const item = draft.images?.find(image => image.id === id);
     if (!item) return;
     cacheDraftPreview(id, dataUrl);
-    item.thumbnail = thumbnail; composerDrafts.set(owner, draft.text, draft.chips, draft.images, draft.sessionRefs);
+    item.thumbnail = thumbnail; composerDrafts.set(owner, draft.text, draft.chips, draft.images, draft.sessionRefs, draft.skills, draft.agents, draft.planEnabled);
     if (owner === draftSessionId) { imageDrafts = draft.images ?? []; renderImageDrafts(); }
     vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize() });
     return true;
   } catch { return false; }
 }
+function attachmentInputReady(): boolean {
+  if (holdStreams || !sessionConnected || !draftSessionId) {
+    showToast(t("会话正在连接或切换，请稍后添加附件。"));
+    return false;
+  }
+  return true;
+}
 async function addImageFile(file: File): Promise<void> {
-  if (holdStreams || !draftSessionId) return;
+  if (!attachmentInputReady()) return;
   if (imageDrafts.length >= IMAGE_MAX_COUNT) { showToast(t("最多添加 8 张图片。")); return; }
   if (file.size > IMAGE_MAX_BYTES) { showToast(t("每张图片不能超过 20 MB。")); return; }
   if (!IMAGE_MIMES.includes(file.type as any)) { showToast(t("请选择 PNG、JPEG、WebP 或 GIF 图片。")); return; }
@@ -526,7 +564,7 @@ async function addImageFile(file: File): Promise<void> {
     post({ type: "uploadImage", imageId: id, sessionId: owner, fileName: file.name, dataUrl });
   } catch { imageResult({ type: "image_failed", imageId: id, sessionId: owner }); }
 }
-document.getElementById("attach-files")!.addEventListener("click", () => { if (!holdStreams) post({ type: "pickAttachments", sessionId: draftSessionId, maxImages: Math.max(0, IMAGE_MAX_COUNT - imageDrafts.length) }); });
+document.getElementById("attach-files")!.addEventListener("click", () => { if (attachmentInputReady()) post({ type: "pickAttachments", sessionId: draftSessionId, maxImages: Math.max(0, IMAGE_MAX_COUNT - imageDrafts.length) }); });
 input.addEventListener("paste", event => {
   const images = Array.from(event.clipboardData?.files ?? []).filter(file => file.type.startsWith("image/"));
   if (images.length) {
@@ -541,10 +579,16 @@ input.addEventListener("paste", event => {
 });
 input.addEventListener("dragover", event => { if (event.dataTransfer?.types.some(type => type === "Files" || type === "text/uri-list")) event.preventDefault(); });
 input.addEventListener("drop", event => {
-  const images = Array.from(event.dataTransfer?.files ?? []).filter(file => file.type.startsWith("image/"));
-  if (images.length) { event.preventDefault(); for (const image of images) void addImageFile(image); return; }
   const uris = (event.dataTransfer?.getData("text/uri-list") || "").split(/\r?\n/).filter(uri => /^file:/i.test(uri));
-  if (uris.length && !holdStreams) { event.preventDefault(); post({ type: "attachFileUris", sessionId: draftSessionId, uris, maxImages: Math.max(0, IMAGE_MAX_COUNT - imageDrafts.length) }); }
+  // A native drop can contain images and ordinary files together. Let the
+  // host handle the entire batch so neither ordinary files nor images repeat.
+  if (uris.length) {
+    event.preventDefault();
+    if (attachmentInputReady()) post({ type: "attachFileUris", sessionId: draftSessionId, uris, maxImages: Math.max(0, IMAGE_MAX_COUNT - imageDrafts.length) });
+    return;
+  }
+  const images = Array.from(event.dataTransfer?.files ?? []).filter(file => file.type.startsWith("image/"));
+  if (images.length) { event.preventDefault(); for (const image of images) void addImageFile(image); }
 });
 
 function post(msg: unknown): void {
@@ -597,8 +641,7 @@ function alignQuestionToTop(question: HTMLElement): void {
   const edge = questionReadingEdge();
   const delta = question.getBoundingClientRect().top - edge;
   stickToBottom = false;
-  resumeOuterFollow = false;
-  resumeWorkFollow = false;
+  cancelPromptFollow();
   if (Math.abs(delta) < 1) return;
   ignoreScroll = true;
   messagesEl.scrollTop += delta;
@@ -666,7 +709,16 @@ const activityLabels: Record<ActivityPhase, string> = {
 };
 
 function pendingPrompt(): HTMLElement | null {
-  return messagesEl.querySelector<HTMLElement>(".perm-card:not(.resolved), .ask-card:not(.resolved)");
+  return [...messagesEl.querySelectorAll<HTMLElement>(".perm-card:not(.resolved), .ask-card:not(.resolved)")].at(-1) ?? null;
+}
+
+function cancelPromptFollow(): void {
+  // Invalidate delayed placement as well as the current follow preference.
+  promptFollowEpoch++;
+  resumeOuterFollow = false;
+  resumeWorkFollow = false;
+  // The user's next scroll must update follow state even within a layout frame.
+  ignoreScroll = false;
 }
 
 function paintActivity(): void {
@@ -706,14 +758,30 @@ function revealPrompt(el: HTMLElement, focus = false): void {
   if (!el.isConnected || el.classList.contains("resolved") || !messagesEl.contains(el)) return;
   const fold = el.closest<HTMLElement>(".work-fold");
   if (fold) {
+    if (!focus && fold.dataset.userToggle === "closed") return;
+    if (focus) fold.dataset.userToggle = "open";
     fold.classList.add("open");
     workBody(fold).scrollTop = workBody(fold).scrollHeight;
   }
   // The action row can be below a very long command. Reveal controls, not just
   // the card's top, through both the work viewport and outer chat viewport.
-  const actions = el.querySelector<HTMLElement>(".perm-actions, .ask-actions:last-child") || el;
+  const actions = el.querySelector<HTMLElement>(".perm-actions, .ask-details > .ask-actions") || el;
   actions.scrollIntoView({block: "nearest", inline: "nearest"});
-  if (focus) { el.tabIndex = -1; el.focus({preventScroll: true}); }
+  // The transcript scrolls behind floating composer chrome. Native nearest
+  // scrolling can leave the controls underneath it even though they are in
+  // the scroll element's viewport.
+  const inputTop = (!questionRail.hidden ? questionRail : composerEl.querySelector(".composer-card") ?? composerEl).getBoundingClientRect().top;
+  const pendingAction = document.getElementById("pending-action")!;
+  const bottom = Math.min(inputTop, pendingAction.hidden ? inputTop : pendingAction.getBoundingClientRect().top) - 8;
+  const delta = actions.getBoundingClientRect().bottom - bottom;
+  if (delta > 0) messagesEl.scrollTop += delta;
+  if (focus) {
+    releaseCompletedReveal();
+    resumeOuterFollow = true;
+    resumeWorkFollow = true;
+    el.tabIndex = -1;
+    el.focus({preventScroll: true});
+  }
 }
 
 let messageEpoch = 0;
@@ -727,14 +795,16 @@ function announcePrompt(el: HTMLElement, follow: boolean): void {
   if (follow) resumeOuterFollow = true;
   if (follow || workNear) resumeWorkFollow = true;
   if (!follow) return;
+  releaseCompletedReveal();
   const epoch = messageEpoch;
+  const followEpoch = promptFollowEpoch;
   ignoreScroll = true;
   revealPrompt(el);
   // Confirm placement after layout without relying on a frame being delivered
   // immediately (e.g. an inactive or throttled webview).
   requestAnimationFrame(() => {
     if (epoch !== messageEpoch) return;
-    revealPrompt(el);
+    if (followEpoch === promptFollowEpoch) revealPrompt(el);
     ignoreScroll = false;
   });
 }
@@ -746,8 +816,9 @@ function restorePromptFollow(): void {
   resumeOuterFollow = false;
   resumeWorkFollow = false;
   const epoch = messageEpoch;
+  const followEpoch = promptFollowEpoch;
   const apply = () => {
-    if (epoch !== messageEpoch) return;
+    if (epoch !== messageEpoch || followEpoch !== promptFollowEpoch) return;
     ignoreScroll = true;
     if (work) {
       for (const fold of document.querySelectorAll<HTMLElement>('.work-fold.open[data-state="running"]')) {
@@ -830,7 +901,39 @@ function setConnStatus(kind: "idle" | "busy" | "error" | "warn", text?: string):
   connStatus.title = label;
 }
 
+function clearStartupWait(): void {
+  if (startupWaitTimer) window.clearInterval(startupWaitTimer);
+  startupWaitTimer = 0;
+  startupWait = null;
+}
+
+function showStartupWait(phase: string, waitedSeconds = 0): void {
+  const key = phase === "restoring" ? "正在恢复上次会话" : "正在启动服务";
+  const base = t(key);
+  const waited = waitedSeconds >= 8 ? t("已等待 {0} 秒 · 草稿会保留", { 0: waitedSeconds }) : "";
+  const label = waited ? `${base} · ${waited}` : base;
+  setConnStatus("busy", label);
+  connLabel.dataset.i18nKey = key;
+  connLabel.dataset.i18nValues = JSON.stringify(waitedSeconds >= 8 ? { 0: waitedSeconds } : {});
+  connStatus.title = label;
+}
+
+function beginStartupWait(phase: string, waitedSeconds = 0): void {
+  const startedAt = Date.now() - Math.max(0, waitedSeconds) * 1000;
+  if (!startupWait || startupWait.key !== phase) {
+    clearStartupWait();
+    startupWait = { key: phase, startedAt };
+  } else startupWait.startedAt = startedAt;
+  const paint = () => {
+    if (!startupWait) return;
+    showStartupWait(startupWait.key, Math.floor((Date.now() - startupWait.startedAt) / 1000));
+  };
+  paint();
+  if (!startupWaitTimer) startupWaitTimer = window.setInterval(paint, 1000);
+}
+
 function setGenerating(generating: boolean, preserveCompletionReveal = false): void {
+  if (!generating && !holdStreams) finishAssistantRendering();
   const wasGenerating = isGenerating;
   isGenerating = generating;
   if (generating) {
@@ -851,6 +954,7 @@ function setGenerating(generating: boolean, preserveCompletionReveal = false): v
     if (!preserveCompletionReveal) revealAfterCompletionArmed = false;
     stopWorkTicker();
     resolveOpenPrompts();
+    clearStartupWait();
     setConnStatus("idle", t("已连接"));
     workingIndicator()?.remove();
   }
@@ -877,7 +981,7 @@ function ensureWorkingIndicator(): void {
 }
 
 function composerHasText(): boolean {
-  return input.value.trim().length > 0 || imageDrafts.length > 0;
+  return input.value.trim().length > 0 || imageDrafts.length > 0 || selectedSkills.length > 0 || selectedAgents.length > 0;
 }
 
 function updateComposerActions(): void {
@@ -1353,6 +1457,7 @@ function railQuestions(): IndexedQuestion[] {
 }
 
 function clearMessages(): void {
+  cancelAssistantRender();
   messageEpoch++;
   ignoreScroll = false;
   clearGreetingTimer();
@@ -1443,7 +1548,9 @@ function syncQuestionRail(): void {
     dot.type = "button";
     const marked = (index + 1) % 10 === 0;
     dot.className = "q-dot" + (marked ? " mark" : "");
-    dot.textContent = String(index + 1);
+    const number = document.createElement("span");
+    number.textContent = String(index + 1);
+    dot.appendChild(number);
     dot.dataset.jump = item.id;
     dot.dataset.preview = label;
     if (item.at) dot.dataset.at = String(item.at);
@@ -1532,6 +1639,7 @@ function updateQuestionRailActive(): void {
 
 function jumpToQuestion(id: string): void {
   releaseCompletedReveal();
+  cancelPromptFollow();
   const el = messagesEl.querySelector<HTMLElement>(`.message.user[data-jump="${CSS.escape(id)}"]`);
   if (!el) {
     if (!oldestLoadedId || pendingJump === id) return;
@@ -1550,8 +1658,6 @@ function jumpToQuestion(id: string): void {
     messagesEl.scrollTop -
     inset;
   stickToBottom = false;
-  resumeOuterFollow = false;
-  resumeWorkFollow = false;
   ignoreScroll = true;
   messagesEl.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
   updateJumpLatest();
@@ -1745,6 +1851,7 @@ function foldOldTurns(): void {
   // Folding changes the vertical position of every later question without
   // necessarily producing a scroll event. Re-evaluate after layout settles.
   requestAnimationFrame(updateQuestionRailActive);
+  syncMathFontHint();
 }
 
 function turnStateKey(turn: HTMLElement[], index: number): string {
@@ -1858,7 +1965,7 @@ function errorActions(text: string): Array<{ act: string; label: string }> {
   return actions;
 }
 
-function addErrorMessage(text: string): void {
+function addErrorMessage(text: string, rejectedDraft?: ComposerDraft): void {
   const question = sentQuestions().at(-1);
   const ownerSessionId = currentSessionId;
   const ownerViewGen = viewGen;
@@ -1886,10 +1993,23 @@ function addErrorMessage(text: string): void {
       if (currentSessionId !== ownerSessionId || viewGen !== ownerViewGen) return;
       const act = btn.dataset.act;
       if (act === "retryLast" && question && (failedPrompt || readImageAttachments(JSON.parse(question.dataset.images || "[]")).length)) {
+        if (holdStreams || isGenerating) return;
+        btn.disabled = true;
         const images = readImageAttachments(JSON.parse(question?.dataset.images || "[]"));
+        const commandId = crypto.randomUUID();
+        if (rejectedDraft) {
+          persistComposerDraft();
+          const consumed = draftSessionId === ownerSessionId && sameComposerDraft(composerDrafts.get(draftSessionId), rejectedDraft);
+          pendingInputs.set(commandId, { sessionId: ownerSessionId, draft: rejectedDraft, restoreOnReject: consumed });
+          if (consumed) {
+            restoreComposerDraft({ text: "", chips: [] });
+            persistComposerDraft();
+          }
+        }
         addUserMessage(failedPrompt || "", [], false, undefined, undefined, undefined, undefined, images);
         setGenerating(true);
-        post({ type: "retryLast", sessionId: ownerSessionId, text: failedPrompt || "", chips: [], attachments: images });
+        post({ type: "retryLast", commandId, sessionId: ownerSessionId, text: failedPrompt || "", chips: [], attachments: images,
+          ...(rejectedDraft ? { recoveryText: rejectedDraft.text, ...(rejectedDraft.planEnabled ? { planMode: true } : {}) } : {}) });
       } else if (act === "showLog") post({ type: "showLog" });
       else if (act === "retry") post({ type: "retry" });
       else if (act === "pickModel") openOverlay("models");
@@ -1936,32 +2056,31 @@ function addUserMessage(
   const shownSessionRefs = sessionRefs.length ? sessionRefs : parsed.sessionRefs;
   el.dataset.sessionRefs = JSON.stringify(shownSessionRefs);
   el.dataset.retryText = parsed.sessionRefs.length ? text : chips.length || sessionRefs.length ? buildPrompt(text, chips, sessionRefs) : text;
+  const parsedSkills = parsed.chips.filter(chip => chip.label.startsWith("$"));
   const shown = chips.length
     ? chips
         .filter((c) => !c.hidden)
         .map((c) => ({ label: chipLabel(c), title: chipTitle(c) }))
+        .concat(parsedSkills.length ? parsed.chips : [])
     : parsed.chips;
-  const body = chips.length ? text : parsed.body;
+  const body = chips.length && !parsedSkills.length ? text : parsed.body;
   const sessionRefHtml = shownSessionRefs.map(reference =>
     `<span class="ctx-chip session-ref-chip" title="${escapeText(reference.title)}">${SESSION_REF_ICON}<span>${escapeText(reference.title)}</span></span>`
   ).join("");
-  const chipHtml = shown.length || sessionRefHtml
-    ? `<div class="user-chips">${shown
-        .map(
-          (c) =>
-            `<span class="ctx-chip" title="${escapeText(c.title)}"><span>${escapeText(
-              c.label
-            )}</span></span>`
-        )
-        .join("")}${sessionRefHtml}</div>`
+  const skillHtml = skillRefsHtml(shown);
+  const fileHtml = shown.filter(c => !c.label.startsWith("$")).map(c =>
+    `<span class="ctx-chip" title="${escapeText(c.title)}"><span>${escapeText(c.label)}</span></span>`
+  ).join("");
+  const chipHtml = fileHtml || sessionRefHtml
+    ? `<div class="user-chips">${fileHtml}${sessionRefHtml}</div>`
     : "";
   const queuedUi = queued
     ? `<div class="queued-tag">${t("排队中，当前回复结束后发送")}</div>`
     : "";
   const commandParts = queued ? undefined : splitCommandBody(body);
   const bodyHtml = commandParts
-    ? `${commandParts.badge}${escapeText(commandParts.rest)}`
-    : escapeText(body);
+    ? `${commandParts.badge}${renderUserText(commandParts.rest)}`
+    : renderUserText(body);
   const actions = queued
     ? `<div class="queued-actions">
         <button type="button" data-qact="now" title="${t("立即发送")}" aria-label="${t("立即发送")}">${lucideIcon("chevronsUp")}</button>
@@ -1969,7 +2088,7 @@ function addUserMessage(
         <button type="button" data-qact="delete" title="${t("删除")}" aria-label="${t("删除")}">${lucideIcon("trash2")}</button>
       </div>`
     : "";
-  el.innerHTML = `${queuedUi}${chipHtml}<div class="user-body">${bodyHtml}</div>${actions}`;
+  el.innerHTML = `${queuedUi}${chipHtml}<div class="user-body">${skillHtml}${skillHtml && bodyHtml ? " " : ""}${bodyHtml}</div>${actions}`;
   renderUserImages(el, images, attachmentTarget);
   if (!queued) {
     if (createdAt && createdAt > 0) el.dataset.sentAt = String(createdAt);
@@ -2497,7 +2616,7 @@ function cancelUserEdit(el: HTMLElement): void {
   const parsed = parsePromptDisplay(text);
   const body = document.createElement("div");
   body.className = "user-body";
-  body.textContent = parsed.body || text;
+  body.innerHTML = renderSubmittedBody(text);
   ta?.replaceWith(body);
   disarmEditImageRemoval(el);
   el.querySelector(".user-actions")?.remove();
@@ -2557,11 +2676,11 @@ function applyQueryRewind(el: HTMLElement, text: string, attachments: ImageAttac
   const ta = el.querySelector(".user-edit");
   const body = document.createElement("div");
   body.className = "user-body";
-  body.textContent = parsed.body || text;
+  body.innerHTML = renderSubmittedBody(text);
   if (ta) ta.replaceWith(body);
   else {
     const existing = el.querySelector(".user-body");
-    if (existing) existing.textContent = parsed.body || text;
+    if (existing) existing.innerHTML = renderSubmittedBody(text);
   }
   disarmEditImageRemoval(el);
   el.dataset.images = JSON.stringify(attachments);
@@ -3125,7 +3244,7 @@ function finishQueuedEdit(el: HTMLElement, text: string): void {
   const ta = el.querySelector(".queued-edit");
   const body = document.createElement("div");
   body.className = "user-body";
-  body.textContent = text;
+  body.innerHTML = renderSubmittedBody(text);
   ta?.replaceWith(body);
   const actions = el.querySelector(".queued-actions");
   if (actions) {
@@ -3156,7 +3275,52 @@ function assistantVisibleText(el: HTMLElement): string {
   return el.querySelector(".md")?.textContent?.trim() || "";
 }
 
+// Only text painting is deferred. Protocol/state transitions remain synchronous.
+let assistantRenderFrame = 0;
+let pendingAssistantRender: { el: HTMLElement; text: string; streaming: boolean; epoch: number } | null = null;
+
+function cancelAssistantRender(): void {
+  if (assistantRenderFrame) cancelAnimationFrame(assistantRenderFrame);
+  assistantRenderFrame = 0;
+  pendingAssistantRender = null;
+}
+
+function flushAssistantRender(): void {
+  const pending = pendingAssistantRender;
+  cancelAssistantRender();
+  if (!pending || pending.epoch !== messageEpoch || !pending.el.isConnected) return;
+  const { el, text, streaming } = pending;
+  const viewport = el.closest<HTMLElement>(".work-fold-body");
+  const follow = viewport && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 24;
+  renderAssistantBody(el, text, !streaming && !isGenerating, streaming, streaming);
+  if (follow) viewport.scrollTop = viewport.scrollHeight;
+  scrollToBottom();
+}
+
+function finishAssistantRendering(): void {
+  if (pendingAssistantRender) pendingAssistantRender.streaming = false;
+  flushAssistantRender();
+  for (const el of messagesEl.querySelectorAll<HTMLElement>(".message.assistant[data-streaming-markdown]")) {
+    renderAssistantBody(el, el.dataset.streamText ?? "", false);
+  }
+}
+
+function scheduleAssistantRender(el: HTMLElement, text: string, streaming: boolean): void {
+  if (pendingAssistantRender && pendingAssistantRender.el !== el) flushAssistantRender();
+  // Replay guards must see the newest accepted text even before the next frame.
+  el.dataset.streamText = text;
+  pendingAssistantRender = { el, text, streaming, epoch: messageEpoch };
+  if (!streaming) { flushAssistantRender(); return; }
+  if (!assistantRenderFrame) {
+    const epoch = messageEpoch;
+    assistantRenderFrame = requestAnimationFrame(() => {
+      if (epoch === messageEpoch) flushAssistantRender();
+    });
+  }
+}
+
 function appendAssistantDelta(fullText: string, partId?: string, authoritative = false, streaming = true): void {
+  if (pendingAssistantRender && partId && pendingAssistantRender.el.dataset.partId !== partId) flushAssistantRender();
   if (partId) {
     const restored = [...messagesEl.querySelectorAll<HTMLElement>(".message.assistant")]
       .find(node => node.dataset.partId === partId);
@@ -3172,8 +3336,6 @@ function appendAssistantDelta(fullText: string, partId?: string, authoritative =
   if (streaming && !isGenerating) setGenerating(true);
   if (!currentAssistantEl) startAssistantMessage();
   const el = currentAssistantEl!;
-  const workViewport = el.closest<HTMLElement>(".work-fold-body");
-  const followWork = workViewport && workViewport.scrollHeight - workViewport.scrollTop - workViewport.clientHeight <= 24;
   const previous = el.dataset.streamText ?? el.dataset.copyText ?? "";
   // History can be ahead of a replayed prefix. Never replace it with less text.
   if (!authoritative && previous.startsWith(fullText) && fullText.length < previous.length) return;
@@ -3182,9 +3344,7 @@ function appendAssistantDelta(fullText: string, partId?: string, authoritative =
   // answer. Narration written while a tool is still running is not.
   if (!el.closest(".work-fold") && answerFollowsSettledTools()) el.dataset.afterSettled = "1";
   // A finished text part is not a finished turn: tools/reasoning may follow.
-  renderAssistantBody(el, fullText, !streaming && !isGenerating, streaming);
-  if (followWork) workViewport.scrollTop = workViewport.scrollHeight;
-  scrollToBottom();
+  scheduleAssistantRender(el, fullText, streaming);
 }
 
 function adoptTrailingAnswer(fullText: string): void {
@@ -3231,8 +3391,9 @@ function compactStatusLabel(status: string, origin?: string): string {
   return t("上下文已压缩");
 }
 
-const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssistantBody(el: HTMLElement, text: string, settled: boolean, liveAnswer = false): void {
+const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssistantBody(el: HTMLElement, text: string, settled: boolean, liveAnswer = false, streaming = false): void {
   el.dataset.streamText = text;
+  el.toggleAttribute("data-streaming-markdown", streaming);
   const parts = splitZaiBuiltin(text);
   let work = builtinWork.get(el);
   const tools = parts.some(part => part.kind === "tool");
@@ -3250,7 +3411,7 @@ const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssis
     const part=parts[index];
     if (part.kind === "text") {
       if (!part.text.trim()) continue;
-      const md=document.createElement("div"); md.className="md"; md.innerHTML=renderMarkdown(part.text);
+      const md=document.createElement("div"); md.className="md"; md.innerHTML=renderMarkdown(part.text, streaming);
       (index<lastTool && work ? work : el).append(md);
     } else {
       const tool=document.createElement("div"); if (toggles[toolIndex]) tool.dataset.userToggle=toggles[toolIndex]; toolIndex++;
@@ -3278,7 +3439,9 @@ const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssis
 }
 
 function finalizeAssistantMessage(): void {
+  flushAssistantRender();
   currentAssistantEl = null;
+  syncMathFontHint();
 }
 
 function formatPermissionInput(input: unknown): string {
@@ -3560,6 +3723,7 @@ function createWorkFold(state: "running" | "completed" | "interrupted", startedA
   btn.addEventListener("click", () => {
     const open = fold.classList.toggle("open");
     fold.dataset.userToggle = open ? "open" : "closed";
+    if (!open) cancelPromptFollow();
     paintWorkFold(fold);
   });
   paintWorkFold(fold);
@@ -3683,6 +3847,7 @@ function answerFollowsSettledTools(): boolean {
 }
 
 function parkCurrentAnswer(): void {
+  flushAssistantRender();
   const el = currentAssistantEl;
   if (!el) return;
   if (!assistantVisibleText(el)) {
@@ -3844,7 +4009,7 @@ function settleWorkFolds(state: "completed" | "interrupted", nextQuestion = fals
 
 function renderReasoningBody(note: HTMLElement, text: string): void {
   const parts = splitZaiBuiltin(text);
-  if (!parts.some(part => part.kind === "tool")) { note.textContent = text; return; }
+  if (!parts.some(part => part.kind === "tool")) { note.textContent = parts.map(part => part.kind === "text" ? part.text : "").join(""); return; }
   const toggles = [...note.querySelectorAll<HTMLElement>(".tool-call")].map(tool => tool.dataset.userToggle);
   note.replaceChildren();
   let index = 0;
@@ -4137,7 +4302,7 @@ function fillToolCallEl(
   el.dataset.toolName = toolName;
   const prevStatus = el.dataset.toolStatus ?? "";
   let status = data.status ?? "running";
-  if ((prevStatus === "completed" || prevStatus === "error") && status === "running") {
+  if ((prevStatus === "completed" || prevStatus === "error" || prevStatus === "cancelled") && status === "running") {
     status = prevStatus;
   }
   el.dataset.toolStatus = status;
@@ -4208,7 +4373,7 @@ function fillToolCallEl(
     !hideIo && outputText ? `${imageAnalysis ? `<div class="tool-section-label" ${uiLabelAttributes("结果")}>${t("结果")}</div>` : ""}<div class="tool-io out">${escapeText(outputText)}</div>` : ""
   }${fileHtml}`;
   el.classList.toggle("collapsed", !expanded);
-  el.innerHTML = `<button type="button" class="tool-head${category === "tool" && !imageAnalysis ? " raw-tool-head" : ""}" aria-expanded="${expanded ? "true" : "false"}">${processIcon(shellCall ? "terminal" : category)}<span class="tool-name" ${category === "tool" && !imageAnalysis ? "" : uiLabelAttributes(imageAnalysis ? "分析图片" : labelKey)}>${escapeText(imageAnalysis ? t("分析图片") : category === "tool" ? toolName : t(labelKey))}</span><span class="tool-preview" title="${escapeText(imageAnalysis ? "" : preview || toolName)}">${escapeText(imageAnalysis ? "" : preview || toolName)}</span><span class="tool-status ${escapeText(status)}" ${uiLabelAttributes(toolStatusKey(status))}>${escapeText(t(toolStatusKey(status)))}</span><svg class="process-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button><div class="tool-body">${bodyHtml}</div>`;
+  el.innerHTML = `<button type="button" class="tool-head" aria-expanded="${expanded ? "true" : "false"}">${processIcon(shellCall ? "terminal" : category)}<span class="tool-name" ${category === "tool" && !imageAnalysis ? "" : uiLabelAttributes(imageAnalysis ? "分析图片" : labelKey)}>${escapeText(imageAnalysis ? t("分析图片") : category === "tool" ? toolName : t(labelKey))}</span><span class="tool-preview" title="${escapeText(imageAnalysis ? "" : preview || toolName)}">${escapeText(imageAnalysis ? "" : preview || toolName)}</span><span class="tool-status ${escapeText(status)}" ${uiLabelAttributes(toolStatusKey(status))}>${escapeText(t(toolStatusKey(status)))}</span><svg class="process-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button><div class="tool-body">${bodyHtml}</div>`;
   if (!suspendScroll && (previousCategory !== category || prevStatus !== status)) refreshProcessGroups(el.parentElement);
   if (userToggle) el.dataset.userToggle = userToggle;
   el.querySelector(".tool-head")?.addEventListener("click", () => {
@@ -4548,6 +4713,72 @@ function settleReplyFooters(): void {
   foldOldTurns();
 }
 
+function mathFontHintKey(): string | undefined {
+  if (mathFontMode === "off" || mathFontStatus === "ready" || mathFontStatus === "disabled") return;
+  if (mathFontStatus === "downloading") return "正在下载";
+  if (mathFontStatus === "failed") return "重试";
+  return "美化公式";
+}
+
+function replyHasFormula(meta: HTMLElement): boolean {
+  let node = meta.previousElementSibling;
+  while (node instanceof HTMLElement) {
+    if (node.classList.contains("timeline-mark")) return false;
+    if (node.classList.contains("message") && node.classList.contains("user") && !node.classList.contains("queued")) return false;
+    if (node.querySelector(".katex")) return true;
+    node = node.previousElementSibling;
+  }
+  return false;
+}
+
+function applyMathFontCss(css: string): void {
+  if (/[<>]|@import|expression\s*\(/i.test(css)) css = "";
+  const style = document.getElementById("math-font-faces");
+  if (!css) { style?.remove(); return; }
+  if (style?.textContent === css) return;
+  const next = style ?? document.createElement("style");
+  next.id = "math-font-faces";
+  next.textContent = css;
+  if (!style) document.head.append(next);
+}
+
+/** One quiet line on the newest visible formula reply, beside copy and time. */
+function syncMathFontHint(): void {
+  const key = mathFontHintKey();
+  const metas = [...messagesEl.querySelectorAll<HTMLElement>(":scope > .msg-meta.reply-meta")];
+  let target: HTMLElement | undefined;
+  if (key) {
+    for (let index = metas.length - 1; index >= 0; index--) {
+      const meta = metas[index];
+      if (meta.hidden || meta.closest(".turn-hidden, .turn-folded, .turn-collapsed")) continue;
+      if (replyHasFormula(meta)) { target = meta; break; }
+    }
+  }
+  for (const meta of metas) {
+    if (meta !== target) meta.querySelector(":scope > .math-font-hint")?.remove();
+  }
+  if (!target || !key) return;
+  let hint = target.querySelector<HTMLButtonElement>(":scope > .math-font-hint");
+  if (!hint) {
+    hint = document.createElement("button");
+    hint.type = "button";
+    hint.className = "math-font-hint";
+    hint.addEventListener("click", event => {
+      event.stopPropagation();
+      if (mathFontStatus === "downloading") return;
+      mathFontStatus = "downloading";
+      syncMathFontHint();
+      post({ type: "installMathFonts" });
+    });
+    target.append(hint);
+  }
+  setUiLabel(hint, key);
+  hint.title = t(key);
+  hint.setAttribute("aria-label", t(key));
+  hint.disabled = mathFontStatus === "downloading";
+  hint.setAttribute("aria-busy", hint.disabled ? "true" : "false");
+}
+
 function ensureReplyFooter(anchor: HTMLElement, at?: number): void {
   const stamp = turnStartedAt(anchor) ?? (at && at > 0 ? at : undefined);
   let meta = replyFooterNear(anchor);
@@ -4813,12 +5044,28 @@ function openOverlay(mode: "sessions" | "models" | "mode" | "thought"): void {
     document.getElementById("tab-active")?.classList.add("active");
     document.getElementById("tab-archived")?.classList.remove("active");
     if (isGenerating && currentSessionId) runningSessions.add(currentSessionId);
-    post({ type: "listSessions", includeArchived: false });
+    post({ type: "listSessions", includeArchived: false, listVisible: true });
     rebuildOverlay("");
     overlaySearch.focus();
     return;
   }
   openPicker(mode);
+}
+
+function paintSessionListNotice(): void {
+  const notice = document.getElementById("session-list-notice");
+  if (!notice) return;
+  const failed = overlayMode === "sessions" && (sessionListNotice === "stale" || sessionListNotice === "initial");
+  notice.hidden = overlayMode !== "sessions" || (!failed && !sessionListHasMore);
+  const label = notice.querySelector("span");
+  if (label) setUiLabel(label, failed
+    ? sessionListNotice === "initial" ? "会话列表加载失败" : "刷新失败，当前显示上次结果"
+    : "仅显示已加载的会话，加载更多后可继续搜索。");
+  const button = notice.querySelector<HTMLButtonElement>("button");
+  if (button) {
+    setUiLabel(button, sessionListRequestId ? "正在加载…" : failed ? "重试" : "加载更多会话");
+    button.disabled = !!sessionListRequestId;
+  }
 }
 
 function pickerAnchor(mode: "models" | "mode" | "thought"): HTMLElement {
@@ -4887,6 +5134,7 @@ function rebuildOverlay(query: string): void {
   const listEl =
     overlayMode === "sessions" ? overlayList : popoverList;
   listEl.innerHTML = "";
+  paintSessionListNotice();
 
   if (overlayMode === "sessions") {
     const ranked = [...sessions].sort((a, b) => {
@@ -4951,7 +5199,13 @@ function rebuildOverlay(query: string): void {
   }
 
   if (overlayItems.length === 0) {
-    listEl.innerHTML = `<div class="overlay-empty">${t("Nothing matches.")}</div>`;
+    if (overlayMode === "sessions" && sessionListNotice === "initial") {
+      listEl.innerHTML = "";
+      placePicker();
+      return;
+    }
+    const key = "Nothing matches.";
+    listEl.innerHTML = `<div class="overlay-empty" data-i18n-key="${escapeText(key)}">${t(key)}</div>`;
     placePicker();
     return;
   }
@@ -5026,6 +5280,9 @@ function rebuildOverlay(query: string): void {
     el.addEventListener("click", () => selectOverlay(idx));
     listEl.appendChild(el);
   });
+  // The compact model picker can hold more entries than its visible viewport.
+  // Keep the current choice in view after search-driven rebuilds as well.
+  listEl.querySelector<HTMLElement>(".overlay-item.active")?.scrollIntoView({ block: "nearest" });
   placePicker();
 }
 
@@ -5058,8 +5315,16 @@ function selectOverlay(idx: number): void {
     post({ type: "selectModel", providerId: m.providerId, modelId: m.modelId });
   } else if (overlayMode === "mode") {
     const picked = String(item.payload);
-    if (picked === "plan") planEnabled = true;
-    else baseMode = picked;
+    if (picked === "plan") {
+      draftPlanEnabled = true;
+      updatePlanChip();
+      persistComposerDraft();
+      closeOverlay();
+      return;
+    }
+    draftPlanEnabled = false;
+    persistComposerDraft();
+    baseMode = picked;
     applySessionControls({
       mode: picked,
       baseMode,
@@ -5898,7 +6163,7 @@ function syncQueuedMessages(): void {
     node.dataset.images = JSON.stringify(item.attachments ?? []);
     renderUserImages(node, item.attachments ?? []);
     if (item.sourceCommandId) node.dataset.sourceCommandId = item.sourceCommandId;
-    if (!node.querySelector(".queued-edit")) node.querySelector(".user-body")!.textContent = parsePromptDisplay(item.text).body;
+    if (!node.querySelector(".queued-edit")) node.querySelector(".user-body")!.innerHTML = renderSubmittedBody(item.text);
     if (queuedEditDrafts.has(queuedEditKey(currentSessionId, item.queueItemId))) beginQueuedEdit(node);
     node.querySelectorAll<HTMLButtonElement>("button").forEach(button => { button.disabled = false; });
     paintQueuedEdit(node);
@@ -5951,6 +6216,82 @@ function renderComposerChips(): void {
 }
 
 const SESSION_REF_ICON = '<svg class="session-ref-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 3.5h10a1.5 1.5 0 0 1 1.5 1.5v5a1.5 1.5 0 0 1-1.5 1.5H8l-3.5 2v-2H3A1.5 1.5 0 0 1 1.5 10V5A1.5 1.5 0 0 1 3 3.5Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg>';
+const SKILL_ICON = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m3 13 7-7 2 2-7 7H3v-2ZM3 2v3M1.5 3.5h3M10.5 1v3M9 2.5h3M13 4.5v3M11.5 6h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const AGENT_ICON = lucideIcon("brain", { size: 14 });
+
+function skillRefsHtml(chips: Array<{ label: string; title: string }>): string {
+  return chips.filter(chip => chip.label.startsWith("$")).map(chip =>
+    `<span class="skill-ref-chip" title="${escapeText(chip.title)}">${SKILL_ICON}<span>${escapeText(chip.label.slice(1))}</span></span>`
+  ).join(" ");
+}
+
+function renderSubmittedBody(text: string): string {
+  const parsed = parsePromptDisplay(text);
+  const skills = skillRefsHtml(parsed.chips);
+  const body = renderUserText(parsed.body);
+  return `${skills}${skills && body ? " " : ""}${body}`;
+}
+
+function renderUserText(text: string): string {
+  const known = new Set([...slashAgents.map(agent => agent.name), ...selectedAgents.map(agent => agent.name)].map(name => name.toLowerCase()));
+  let html = "", rest = text;
+  for (;;) {
+    const match = /^@([A-Za-z0-9][A-Za-z0-9._:-]{0,255})(?=\s|$)/.exec(rest);
+    if (!match || !known.has(match[1].toLowerCase())) break;
+    html += `<span class="agent-ref-chip" title="${escapeText(match[0])}">${AGENT_ICON}<span>${escapeText(match[0])}</span></span>`;
+    rest = rest.slice(match[0].length);
+    const whitespace = /^\s+/.exec(rest)?.[0] ?? "";
+    html += escapeText(whitespace);
+    rest = rest.slice(whitespace.length);
+  }
+  return html + escapeText(rest);
+}
+
+function renderSelectedSkills(reveal?: { kind: "skill" | "agent"; key: string }): void {
+  const row = document.getElementById("selected-skills")!;
+  const previousScroll = row.scrollLeft;
+  let target: HTMLElement | undefined;
+  row.replaceChildren();
+  for (const skill of selectedSkills) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "toolbar-btn selected-skill";
+    button.title = `${t("移除")} · $${skill.name}`;
+    button.setAttribute("aria-label", button.title);
+    button.innerHTML = `<span class="chip-icon">${SKILL_ICON}</span><span class="chip-close">${CLOSE}</span><span class="skill-label">${escapeText(skill.name)}</span>`;
+    if (reveal?.kind === "skill" && reveal.key === skill.path) target = button;
+    button.addEventListener("click", () => {
+      selectedSkills = selectedSkills.filter(item => item.path !== skill.path);
+      renderSelectedSkills();
+      persistComposerDraft();
+      updateComposerActions();
+    });
+    row.appendChild(button);
+  }
+  for (const agent of selectedAgents) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "toolbar-btn selected-skill selected-agent";
+    button.title = `${t("移除")} · @${agent.name}`;
+    button.setAttribute("aria-label", button.title);
+    button.innerHTML = `<span class="chip-icon">${AGENT_ICON}</span><span class="chip-close">${CLOSE}</span><span class="skill-label">${escapeText(agent.name)}</span>`;
+    if (reveal?.kind === "agent" && reveal.key.toLowerCase() === agent.name.toLowerCase()) target = button;
+    button.addEventListener("click", () => {
+      selectedAgents = selectedAgents.filter(item => item.name !== agent.name);
+      renderSelectedSkills();
+      persistComposerDraft();
+      updateComposerActions();
+    });
+    row.appendChild(button);
+  }
+  row.hidden = !selectedSkills.length && !selectedAgents.length;
+  row.scrollLeft = previousScroll;
+  if (target) {
+    const bounds = row.getBoundingClientRect(), item = target.getBoundingClientRect();
+    if (item.right > bounds.right) row.scrollLeft += item.right - bounds.right;
+    else if (item.left < bounds.left) row.scrollLeft -= bounds.left - item.left;
+  }
+}
 
 function makeSessionReferenceEl(reference: SessionReference, removable: boolean): HTMLElement {
   const chip = document.createElement("div");
@@ -6015,7 +6356,7 @@ function addExplicitChip(chip: ContextChip): void {
 }
 
 function addExplicitSessionReference(reference: SessionReference): void {
-  if (sessions.some(session => session.sessionId === reference.sessionId && !session.archivedAt)) {
+  if (referenceSessions.some(session => session.sessionId === reference.sessionId)) {
     explicitSessionRefs = explicitSessionRefs.filter(item => item.sessionId !== reference.sessionId);
     explicitSessionRefs.push({ sessionId: reference.sessionId, title: reference.title });
     renderComposerChips();
@@ -6029,22 +6370,14 @@ function sendMessage(immediate = false): void {
   if (holdStreams || !sessionConnected) return;
   mentions.close();
   const body = input.value.trim();
-  const planShortcut = activeCommand === "plan";
-  if (planShortcut && (imageDrafts.length || explicitChips.length || explicitSessionRefs.length)) {
-    showToast(t("Plan 命令暂不支持图片或上下文引用，请先移除后重试。"));
+  const planShortcut = draftPlanEnabled;
+  if (activeCommand && (selectedSkills.length || selectedAgents.length)) {
+    showToast(t("命令暂不支持技能或子智能体引用，请先移除后重试。"));
     return;
   }
-  if (planShortcut && !body) {
-    planEnabled = true;
-    applySessionControls({ mode: "plan", baseMode, planEnabled: true, thoughtEnabled, thoughtLevel: currentThought, thoughtLevels });
-    clearActiveCommand();
-    post({ type: "setMode", mode: "plan", sessionId: draftSessionId, viewGen });
-    persistComposerDraft();
-    return;
-  }
-  // Most active commands keep their slash prefix; /plan is a composer mode
-  // shortcut and sends only its task body after the host switches the session.
-  const text = planShortcut ? body : activeCommand ? `/${activeCommand} ${body}`.trim() + (body ? "" : " ") : body;
+  const prompt = activeCommand ? `/${activeCommand} ${body}`.trim() + (body ? "" : " ") : body;
+  const agentPrompt = [...selectedAgents.map(agent => `@${agent.name}`), prompt].filter(Boolean).join(" ");
+  const text = [...selectedSkills.map(skillReferenceMarkdown), agentPrompt].filter(Boolean).join("\n\n");
   if (!text.trim() && !imageDrafts.length) return;
   if (imageDrafts.length > IMAGE_MAX_COUNT) { showToast(t("最多添加 8 张图片。")); return; }
   if (imageDrafts.some(image => image.status !== "ready")) { showToast(t("请等待图片添加完成，或移除失败的图片。")); return; }
@@ -6053,17 +6386,17 @@ function sendMessage(immediate = false): void {
   const chips = activeChips();
   const refs = explicitSessionRefs.map(reference => ({ ...reference }));
   const commandId = crypto.randomUUID();
-  const recoveryText = planShortcut ? `/plan ${body}` : text;
-  pendingInputs.set(commandId, { sessionId: draftSessionId, draft: { text: recoveryText, chips: explicitChips.map(chip => ({ ...chip })), sessionRefs: refs, images } });
-  if (planShortcut) {
-    planEnabled = true;
-    applySessionControls({ mode: "plan", baseMode, planEnabled: true, thoughtEnabled, thoughtLevel: currentThought, thoughtLevels });
-  }
+  const recoveryText = prompt;
+  pendingInputs.set(commandId, { sessionId: draftSessionId, draft: { text: recoveryText, ...(planShortcut ? { planEnabled: true } : {}), chips: explicitChips.map(chip => ({ ...chip })), sessionRefs: refs, images, skills: selectedSkills.map(skill => ({ ...skill })), agents: selectedAgents.map(agent => ({ ...agent })) } });
+  draftPlanEnabled = false;
   input.value = "";
   clearActiveCommand();
   explicitChips = [];
   explicitSessionRefs = [];
+  selectedSkills = [];
+  selectedAgents = [];
   renderComposerChips();
+  renderSelectedSkills();
   imageDrafts = [];
   renderImageDrafts();
   persistComposerDraft();
@@ -6137,11 +6470,16 @@ messagesEl.addEventListener("click", (event) => {
 });
 messagesEl.addEventListener("pointerdown", releaseCompletedReveal, {capture:true});
 document.addEventListener("keydown", (event) => {
-  if (!completionRevealPending || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+  if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
   if (!["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) return;
   const target = event.target;
+  if (target instanceof Element && (target.closest("input, textarea, select, [contenteditable='true']") ||
+      (event.key === " " && target.closest("button, a")))) return;
   if (target === document.body || target === document.documentElement ||
-      (target instanceof Node && messagesEl.contains(target))) releaseCompletedReveal();
+      (target instanceof Node && messagesEl.contains(target))) {
+    cancelPromptFollow();
+    releaseCompletedReveal();
+  }
 }, { capture: true });
 messagesEl.addEventListener("scroll", () => {
   if (completionRevealPending) {
@@ -6167,7 +6505,7 @@ messagesEl.addEventListener(
     if (event.deltaY !== 0) releaseCompletedReveal();
     if (event.deltaY < 0) {
       stickToBottom = false;
-      resumeOuterFollow = false;
+      cancelPromptFollow();
       updateJumpLatest();
     }
     const viewport = event.target instanceof Element ? event.target.closest<HTMLElement>(".work-fold-body") : null;
@@ -6262,7 +6600,7 @@ function fileUri(fsPath: string): string {
 }
 const mentions = fileMentions(input, document.getElementById("composer")!, () => draftSessionId,
   (requestId,text,sessionId) => post({type:"searchWorkspaceFiles",requestId,text,sessionId}),
-  () => sessions.filter(session => !session.archivedAt).map(({ sessionId, title }) => ({ sessionId, title })),
+  () => referenceSessions,
   (choice: MentionChoice,sessionId) => {
     if (sessionId !== draftSessionId || holdStreams) return;
     if (choice.kind === "session") {
@@ -6278,6 +6616,15 @@ const mentions = fileMentions(input, document.getElementById("composer")!, () =>
   });
 
 let slashCommands: Array<{ name: string; description: string; inputHint: string }> = [];
+type SlashSkill = { name: string; description: string; path: string; gated?: boolean };
+type SlashAgent = { name: string; description: string; source: string };
+type SlashMenuEntry =
+  | { kind: "command"; command: (typeof slashCommands)[number] }
+  | { kind: "skill"; skill: SlashSkill }
+  | { kind: "agent"; agent: SlashAgent };
+let slashSkills: SlashSkill[] = [];
+let slashAgents: SlashAgent[] = [];
+let referenceMenuOpen = false;
 /** Goal state from the v4 stream: drives the status strip and iteration markers. */
 type WebviewGoal = { objective: string; status: string; iteration: number; timeUsedSeconds: number; activeRunStartedAtMs?: number | null; localTickFrom?: number; verifications: Array<{ anchorTurnId?: string; anchorRowId?: number; iteration: number; passed: boolean }> };
 type GoalVerification = WebviewGoal["verifications"][number];
@@ -6496,7 +6843,7 @@ function restoreGoalHistoryMarks(): void {
 /** Active composer command (e.g. "goal"): shown as a toolbar chip, sent as a /prefix. */
 let activeCommand: string | undefined;
 function composerPlaceholder(): string {
-  return t("向 ZCode 提问，@ 添加上下文，/ 选择能力");
+  return t("向 ZCode 提问，@ 添加上下文，/ 选择命令或能力");
 }
 /** Live model-switch separators kept until the transcript's own timeline part covers them. */
 let modelMarks: Array<{ fromText?: string; toText: string; toId: string; anchorJump: string; anchorText: string }> = [];
@@ -6538,56 +6885,184 @@ function splitCommandBody(body: string): { badge: string; rest: string } | undef
   return { badge, rest: match[2] };
 }
 
-function slashMatches(): typeof slashCommands {
-  // The menu covers command-name completion only; once parameters begin the
-  // input stops matching and the menu closes. A bare "/" still opens it.
-  const match = /^\/([a-zA-Z][a-zA-Z0-9_-]*)?$/.exec(input.value.trim());
-  if (!match) return [];
-  const query = (match[1] ?? "").toLowerCase();
-  return slashCommands.filter(command => command.name.toLowerCase().startsWith(query));
+function slashToken(): { start: number; end: number; typed: string } | undefined {
+  if (input.selectionStart !== input.selectionEnd) return;
+  const end = input.selectionStart;
+  const match = /(?:^|\s)\/([a-zA-Z0-9@$._:-]*)$/.exec(input.value.slice(0, end));
+  if (!match) return;
+  return { start: match.index + (match[0].startsWith("/") ? 0 : 1), end, typed: match[1].toLowerCase() };
+}
+
+function slashMatches(): SlashMenuEntry[] {
+  if (activeCommand) return [];
+  const token = slashToken();
+  if (!token) return [];
+  const { typed } = token;
+  const skillQuery = typed.replace(/^\$/, "");
+  const agentQuery = typed.replace(/^@/, "");
+  const isWholeInput = !input.value.slice(0, token.start).trim() && !input.value.slice(token.end).trim();
+  const catalog = [
+    { name: "plan", description: "开启计划模式", inputHint: "" },
+    ...slashCommands.filter(command => command.name.toLowerCase() !== "plan"),
+  ];
+  const commands = /^[\$@]/.test(typed) ? [] : catalog.filter(command =>
+    (command.name === "plan" || isWholeInput) && command.name.toLowerCase().startsWith(typed));
+  return [
+    ...commands
+      .map(command => ({ kind: "command" as const, command })),
+    ...(typed.startsWith("@") ? [] : slashSkills)
+      .filter(skill => skill.name.toLowerCase().startsWith(skillQuery))
+      .map(skill => ({ kind: "skill" as const, skill })),
+    ...(typed.startsWith("$") ? [] : slashAgents)
+      .filter(agent => agent.name.toLowerCase().startsWith(agentQuery))
+      .map(agent => ({ kind: "agent" as const, agent })),
+  ];
 }
 
 function closeSlashMenu(): void {
   slashIndex = 0;
+  referenceMenuOpen = false;
   document.getElementById("slash-menu")?.classList.remove("open");
 }
 
-function renderSlashMenu(): void {
+function slashEntryKey(entry: SlashMenuEntry): string {
+  return entry.kind === "command" ? `command:${entry.command.name.toLowerCase()}`
+    : entry.kind === "skill" ? `skill:${entry.skill.path}` : `agent:${entry.agent.name.toLowerCase()}`;
+}
+
+function selectedSlashKey(): string | undefined {
+  if (!document.getElementById("slash-menu")?.classList.contains("open")) return undefined;
+  const entry = slashMatches()[slashIndex];
+  return entry ? slashEntryKey(entry) : undefined;
+}
+
+function renderSlashMenu(preserveKey?: string): void {
   const menu = document.getElementById("slash-menu");
   if (!menu) return;
+  if (slashToken() && document.activeElement === input && sessionConnected && currentSessionId && !referenceMenuOpen) {
+    referenceMenuOpen = true;
+    post({ type: "refreshReferenceCatalog", sessionId: currentSessionId });
+  }
   const items = slashMatches();
   if (!items.length || document.activeElement !== input) {
-    closeSlashMenu();
+    menu.classList.remove("open");
+    if (!slashToken() || document.activeElement !== input) referenceMenuOpen = false;
     return;
   }
-  slashIndex = Math.min(Math.max(slashIndex, 0), items.length - 1);
+  if (preserveKey !== undefined) {
+    const index = items.findIndex(item => slashEntryKey(item) === preserveKey);
+    slashIndex = index < 0 ? 0 : index;
+  } else slashIndex = Math.min(Math.max(slashIndex, 0), items.length - 1);
+  const previousScroll = menu.scrollTop;
   menu.replaceChildren();
-  items.forEach((command, index) => {
+  let section: SlashMenuEntry["kind"] | undefined;
+  items.forEach((entry, index) => {
+    if (entry.kind !== section) {
+      section = entry.kind;
+      const heading = document.createElement("div");
+      heading.className = "slash-heading";
+      heading.textContent = t(entry.kind === "command" ? "命令" : entry.kind === "skill" ? "技能" : "子智能体");
+      menu.appendChild(heading);
+    }
     const item = document.createElement("button");
     item.type = "button";
-    item.className = "slash-item" + (index === slashIndex ? " active" : "");
+    item.className = `slash-item ${entry.kind}` + (index === slashIndex ? " active" : "");
     item.setAttribute("role", "option");
     item.setAttribute("aria-selected", String(index === slashIndex));
     const icon = document.createElement("span");
     icon.className = "slash-icon";
-    icon.innerHTML = COMMAND_ICONS[command.name] ?? COMMAND_ICON;
+    if (entry.kind === "command") icon.innerHTML = COMMAND_ICONS[entry.command.name] ?? COMMAND_ICON;
+    else if (entry.kind === "skill") { icon.classList.add("skill"); icon.textContent = "$"; }
+    else icon.innerHTML = AGENT_ICON;
     const name = document.createElement("span");
-    name.className = "slash-name"; name.textContent = `/${command.name}`;
+    name.className = "slash-name";
     const hint = document.createElement("span");
-    hint.className = "slash-hint"; hint.textContent = command.inputHint;
     const desc = document.createElement("span");
-    desc.className = "slash-desc"; desc.textContent = commandDescription(command);
+    desc.className = "slash-desc";
+    if (entry.kind === "command") {
+      name.textContent = entry.command.name === "plan" ? t("计划模式") : `/${entry.command.name}`;
+      hint.className = "slash-hint";
+      hint.textContent = entry.command.inputHint;
+      desc.textContent = commandDescription(entry.command);
+    } else if (entry.kind === "skill") {
+      name.textContent = entry.skill.name;
+      hint.className = "slash-hint";
+      desc.textContent = entry.skill.gated
+        ? `${t(entry.skill.description)} · ${t("已关闭，选择后可以启用")}`
+        : entry.skill.description;
+    } else {
+      name.textContent = entry.agent.name;
+      hint.className = "slash-hint";
+      const source = entry.agent.source === "built-in" ? t("内置") : entry.agent.source === "workspace" ? t("工作区") : entry.agent.source === "plugin" ? t("插件") : t("用户");
+      desc.textContent = [source, entry.agent.description].filter(Boolean).join(" · ");
+    }
     item.append(icon, name, hint, desc);
     // pointerdown keeps the composer focus so the draft state stays intact.
-    item.addEventListener("pointerdown", event => { event.preventDefault(); applySlashCommand(command); });
+    item.addEventListener("pointerdown", event => { event.preventDefault(); applySlashMenuEntry(entry); });
     menu.appendChild(item);
   });
   menu.classList.add("open");
+  menu.scrollTop = previousScroll;
+  const active = menu.querySelector<HTMLElement>(".slash-item.active");
+  if (active) {
+    const box = menu.getBoundingClientRect(), item = active.getBoundingClientRect();
+    const top = box.top + menu.clientTop, bottom = top + menu.clientHeight;
+    if (item.top < top) menu.scrollTop += item.top - top;
+    else if (item.bottom > bottom) menu.scrollTop += item.bottom - bottom;
+  }
+}
+
+function skillReferenceMarkdown(skill: SkillReference): string {
+  return markdownLinkRef(`$${skill.name}`, skill.path);
+}
+
+function applySlashMenuEntry(entry: SlashMenuEntry): void {
+  if (entry.kind === "command") {
+    applySlashCommand(entry.command);
+    return;
+  }
+  const token = slashToken();
+  if (!token) return;
+  if (entry.kind === "skill") {
+    if (entry.skill.gated) {
+      input.setRangeText("", token.start, token.end, "end");
+      closeSlashMenu();
+      post({ type: "promptDesktopPluginSkill", text: entry.skill.name });
+      resizeComposerInput();
+      updateComposerActions();
+      persistComposerDraft();
+      input.focus();
+      return;
+    }
+    if (!selectedSkills.some(skill => skill.path === entry.skill.path)) selectedSkills.push({ name: entry.skill.name, path: entry.skill.path });
+  } else if (!selectedAgents.some(agent => agent.name.toLowerCase() === entry.agent.name.toLowerCase())) {
+    selectedAgents.push({ name: entry.agent.name });
+  }
+  input.setRangeText("", token.start, token.end, "end");
+  closeSlashMenu();
+  renderSelectedSkills(entry.kind === "skill" ? { kind: "skill", key: entry.skill.path } : { kind: "agent", key: entry.agent.name });
+  resizeComposerInput();
+  updateComposerActions();
+  persistComposerDraft();
+  input.focus();
 }
 
 /** Picking a command clears the composer: the body typed next is the parameter,
  *  sent with a /name prefix. The chip lives in the toolbar, like the desktop. */
 function applySlashCommand(command: { name: string }): void {
+  if (command.name.toLowerCase() === "plan") {
+    const token = slashToken();
+    if (!token) return;
+    input.setRangeText("", token.start, token.end, "end");
+    closeSlashMenu();
+    draftPlanEnabled = true;
+    updatePlanChip();
+    resizeComposerInput();
+    updateComposerActions();
+    persistComposerDraft();
+    input.focus();
+    return;
+  }
   activateCommand(command.name);
 }
 
@@ -6647,7 +7122,7 @@ function updateActiveCommandChip(): void {
 
 /** Permission-menu plan and /plan are one chip: lightbulb, the word plan, and the same hover X. */
 function updatePlanChip(): void {
-  const show = planEnabled || activeCommand === "plan";
+  const show = planEnabled || draftPlanEnabled;
   if (!show) {
     planIndicator.hidden = true;
     planIndicator.replaceChildren();
@@ -6660,6 +7135,9 @@ function updatePlanChip(): void {
 }
 
 function dismissPlanChip(): void {
+  draftPlanEnabled = false;
+  persistComposerDraft();
+  updatePlanChip();
   if (activeCommand === "plan") clearActiveCommand();
   if (!planEnabled) return;
   const next = baseMode && baseMode !== "plan" ? baseMode : "build";
@@ -6680,7 +7158,7 @@ function maybeActivateTypedCommand(): void {
   const match = /^\/([a-zA-Z][a-zA-Z0-9_-]*)\s$/.exec(input.value);
   if (!match) return;
   const name = match[1].toLowerCase();
-  if (!slashCommands.some(item => item.name.toLowerCase() === name)) return;
+  if (name === "plan" || !slashCommands.some(item => item.name.toLowerCase() === name)) return;
   activateCommand(name);
 }
 
@@ -6700,7 +7178,7 @@ input.addEventListener("keydown", (e) => {
     }
     if ((e.key === "Tab" || e.key === "Enter") && items[slashIndex]) {
       e.preventDefault();
-      applySlashCommand(items[slashIndex]);
+      applySlashMenuEntry(items[slashIndex]);
       return;
     }
     if (e.key === "Escape") {
@@ -6751,7 +7229,7 @@ planIndicator.addEventListener("click", () => {
 });
 
 input.addEventListener("blur", closeSlashMenu);
-input.addEventListener("focus", renderSlashMenu);
+input.addEventListener("focus", () => renderSlashMenu());
 
 titleEl.addEventListener("focus", () => beginTitleEdit());
 titleEl.addEventListener("keydown", (e) => {
@@ -6884,6 +7362,10 @@ settingsButton.addEventListener("click", () => {
 languageSelect.addEventListener("change", () => {
   post({ type: "setLanguage", language: languageSelect.value });
 });
+const desktopPluginsInputs = [...document.querySelectorAll<HTMLInputElement>("[data-desktop-plugin]")];
+for (const checkbox of desktopPluginsInputs) checkbox.addEventListener("change", () => {
+  post({ type: "setDesktopPlugins", text: checkbox.dataset.desktopPlugin, enabled: checkbox.checked });
+});
 function applyComposerChrome(chrome: {
   showQuestionJump?: boolean;
   showUsageChevron?: boolean;
@@ -6938,7 +7420,7 @@ function applyInterfaceLanguage(language: string, setting: LanguageSetting): voi
   setUiLanguage(resolveUiLanguage(language, "en"));
   document.documentElement.lang = language;
   languageSelect.value = setting;
-  renderImageDrafts(); refreshImageLabels(); renderComposerChips();
+  renderImageDrafts(); refreshImageLabels(); renderComposerChips(); renderSelectedSkills();
   refreshPendingAction();
   // Refresh only extension-owned controls. Chat text, question choices, tool
   // input/output, drafts and session names remain untouched.
@@ -6957,7 +7439,7 @@ function applyInterfaceLanguage(language: string, setting: LanguageSetting): voi
       if (value) node.setAttribute(attr, relocalizeUiText(value));
     }
   }
-  for (const node of document.querySelectorAll<HTMLElement>(".git-title[data-i18n-key],.perm-title[data-i18n-key],.tool-status[data-i18n-key],.tool-name[data-i18n-key],.reasoning-head [data-i18n-key],.process-group [data-i18n-key],.tool-section-label[data-i18n-key],.ask-summary [data-i18n-key],.message.error [data-i18n-key],#setup-title[data-i18n-key],#setup-hint[data-i18n-key],#setup-recovery [data-i18n-key]")) {
+  for (const node of document.querySelectorAll<HTMLElement>(".git-title[data-i18n-key],.perm-title[data-i18n-key],.tool-status[data-i18n-key],.tool-name[data-i18n-key],.reasoning-head [data-i18n-key],.process-group [data-i18n-key],.tool-section-label[data-i18n-key],.ask-summary [data-i18n-key],.message.error [data-i18n-key],#setup-title[data-i18n-key],#setup-hint[data-i18n-key],#setup-recovery [data-i18n-key],.math-font-hint[data-i18n-key]")) {
     if (node.closest(".md,.work-note,.message.user,.tool-body,.ask-q,.perm-reason") && !node.classList.contains("tool-section-label") && node.dataset.i18nKey !== "分析图片") continue;
     node.textContent = t(node.dataset.i18nKey!, JSON.parse(node.dataset.i18nValues || "{}"));
   }
@@ -6976,6 +7458,8 @@ function applyInterfaceLanguage(language: string, setting: LanguageSetting): voi
   input.placeholder = command ? commandDescription(command) : composerPlaceholder();
   for (const fold of messagesEl.querySelectorAll<HTMLElement>(".work-fold")) paintWorkFold(fold);
   refreshEmptyGreeting();
+  if (startupWait) showStartupWait(startupWait.key, Math.floor((Date.now() - startupWait.startedAt) / 1000));
+  paintSessionListNotice();
   if (overlayMode) rebuildOverlay(overlaySearch.value);
   placePicker();
 }
@@ -6987,13 +7471,13 @@ document.getElementById("tab-active")?.addEventListener("click", () => {
   showArchived = false;
   document.getElementById("tab-active")?.classList.add("active");
   document.getElementById("tab-archived")?.classList.remove("active");
-  post({ type: "listSessions", includeArchived: false });
+  post({ type: "listSessions", includeArchived: false, listVisible: true });
 });
 document.getElementById("tab-archived")?.addEventListener("click", () => {
   showArchived = true;
   document.getElementById("tab-archived")?.classList.add("active");
   document.getElementById("tab-active")?.classList.remove("active");
-  post({ type: "listSessions", includeArchived: true });
+  post({ type: "listSessions", includeArchived: true, listVisible: true });
 });
 document.getElementById("btn-new")!.addEventListener("click", () => {
   post({ type: "newSession" });
@@ -7020,6 +7504,13 @@ document.addEventListener("mousedown", (e) => {
   closePicker();
 });
 document.getElementById("overlay-close")!.addEventListener("click", closeOverlay);
+document.querySelector("#session-list-notice button")?.addEventListener("click", () => {
+  if (sessionListRequestId) return;
+  const loadMore = sessionListHasMore && sessionListNotice === "ready";
+  sessionListRequestId = crypto.randomUUID();
+  paintSessionListNotice();
+  post({ type: "listSessions", includeArchived: showArchived, listVisible: true, requestId: sessionListRequestId, ...(loadMore ? { loadMore: true } : {}) });
+});
 overlay.addEventListener("click", (e) => {
   if (e.target === overlay) closeOverlay();
 });
@@ -7042,9 +7533,17 @@ window.addEventListener("keydown", (e) => {
 
 window.addEventListener("message", (event) => {
   const msg = event.data;
+  if (msg.type === "view_reset" || (msg.type === "session_ready" && msg.sessionId !== currentSessionId)) {
+    cancelAssistantRender();
+  } else if (msg.type !== "assistant_text_delta") {
+    // Tools, reasoning, history and completion must observe all preceding text.
+    flushAssistantRender();
+  }
   switch (msg.type) {
     case "session_ready":
+      if (msg.sessionId !== currentSessionId) { slashSkills = []; slashAgents = []; }
       hideSetup();
+      clearStartupWait();
       if (
         msg.sessionId &&
         conversationSessionId &&
@@ -7069,6 +7568,30 @@ window.addEventListener("message", (event) => {
       sessionConnected = true;
       updateComposerActions();
       setStatus("idle", "");
+      renderSlashMenu();
+      break;
+    case "skill_catalog":
+      if (msg.sessionId !== currentSessionId) break;
+      {
+      const selected = selectedSlashKey();
+      slashSkills = Array.isArray(msg.skills)
+        ? msg.skills.flatMap((skill: { name?: unknown; description?: unknown; path?: unknown; gated?: unknown }) => {
+          if (typeof skill?.name !== "string" || skill.name.length === 0) return [];
+          if (typeof skill.description !== "string" || typeof skill.path !== "string") return [];
+          return [{ name: skill.name, description: skill.description, path: skill.path, ...(skill.gated === true ? { gated: true } : {}) }];
+        })
+        : [];
+      renderSlashMenu(selected);
+      }
+      break;
+    case "subagent_catalog":
+      if (msg.sessionId !== currentSessionId) break;
+      {
+      const selected = selectedSlashKey();
+      slashAgents = Array.isArray(msg.agents) ? msg.agents.filter((agent: SlashAgent) =>
+        typeof agent?.name === "string" && typeof agent?.description === "string" && typeof agent?.source === "string") : [];
+      renderSlashMenu(selected);
+      }
       break;
     case "goal_state": {
       if (holdStreams) break;
@@ -7103,6 +7626,9 @@ window.addEventListener("message", (event) => {
           ? { ...s, title: msg.title }
           : s
       );
+      referenceSessions = referenceSessions.map(session => session.sessionId === (msg.sessionId || currentSessionId)
+        ? { ...session, title: msg.title } : session);
+      mentions.refresh();
       if (
         msg.title &&
         (!msg.sessionId || msg.sessionId === currentSessionId)
@@ -7123,8 +7649,18 @@ window.addEventListener("message", (event) => {
     case "session_action_complete":
       if (msg.sessionId && msg.actionRequestId) finishSessionAction(msg.sessionId, msg.actionRequestId);
       break;
+    case "session_list_complete":
+      if (msg.requestId === sessionListRequestId) {
+        sessionListRequestId = "";
+        paintSessionListNotice();
+      }
+      break;
     case "sessions":
+      sessionListHasMore = msg.hasMore === true;
+      sessionListRequestId = "";
       sessions = msg.sessions ?? [];
+      referenceSessions = msg.referenceSessions ?? [];
+      if (msg.notice === "initial" || msg.notice === "stale" || msg.notice === "ready") sessionListNotice = msg.notice;
       mentions.refresh();
       currentSessionId = msg.currentId || currentSessionId;
       {
@@ -7255,6 +7791,8 @@ window.addEventListener("message", (event) => {
     case "user_input_echo":
       break;
     case "view_reset":
+      sessionListRequestId = "";
+      paintSessionListNotice();
       messageEpoch++;
       resetAllTurnCollapse();
       pinActiveQuestionUntil = 0;
@@ -7360,6 +7898,7 @@ window.addEventListener("message", (event) => {
       break;
     case "setup":
       sessionConnected = false;
+      clearStartupWait();
       setStatus("warn", msg.reason || t("Setup needed"));
       updateComposerActions();
       showSetup(msg.reason || t("Setup needed"), msg.hint || "", msg.picker || []);
@@ -7367,12 +7906,26 @@ window.addEventListener("message", (event) => {
     case "ui_language":
       applyInterfaceLanguage(msg.language, msg.setting);
       break;
+    case "math_fonts":
+      if (msg.mode === "auto" || msg.mode === "on" || msg.mode === "off") mathFontMode = msg.mode;
+      if (msg.status === "absent" || msg.status === "downloading" || msg.status === "ready" || msg.status === "failed" || msg.status === "disabled") mathFontStatus = msg.status;
+      applyMathFontCss(typeof msg.css === "string" ? msg.css : "");
+      if (mathFontStatus === "ready" && !document.getElementById("math-font-faces")) mathFontStatus = "failed";
+      syncMathFontHint();
+      break;
     case "composer_chrome":
       if (msg.chrome) applyComposerChrome(msg.chrome);
       break;
     case "openSettings":
       settingsMenu.hidden = false;
       settingsButton.setAttribute("aria-expanded", "true");
+      if (msg.focus === "enable-desktop-plugins") {
+        document.getElementById("desktop-plugin-settings")?.scrollIntoView({ block: "nearest" });
+        desktopPluginsInputs[0]?.focus();
+      }
+      break;
+    case "desktop_plugins":
+      if (Array.isArray(msg.allowed)) for (const checkbox of desktopPluginsInputs) checkbox.checked = msg.allowed.includes(checkbox.dataset.desktopPlugin);
       break;
     case "status":
       if (msg.sessionId && msg.sessionId !== currentSessionId) break;
@@ -7391,7 +7944,11 @@ window.addEventListener("message", (event) => {
       }
       else if (msg.status === "connecting" || msg.status === "resolving_credentials") {
         sessionConnected = false;
-        setStatus("busy", msg.status === "resolving_credentials" ? t("读取登录") : t("连接中"));
+        if (msg.phase === "starting" || msg.phase === "restoring") beginStartupWait(msg.phase, Number(msg.waitedSeconds) || 0);
+        else {
+          clearStartupWait();
+          setStatus("busy", msg.status === "resolving_credentials" ? t("读取登录") : t("连接中"));
+        }
         updateComposerActions();
       } else if (msg.status === "completedSuccess" || msg.status === "completedInterrupted") {
         const revealStart = msg.status === "completedSuccess" && revealAfterCompletionArmed && stickToBottom;
@@ -7410,6 +7967,7 @@ window.addEventListener("message", (event) => {
         }
       } else if (msg.status === "exited") {
         sessionConnected = false;
+        clearStartupWait();
         setGenerating(false);
         removePendingEditPens();
         settleWorkFolds("interrupted");
@@ -7417,6 +7975,7 @@ window.addEventListener("message", (event) => {
         setStatus("error", t("ZCode process exited"));
         if (!messagesEl.lastElementChild?.classList.contains("error")) addErrorMessage(msg.message || "ZCode process exited");
       } else if (msg.status === "error") {
+        clearStartupWait();
         setGenerating(false);
         removePendingEditPens();
         settleWorkFolds("interrupted");
@@ -7433,6 +7992,7 @@ window.addEventListener("message", (event) => {
       break;
     case "session_error":
       if (holdStreams) break;
+      clearStartupWait();
       setGenerating(false);
       removePendingEditPens();
       settleWorkFolds("interrupted");
@@ -7466,7 +8026,7 @@ window.addEventListener("message", (event) => {
     case "file_added": {
       persistComposerDraft(); const draft = composerDrafts.get(msg.sessionId);
       if (!draft.chips.some(chip => chip.path === msg.chip.path)) draft.chips.push(msg.chip);
-      composerDrafts.set(msg.sessionId, draft.text, draft.chips, draft.images, draft.sessionRefs);
+      composerDrafts.set(msg.sessionId, draft.text, draft.chips, draft.images, draft.sessionRefs, draft.skills, draft.agents, draft.planEnabled);
       if (msg.sessionId === draftSessionId) { explicitChips = draft.chips; renderComposerChips(); }
       vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize() }); break;
     }
@@ -7525,14 +8085,14 @@ window.addEventListener("message", (event) => {
         if (!msg.sessionId || msg.sessionId === currentSessionId) showToast(msg.message || "");
         break;
       }
-      recoverInput(msg);
+      const rejectedDraft = recoverInput(msg);
       if (!msg.sessionId || msg.sessionId === currentSessionId) {
         setGenerating(false);
         removePendingEditPens();
         settleWorkFolds("interrupted");
         settleReplyFooters();
         setStatus("error", msg.message || "");
-        addErrorMessage(msg.message || t("发送失败，内容已保留到草稿。"));
+        addErrorMessage(msg.message || t("发送失败，内容已保留到草稿。"), rejectedDraft);
         showToast(t("发送失败，内容已保留到草稿。"));
       }
       break;
@@ -7696,6 +8256,10 @@ const chromeObserver = new ResizeObserver(() => {
   const stick = stickToBottom;
   syncMessagesChrome();
   if (stick) scrollToBottom(true);
+  if (resumeOuterFollow) {
+    const prompt = pendingPrompt();
+    if (prompt) revealPrompt(prompt);
+  }
   scheduleCompletedReveal();
 });
 chromeObserver.observe(topbarEl);
@@ -7712,9 +8276,13 @@ window.addEventListener("resize", () => {
   scheduleCompletedReveal();
 });
 messagesEl.addEventListener("scroll", scheduleMessagesScrollbar, { passive: true });
-new MutationObserver(() => {
+new MutationObserver(records => {
   scheduleMessagesScrollbar();
   scheduleCompletedReveal();
+  if (resumeOuterFollow) {
+    const prompt = pendingPrompt();
+    if (prompt && records.some(record => prompt.contains(record.target))) revealPrompt(prompt);
+  }
 }).observe(messagesEl, {
   childList: true,
   subtree: true,
@@ -7722,6 +8290,7 @@ new MutationObserver(() => {
 });
 messagesScrollEl.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
+  cancelPromptFollow();
   releaseCompletedReveal();
   const thumbRect = messagesThumbEl.getBoundingClientRect();
   const onThumb = event.clientY >= thumbRect.top && event.clientY <= thumbRect.bottom;

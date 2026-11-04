@@ -21,12 +21,13 @@ type Kind = "string" | "longString" | "path" | "dataUrl" | "number" | "boolean" 
 
 export const KNOWN_WEBVIEW_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   "archiveSession", "attachFileUris", "copy", "copyDiagnostics", "deleteSession", "editLast",
-  "fileReferenceDetails", "historyRenderTiming", "insert", "listSessions", "loadFileChanges",
+  "fileReferenceDetails", "historyRenderTiming", "insert", "installMathFonts", "listSessions", "loadFileChanges",
   "loadOlder", "loadPreviewFiles", "loadThrough", "newSession", "openCommunity", "openDiff",
   "openFile", "openGitDiff", "openMarkdownFile", "openRecoverySettings", "permissionAnswer",
+  "promptDesktopPluginSkill",
   "pickAttachments", "previewImage", "queueDelete", "queueEdit", "queueReorder", "queueSendNow",
-  "ready", "renameSession", "responsePainted", "retry", "retryLast", "rewindFiles",
-  "searchWorkspaceFiles", "selectModel", "send", "setChrome", "setLanguage", "setMode",
+  "ready", "refreshReferenceCatalog", "renameSession", "responsePainted", "retry", "retryLast", "rewindFiles",
+  "searchWorkspaceFiles", "selectModel", "send", "setChrome", "setDesktopPlugins", "setLanguage", "setMode",
   "setNewSessionDefaults", "setThoughtLevel", "showLog", "stop", "switchSession",
   "thumbnailImage", "unarchiveSession", "uploadImage", "userInputAnswer",
 ]);
@@ -41,7 +42,7 @@ const FIELD_KINDS = {
   dataUrl: "dataUrl", uris: "fileUris", fileName: "string", language: "string", chrome: "settingsObject",
   defaults: "settingsObject", chromeKey: "string", enabled: "boolean", text: "longString",
   sessionId: "string", providerId: "string", modelId: "string", restart: "boolean",
-  includeArchived: "boolean", requestId: "string", actionRequestId: "string", optionId: "string",
+  includeArchived: "boolean", listVisible: "boolean", loadMore: "boolean", requestId: "string", actionRequestId: "string", optionId: "string",
   mode: "string", planMode: "boolean", recoveryText: "longString", thoughtLevel: "string",
   viewGen: "number", title: "string", commit: "boolean", action: "string", content: "formAnswer",
   reason: "longString", path: "path", fileChange: "fileChange", previewCandidates: "stringList",

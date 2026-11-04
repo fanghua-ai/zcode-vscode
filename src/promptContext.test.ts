@@ -1,6 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildPrompt, parsePromptDisplay, fileMarkdownRef, stripSessionReferences } from "./promptContext";
+import { buildPrompt, parsePromptDisplay, fileMarkdownRef, stripSessionReferences, extractLeadingSkills, extractLeadingAgents, markdownLinkRef } from "./promptContext";
+
+test("serialized subagent mentions restore qualified names and the prompt", () => {
+  assert.deepEqual(extractLeadingAgents("@Explore @demo:reviewer Please review"), {
+    agents: [{ name: "Explore" }, { name: "demo:reviewer" }], text: "Please review",
+  });
+});
+
+test("skill references restore as selections and retain a prompt beginning with a code fence", () => {
+  const first = { name: "alpha", path: "/My Skills/alpha/SKILL.md" };
+  const second = { name: "beta", path: "C:\\Skills\\beta\\SKILL.md" };
+  const text = `${markdownLinkRef(`$${first.name}`, first.path)}\n\n${markdownLinkRef(`$${second.name}`, second.path)}\n\n\`\`\`js\nconsole.log(1)\n\`\`\``;
+  const parsed = parsePromptDisplay(text);
+  assert.equal(parsed.chips.length, 2);
+  assert.equal(parsed.body, "```js\nconsole.log(1)\n```");
+  assert.deepEqual(extractLeadingSkills(text), { text: parsed.body, skills: [first, { ...second, path: "C:/Skills/beta/SKILL.md" }] });
+});
 test("special file names and line ranges round trip without broken Markdown", () => {
   const chip={path:"/work/a (1)#%.ts",relPath:"a (1)#%.ts",selectionStart:2,selectionEnd:3,selectedText:"sample"};
   assert.match(fileMarkdownRef(chip), /<\.\/a \(1\)%23%25.ts#L2-L3>/);

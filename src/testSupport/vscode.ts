@@ -4,12 +4,21 @@ export class RelativePattern { constructor(public base: string, public pattern: 
 export const setTestFiles = (files: string[]) => { testFiles = files; };
 let languageSetting = "auto";
 let confirmWarning = false;
+let informationChoice: number | undefined;
+export const setInformationChoice = (index: number | undefined) => { informationChoice = index; };
+export const configUpdates: Array<{ key: string; value: unknown; target?: unknown }> = [];
+const configValues = new Map<string, unknown>();
+export const resetConfigValues = () => configValues.clear();
 const disposable = () => ({ dispose() {} });
 export const recoveryNotices: Array<{message:string;items:string[]}> = [];
 export const window = {
   async showQuickPick(_items: unknown, _options?: unknown): Promise<any> { return undefined; },
   async showErrorMessage(message:string,...items:string[]){recoveryNotices.push({message,items});return undefined as string|undefined;},
   async showWarningMessage(_message: string, _options: unknown, ...items: string[]) { return confirmWarning ? items[0] : undefined; },
+  async showInformationMessage(message: string, ...items: string[]) {
+    recoveryNotices.push({ message, items });
+    return informationChoice === undefined ? undefined : items[informationChoice];
+  },
   createOutputChannel() { return { info() {}, warn() {}, error() {}, debug() {}, show() {}, dispose() {} }; },
   registerWebviewViewProvider(_id: string, value: unknown) { provider = value; return disposable(); },
   onDidChangeActiveTextEditor: disposable,
@@ -19,7 +28,15 @@ export const recoveryCalls: Array<{command?:string;args?:unknown[];url?:string}>
 export const commands = { registerCommand: disposable, async executeCommand(command:string,...args:unknown[]){recoveryCalls.push({command,args});} };
 export const workspace = {
   async findFiles() { return testFiles.map(fsPath => ({fsPath})); },
-  getConfiguration() { return { get(key: string, fallback?: unknown) { return key === "language" ? languageSetting : fallback; }, async update(key: string, value: string) { if (key === "language") languageSetting = value; } }; },
+  getConfiguration() { return { get(key: string, fallback?: unknown) {
+      if (key === "language") return languageSetting;
+      return configValues.has(key) ? configValues.get(key) : fallback;
+    },
+    async update(key: string, value: unknown, target?: unknown) {
+      configUpdates.push({ key, value, target });
+      configValues.set(key, value);
+      if (key === "language") languageSetting = String(value);
+    }, }; },
   onDidChangeConfiguration: disposable,
   onDidChangeWorkspaceFolders: disposable,
   registerTextDocumentContentProvider: disposable,

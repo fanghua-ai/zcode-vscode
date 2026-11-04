@@ -1,3 +1,4 @@
+import * as vscode from "vscode";
 import { createHash } from "crypto";
 import { uploadImage, readUploadedImage } from "./imageAttachments";
 import { withRuntimeCompileCache } from "./runtimeCache";
@@ -5,9 +6,10 @@ import { readImageAttachments, type ImageAttachment } from "./attachmentTypes";
 import { hostT as t, userFacingError } from "./hostI18n";
 import { LocalizedError } from "./i18n";
 import { ChildProcess, spawn } from "child_process";
+import * as fs from "fs";
 import * as readline from "readline";
 import { sameWorkspacePath } from "./workspacePath";
-import { listWorkspacePathVariants, sessionsFinishedSince } from "./taskIndex";
+import { listWorkspacePathVariants, sessionsFinishedSince, persistEmptySessionMode, loadSessionExecutionState, saveSessionRestoreIntent } from "./taskIndex";
 import { logDebug, logError, logInfo, logWarn } from "./log";
 import {
   ResolvedRuntime,
@@ -24,8 +26,9 @@ import {
   listStoredProviderModels,
   workspaceObject,
 } from "./desktop";
-import { fetchPlanQuota, type PlanQuotaLimit, type QuotaLine, type PlanAuth } from "./credentials";
+import { fetchPlanQuota, invalidatePlanAuth, type PlanQuotaLimit, type QuotaLine, type PlanAuth } from "./credentials";
 import { desktopVersion } from "./diagnostics";
+import { DESKTOP_PLUGIN_OVERLAY_ENV } from "./desktopPluginOverlay";
 import { appServerLaunch, startupExitMessage } from "./serverPath";
 import { StartupTiming } from "./startupTiming";
 import { FileChange, parseFileChange } from "./toolFiles";
@@ -43,6 +46,7 @@ import {
 } from "./conversation";
 import { parseGoalCommand, type GoalCommand } from "./goalCommand";
 import { sameSessionModel, type NewSessionDefaults } from "./newSessionDefaults";
+import { localSubagents, mergeSubagentCatalog } from "./subagentCatalog";
 
 export interface ZCodeRequest {
   id: string | number;
@@ -149,6 +153,12 @@ export interface AvailableModel {
   disabledReason?: string;
 }
 
+export interface SkillCatalogEntry {
+  name: string;
+  description: string;
+  path: string;
+}
+
 interface SessionSnapshot {
   runtime?: { stateRevision?: number; eventSeq?: number };
   slashCommands?: Array<{ name?: string; description?: string; inputHint?: string; source?: string }>;
@@ -248,6 +258,8 @@ export interface SessionControls {
 export interface ZCodeEvent {
   type:
     | "session_ready"
+    | "skill_catalog"
+    | "subagent_catalog"
     | "session_error"
     | "sync_status"
     | "assistant_text"
@@ -278,6 +290,13 @@ export interface ZCodeClientOptions {
   nodePath?: string;
   workspacePath: string;
   env?: Record<string, string>;
+  /**
+   * Hide official desktop viewer plugins from this app-server process.
+   * Requires desktopPluginOverlayPath, a plain Node preload script.
+   */
+  suppressDesktopPlugins?: boolean;
+  allowedDesktopPlugins?: string[];
+  desktopPluginOverlayPath?: string;
   compileCachePath?: string;
   runtime?: ResolvedRuntime;
   /** In-flight desktop login. Session attach waits for it, then reuses the key. */
@@ -342,8 +361,19 @@ export class ZCodeClient {
   private msgId = 1;
   private pending = new Map<string | number, Pending>();
   private sessionId: string | null = null;
+  /** False while resume/create has selected an id the server has not activated. */
+  private sessionReadable = true;
+  /** False until that activation and its conversation subscription both finish. */
+  private sessionSynced = false;
+  /** Counts resume RPCs that the server may still be executing. */
+  private resumeRequests = 0;
+  /** Resume ids whose client deadline passed; the server keeps running them. */
+  private lateResumes = new Map<string | number, NodeJS.Timeout>();
   private historyCache: { sessionId: string; items: HistoryItem[] } | null = null;
   private static readonly historyPage = 200;
+  private static readonly startupResumeTimeoutMs = 90_000;
+  private static readonly sessionListTimeoutMs = 20_000;
+  private static readonly sessionListTimeoutDuringResumeMs = 90_000;
   private readonly opts: ZCodeClientOptions;
   private seenRowIds = new Set<number>();
   private seenToolCallIds = new Set<string>();
@@ -372,6 +402,8 @@ export class ZCodeClient {
   private stopWatch: NodeJS.Timeout | null = null;
   private acceptLive = true;
   private sessionChanges: Promise<unknown> = Promise.resolve();
+  private readonly modeChanges = new Map<string, Promise<void>>();
+  private readonly pendingSessionRestores = new Set<string>();
   private sessionGeneration = 0;
   private disposed = false;
 
@@ -401,6 +433,7 @@ export class ZCodeClient {
   /** session/subscribe just applied settings, so the follow-up reads can reuse them. */
   private snapshotSettingsFresh = false;
   private snapshotModelFresh = false;
+  private snapshotModelCatalog?: { sessionId: string; generation: number; models: ReturnType<typeof modelsFromSnapshot> };
   private historyDelivery: HistoryDelivery | null = null;
   private readonly historyVersions = new WeakMap<readonly unknown[], HistoryDelivery>();
   private startupLoginConsumed = false;
@@ -460,7 +493,7 @@ export class ZCodeClient {
       binaryPath: this.opts.binaryPath,
       nodePath: this.opts.nodePath || process.execPath,
       serverReady: this.serverReady,
-      sessionAttached: !!this.sessionId,
+      sessionAttached: this.sessionAttached,
       synchronizationFailures: this.resyncFailures,
       pendingPermissions: this.pendingPermissions.size,
       pendingQuestions: this.pendingUserInputs.size,
@@ -487,6 +520,11 @@ export class ZCodeClient {
 
   setDefaultRuntime(runtime: ResolvedRuntime): void {
     this.defaultRuntime = runtime;
+  }
+
+  stageSessionModel(model: { providerId: string; modelId: string } | null): void {
+    this.setSessionModel(model);
+    if (this.quotaStarted) void this.refreshPlanQuota();
   }
 
   setTiming(timing: StartupTiming | undefined): void {
@@ -635,6 +673,30 @@ export class ZCodeClient {
     return this.lastTitle;
   }
 
+  get sessionAttached(): boolean {
+    // A resumed session can be read before its conversation subscription
+    // finishes. Retry stays available until both steps succeed.
+    return !!this.sessionId && this.sessionReadable && this.sessionSynced;
+  }
+
+  /** Preload that hides desktop viewer plugins, or undefined when it cannot apply. */
+  private desktopPluginPreloadPath(): string | undefined {
+    if (!this.opts.suppressDesktopPlugins) return undefined;
+    const candidate = this.opts.desktopPluginOverlayPath;
+    const script = this.opts.binaryPath.endsWith(".cjs") || this.opts.binaryPath.endsWith(".js");
+    if (!script) {
+      logWarn("Native app-server binary cannot load the desktop-plugin overlay; official MCP processes will still start");
+      void vscode.window.showWarningMessage(t("当前运行时无法应用插件关闭设置，部分 MCP 仍可能启动。"));
+      return undefined;
+    }
+    if (!candidate || !fs.existsSync(candidate)) {
+      logWarn("Desktop-plugin overlay is missing; official MCP processes will still start", { candidate });
+      void vscode.window.showWarningMessage(t("当前运行时无法应用插件关闭设置，部分 MCP 仍可能启动。"));
+      return undefined;
+    }
+    return candidate;
+  }
+
   async start(opts?: {
     resumeSessionId?: string;
     createNew?: boolean;
@@ -646,11 +708,13 @@ export class ZCodeClient {
     ) => string | undefined;
   }): Promise<void> {
     const { binaryPath, nodePath, workspacePath } = this.opts;
+    const preloadPath = this.desktopPluginPreloadPath();
 
     const launch = appServerLaunch({
       binaryPath,
       nodePath,
       execPath: process.execPath,
+      preloadPath,
     });
     const cmd = launch.command;
     const args = launch.args;
@@ -659,6 +723,7 @@ export class ZCodeClient {
       ...process.env,
       ...appServerEnv(binaryPath),
       ...(this.opts.env ?? {}),
+      ...(preloadPath && args[0] === "--require" ? { [DESKTOP_PLUGIN_OVERLAY_ENV]: "1", ZCODE_VSCODE_ALLOWED_PLUGINS: JSON.stringify(this.opts.allowedDesktopPlugins ?? []) } : {}),
     }, this.opts.compileCachePath);
     this.activeTiming?.note("runtimeCompileCacheRequested", !!env.NODE_COMPILE_CACHE && env.NODE_DISABLE_COMPILE_CACHE !== "1");
     if (launch.electronAsNode) env.ELECTRON_RUN_AS_NODE = "1";
@@ -766,7 +831,7 @@ export class ZCodeClient {
       if (opts?.resumeSessionId) {
         try {
           logInfo("Resuming remembered session", opts.resumeSessionId);
-          await this.resumeSession(opts.resumeSessionId);
+          await this.resumeSession(opts.resumeSessionId, undefined, ZCodeClient.startupResumeTimeoutMs);
           return;
         } catch (e) {
           if (this.startupError) throw this.startupError;
@@ -788,7 +853,7 @@ export class ZCodeClient {
       try {
         logInfo("Resuming session", sessionId);
         const known = listed.find((session) => session.sessionId === sessionId);
-        await this.resumeSession(sessionId, known);
+        await this.resumeSession(sessionId, known, ZCodeClient.startupResumeTimeoutMs);
         return;
       } catch (e) {
         if (this.startupError) throw this.startupError;
@@ -824,29 +889,121 @@ export class ZCodeClient {
       pending.reject(error);
     }
     this.pending.clear();
+    this.clearLateResumes();
+  }
+
+  private noteLateResume(id: string | number): void {
+    // The server cannot cancel a resume, so later requests still queue behind it.
+    const timer = setTimeout(() => this.lateResumes.delete(id), ZCodeClient.startupResumeTimeoutMs);
+    timer.unref?.();
+    this.lateResumes.set(id, timer);
+  }
+
+  private settleLateResume(id: string | number): void {
+    const timer = this.lateResumes.get(id);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.lateResumes.delete(id);
+  }
+
+  private clearLateResumes(): void {
+    for (const timer of this.lateResumes.values()) clearTimeout(timer);
+    this.lateResumes.clear();
   }
 
   private ws() {
     return workspaceObject(this.opts.workspacePath);
   }
 
+  private skillCatalogRequest = 0;
+  private subagentCatalogRequest = 0;
+  private subagentCatalogGeneration = -1;
+
+  private async publishSkillCatalog(sessionId: string, generation: number, request: number): Promise<void> {
+    const isCurrent = () => !this.disposed && this.sessionId === sessionId && this.sessionGeneration === generation && this.skillCatalogRequest === request;
+    try {
+      const response = await this.sendRequest("skills/referenceCatalog", {
+        workspace: this.ws(),
+        sessionId,
+      }, 15_000) as { skills?: unknown };
+      if (!isCurrent()) return;
+      const skills: SkillCatalogEntry[] = [];
+      for (const value of Array.isArray(response?.skills) ? response.skills : []) {
+        if (!value || typeof value !== "object") continue;
+        const item = value as { name?: unknown; description?: unknown; path?: unknown };
+        const name = typeof item.name === "string" ? item.name.trim() : "";
+        const skillPath = typeof item.path === "string" ? item.path.trim() : "";
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name) || !skillPath) continue;
+        skills.push({
+          name,
+          description: typeof item.description === "string" ? item.description : "",
+          path: skillPath,
+        });
+      }
+      this.opts.onEvent({ type: "skill_catalog", data: { sessionId, skills } });
+    } catch (error) {
+      if (!isCurrent()) return;
+      const message = error instanceof Error ? error.message : String(error);
+      if (/ZCode error -32601\b/.test(message)) {
+        logDebug("ZCode runtime does not expose a skill reference catalog", { sessionId });
+      } else {
+        logWarn("Could not read the ZCode skill catalog", error);
+      }
+      this.opts.onEvent({ type: "skill_catalog", data: { sessionId, skills: [] } });
+    }
+  }
+
+  refreshSkillCatalog(): void {
+    if (this.sessionId) void this.publishSkillCatalog(this.sessionId, this.sessionGeneration, ++this.skillCatalogRequest);
+  }
+
+  refreshSubagentCatalog(): void {
+    const sessionId = this.sessionId;
+    if (!sessionId) return;
+    const generation = this.sessionGeneration;
+    const request = ++this.subagentCatalogRequest;
+    const isCurrent = () => !this.disposed && this.sessionId === sessionId && this.sessionGeneration === generation && this.subagentCatalogRequest === request;
+    void (async () => {
+      const local = await localSubagents(this.opts.workspacePath);
+      if (!isCurrent()) return;
+      if (this.subagentCatalogGeneration !== generation) {
+        this.subagentCatalogGeneration = generation;
+        this.opts.onEvent({ type: "subagent_catalog", data: { sessionId, agents: mergeSubagentCatalog(local, []) } });
+      }
+      try {
+        const result = await this.sendRequest("plugins/referenceCatalog", { workspace: this.ws(), sessionId }, 15_000) as { plugins?: unknown };
+        if (isCurrent()) this.opts.onEvent({ type: "subagent_catalog", data: { sessionId, agents: mergeSubagentCatalog(local, result?.plugins) } });
+      } catch (error) {
+        if (isCurrent()) logDebug("Could not read plugin subagent catalog", error instanceof Error ? error.message : String(error));
+      }
+    })().catch(error => logWarn("Could not read local subagent catalog", error));
+  }
+
   async listSessions(includeArchived = false): Promise<SessionSummary[]> {
+    return (await this.listSessionsPage(includeArchived)).sessions;
+  }
+
+  async listSessionsPage(includeArchived = false, limit = 80): Promise<{ sessions: SessionSummary[]; hasMore: boolean }> {
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new RangeError("Session list limit must be a positive safe integer");
     const started = Date.now();
+    const timeoutMs = this.resumeRequests > 0 || this.lateResumes.size > 0
+      ? ZCodeClient.sessionListTimeoutDuringResumeMs
+      : ZCodeClient.sessionListTimeoutMs;
     try {
       const paths = listWorkspacePathVariants(this.opts.workspacePath);
       const results = await Promise.all(paths.map(async workspacePath => {
-        const params = { workspace: workspaceObject(workspacePath), limit: 80 };
+        const params = { workspace: workspaceObject(workspacePath), limit };
         try {
           return await this.sendRequest("session/list", {
             ...params, ...(this.sessionListSupportsArchived ? { includeArchived } : {}),
-          }, 20000) as { sessions?: unknown[] };
+          }, timeoutMs) as { sessions?: unknown[] };
         } catch (error) {
           // Desktop 3.16.2 removed this optional field from its strict schema.
           const message = error instanceof Error ? error.message : "";
           if (!/ZCode error -32602:/.test(message) ||
               !/Unrecognized key[^\n]*["']includeArchived["']/i.test(message)) throw error;
           this.sessionListSupportsArchived = false;
-          return await this.sendRequest("session/list", params, 20000) as { sessions?: unknown[] };
+          return await this.sendRequest("session/list", params, timeoutMs) as { sessions?: unknown[] };
         }
       }));
       const byId = new Map<string, SessionSummary>();
@@ -861,7 +1018,9 @@ export class ZCodeClient {
       }
       const sessions = [...byId.values()];
       sessions.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-      return sessions;
+      // Truncation belongs to each raw page, before workspace filtering,
+      // archived filtering or deduplication across Windows path variants.
+      return { sessions, hasMore: results.some(result => (result?.sessions?.length ?? 0) >= limit) };
     } finally {
       this.activeTiming?.add("session/list", Date.now() - started);
       this.activeTiming?.addCount("sessionListCount");
@@ -913,9 +1072,12 @@ export class ZCodeClient {
     this.sessionGeneration++;
     this.snapshotSettingsFresh = false;
     this.snapshotModelFresh = false;
+    this.snapshotModelCatalog = undefined;
     this.attachSessionControls();
     this.stopping = false;
     this.sessionId = null;
+    this.sessionReadable = false;
+    this.sessionSynced = false;
     this.lastContext = null;
     this.modelWindow = null;
     this.setSessionModel(null);
@@ -928,10 +1090,13 @@ export class ZCodeClient {
     const createdRuntime = this.defaultRuntime;
     this.setSessionModel(createdRuntime ? { providerId: createdRuntime.providerId, modelId: createdRuntime.modelId } : null);
     this.sessionRuntime = createdRuntime;
-    await this.sendRequest("session/create", {
+    const created = await this.sendRequest("session/create", {
       workspace: this.ws(),
-      mode: "build",
-    });
+      mode: newSessionDefaults?.mode ?? "build",
+    }) as SessionSnapshot | undefined;
+    // A background request for the previous chat may request preferences while
+    // creation is in flight. Its identity must not win over the create response.
+    if (created?.session?.sessionId) this.sessionId = created.session.sessionId;
 
     if (!this.sessionId) {
       this.opts.onEvent({
@@ -944,20 +1109,25 @@ export class ZCodeClient {
       return;
     }
 
+    this.sessionReadable = true;
+    const stillThisSession = this.sessionScope();
     await this.afterSessionAttached("created", applyModel, createdRuntime, undefined, newSessionDefaults);
+    if (stillThisSession()) this.sessionSynced = true;
   }
 
-  async resumeSession(sessionId: string, known?: SessionSummary): Promise<void> {
-    return this.serializeSessionChange(() => this.resumeSessionInner(sessionId, known));
+  async resumeSession(sessionId: string, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
+    return this.serializeSessionChange(() => this.resumeSessionInner(sessionId, known, timeoutMs));
   }
 
-  private async resumeSessionInner(sessionId: string, known?: SessionSummary): Promise<void> {
+  private async resumeSessionInner(sessionId: string, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
+    await this.modeChanges.get(sessionId)?.catch(() => {});
     const changingSession = this.sessionId !== sessionId;
     this.releaseStopWait();
     this.runtimeNeedsRevalidation = true;
     this.sessionGeneration++;
     this.snapshotSettingsFresh = false;
     this.snapshotModelFresh = false;
+    this.snapshotModelCatalog = undefined;
     this.attachSessionControls(sessionId);
     this.stopping = false;
     if (changingSession) {
@@ -967,6 +1137,8 @@ export class ZCodeClient {
       this.setSessionModel(null);
     }
     this.sessionId = sessionId;
+    this.sessionReadable = false;
+    this.sessionSynced = false;
     this.seenRowIds.clear();
     this.seenToolCallIds.clear();
     this.lastTitle = "";
@@ -985,14 +1157,53 @@ export class ZCodeClient {
     }
 
     const resumeStarted = Date.now();
-    const resumedSnapshot = await this.sendRequest("session/resume", {
-      sessionId,
-      workspace: this.ws(),
-    });
+    this.resumeRequests++;
+    const stillThisResume = this.sessionScope();
+    let resumedSnapshot: unknown;
+    try {
+      resumedSnapshot = await this.sendRequest("session/resume", {
+        sessionId,
+        workspace: this.ws(),
+      }, timeoutMs);
+    } catch (error) {
+      // The id was published before the server activated it. Leave it selected
+      // but unreadable so choosing the same chat can retry the attach.
+      if (stillThisResume()) this.sessionReadable = false;
+      throw error;
+    } finally {
+      this.resumeRequests--;
+    }
     this.activeTiming?.add("session/resume", Date.now() - resumeStarted);
 
     this.sessionId = sessionId;
+    this.sessionReadable = true;
+    await this.queueModeChange(sessionId, async () => {
+      const savedExecution = loadSessionExecutionState(sessionId);
+      if (!savedExecution || !stillThisResume()) return;
+      const snapshot = resumedSnapshot as SessionSnapshot | undefined;
+      const base = readBaseSessionMode(snapshot?.settings);
+      const restoreBase = base !== savedExecution.mode
+        || readPlanFlag(snapshot?.settings) === true && !savedExecution.planEnabled;
+      if (!restoreBase && !savedExecution.planEnabled) {
+        saveSessionRestoreIntent(sessionId);
+        this.pendingSessionRestores.delete(sessionId);
+        return;
+      }
+      // setMode(base) clears the backend's saved plan flag. Keep the full target
+      // until every step succeeds, including across process restarts after failure.
+      this.pendingSessionRestores.add(sessionId);
+      if (savedExecution.planEnabled) saveSessionRestoreIntent(sessionId, savedExecution);
+      if (restoreBase) await this.applyMode(sessionId, savedExecution.mode, true);
+      if (savedExecution.planEnabled) await this.applyMode(sessionId, "plan", true);
+      if (savedExecution.planEnabled) saveSessionRestoreIntent(sessionId);
+      this.pendingSessionRestores.delete(sessionId);
+      resumedSnapshot = undefined;
+    });
+    if (!stillThisResume()) return;
     await this.afterSessionAttached("resumed", false, null, resumedSnapshot as SessionSnapshot | undefined);
+    // Subscription failure throws above. Readable stays true, but this session
+    // is not attached until the conversation catch-up succeeds.
+    if (stillThisResume()) this.sessionSynced = true;
     if (!this.liveModelReady || !this.lastTitle) await this.adoptResumedModel();
   }
 
@@ -1131,8 +1342,8 @@ export class ZCodeClient {
         const registered = available.find(model => !model.disabledReason &&
           model.providerId === requestedRuntime.providerId && model.modelId === requestedRuntime.modelId);
         if (registered) await this.setModel(registered.providerId, registered.modelId);
-        else await this.ensureSessionModel();
-      } else await this.ensureSessionModel();
+        else await this.ensureSessionModel(attachedSnapshot);
+      } else await this.ensureSessionModel(attachedSnapshot);
     } catch (e) {
       logWarn("Could not apply model to session", e);
       if (kind === "created") {
@@ -1186,8 +1397,10 @@ export class ZCodeClient {
       }
     }
     await this.emitSessionControls();
-    this.startPlanQuota();
     await this.subscribeConversation();
+    this.startPlanQuota();
+    this.refreshSkillCatalog();
+    this.refreshSubagentCatalog();
   }
 
   private async applyNewSessionDefaults(defaults: NewSessionDefaults): Promise<void> {
@@ -1217,12 +1430,13 @@ export class ZCodeClient {
       }
     }
 
-    if (defaults.mode && defaults.mode !== this.currentMode()) {
+    if (defaults.mode) {
       try {
-        await this.setMode(defaults.mode);
+        if (defaults.mode !== this.currentMode()) await this.setMode(defaults.mode);
+        else if (this.sessionId) this.persistEmptySessionMode(this.sessionId);
       } catch (error) {
         logWarn("Could not apply new-session permission default", error);
-        warn("新会话权限默认值未能应用，已沿用 ZCode 默认设置。");
+        warn(error instanceof LocalizedError ? error.message : "新会话权限默认值未能应用，已沿用 ZCode 默认设置。");
       }
     }
 
@@ -1251,8 +1465,10 @@ export class ZCodeClient {
   private attachSessionControls(sessionId?: string): void {
     if (this.sessionId) this.sessionControlStates.set(this.sessionId, {baseMode:this.baseMode, planEnabled:this.planEnabled});
     const saved = sessionId ? this.sessionControlStates.get(sessionId) : undefined;
-    this.baseMode = saved?.baseMode ?? "build";
-    this.planEnabled = saved?.planEnabled ?? false;
+    // Older snapshots expose only the base mode, omitting the independent plan flag.
+    const persisted = sessionId ? loadSessionExecutionState(sessionId) : undefined;
+    this.baseMode = persisted?.mode ?? saved?.baseMode ?? "build";
+    this.planEnabled = persisted?.planEnabled ?? saved?.planEnabled ?? false;
     this.lastControls = {...this.lastControls, mode:this.displayedMode(), baseMode:this.baseMode, planEnabled:this.planEnabled};
   }
 
@@ -1307,6 +1523,10 @@ export class ZCodeClient {
 
   private noteSnapshotCompleteness(snapshot: SessionSnapshot): void {
     const settings = snapshot.settings;
+    if (this.sessionId && Array.isArray(settings?.model?.available)) {
+      this.snapshotModelCatalog = { sessionId: this.sessionId, generation: this.sessionGeneration,
+        models: modelsFromSnapshot(snapshot) };
+    }
     // A partial snapshot must not suppress model-dependent controls reads.
     this.snapshotModelFresh = !!extractModel(snapshot.session?.model || settings?.model?.current);
     this.snapshotSettingsFresh = this.snapshotModelFresh
@@ -1318,7 +1538,9 @@ export class ZCodeClient {
   }
 
   private async readSessionSnapshot(): Promise<SessionSnapshot | undefined> {
-    if (!this.sessionId || this.disposed) return undefined;
+    // The id is published before session/resume returns. Reading then is always
+    // rejected with -32004 and can race the activation request.
+    if (!this.sessionId || this.disposed || !this.sessionReadable) return undefined;
     const sessionId = this.sessionId;
     const isCurrent = this.sessionScope();
     const started = Date.now();
@@ -1627,10 +1849,16 @@ export class ZCodeClient {
     };
   }
 
-  async readAvailableModels(): Promise<{
+  async readAvailableModels(reuseSnapshot = false): Promise<{
     current?: { providerId: string; modelId: string };
     available: AvailableModel[];
   }> {
+    const cached = this.snapshotModelCatalog;
+    this.snapshotModelCatalog = undefined;
+    if (reuseSnapshot && cached?.sessionId === this.sessionId && cached.generation === this.sessionGeneration) {
+      this.activeTiming?.addCount("modelCatalogSnapshotReuse");
+      return { ...cached.models, current: this.confirmedModel() ?? cached.models.current };
+    }
     const snapshot = await this.readSessionSnapshot();
     if (!snapshot) return { available: [] };
     return modelsFromSnapshot(snapshot);
@@ -1742,9 +1970,17 @@ export class ZCodeClient {
       return !old || old.marker?.fromProvider !== row.marker.fromProvider || old.marker?.fromModel !== row.marker.fromModel
         || old.marker?.toProvider !== row.marker.toProvider || old.marker?.toModel !== row.marker.toModel;
     });
+    // The completion header can arrive after its reasoning and answer rows.
+    // Redraw then so a work fold does not stay on its generic label.
+    const turnHeaderChanged = replica.rows.some(row => {
+      if (row.kind !== "turnHeader" || row.state === "running" || row.state === "prewarming") return false;
+      const old = previous.find(item => item.rowId === row.rowId);
+      return !old || old.state !== row.state || old.startedAt !== row.startedAt
+        || old.endedAt !== row.endedAt || old.activeMs !== row.activeMs;
+    });
     // Structural corrections replace the transcript; ordinary streamed text
     // updates exactly one stable row without rebuilding the view.
-    if (snapshot || finishedGoalMarker || compactMarkerChanged || modelMarkerChanged || goalCheckRecorded || previous.some(row => !replica.rows.some(next => next.rowId === row.rowId)) ||
+    if (snapshot || finishedGoalMarker || compactMarkerChanged || modelMarkerChanged || turnHeaderChanged || goalCheckRecorded || previous.some(row => !replica.rows.some(next => next.rowId === row.rowId)) ||
         replica.rows.some(row => row.kind === "userInput" && !previous.some(old => old.rowId === row.rowId))) {
       this.publishTranscript();
       this.publishProjectionStatus(true);
@@ -2253,10 +2489,17 @@ export class ZCodeClient {
     }
   }
 
-  private async ensureSessionModel(): Promise<void> {
+  private async ensureSessionModel(attachedSnapshot?: SessionSnapshot): Promise<void> {
     if (this.liveModelReady) return;
     const isCurrent = this.sessionScope();
-    const snapshot = await this.readSessionSnapshot();
+    // The attach path has already subscribed and checked the resume revision.
+    // Reuse its catalog only while that revision is still current. Partial or
+    // legacy snapshots keep the normal read/validation path.
+    const reusable = attachedSnapshot?.session?.sessionId === this.sessionId
+      && typeof attachedSnapshot.runtime?.stateRevision === "number"
+      && attachedSnapshot.runtime.stateRevision >= this.lastRevision
+      && Array.isArray(attachedSnapshot.settings?.model?.available);
+    const snapshot = reusable ? attachedSnapshot : await this.readSessionSnapshot();
     if (!isCurrent()) return;
     if (snapshot) {
       this.applySnapshotSettings(snapshot);
@@ -2279,7 +2522,10 @@ export class ZCodeClient {
     // Cold sessions advertise an empty registry before the first send loads
     // their workspace profile. The backend resolves its configured default
     // after its identity is persisted; an empty shell is not evidence of an invalid model.
-    if (!tries.length && Array.isArray(snapshot?.settings?.model?.available) && !snapshot.settings.model.available.length) return;
+    if (!tries.length && Array.isArray(snapshot?.settings?.model?.available) && !snapshot.settings.model.available.length) {
+      if (reusable) return this.ensureSessionModel();
+      return;
+    }
     let lastError: Error | undefined;
     for (const m of tries) {
       if (!isCurrent()) return;
@@ -2303,7 +2549,12 @@ export class ZCodeClient {
         logWarn("Model candidate rejected", m.providerId, m.modelId, e);
       }
     }
-    if (isCurrent()) throw lastError ?? new LocalizedError("暂时没有可用的模型。");
+    if (isCurrent()) {
+      // An empty workspace registry may populate only during the first model
+      // operation. Refresh once before ruling out the attached candidates.
+      if (reusable) return this.ensureSessionModel();
+      throw lastError ?? new LocalizedError("暂时没有可用的模型。");
+    }
   }
 
   async setModel(providerId: string, modelId: string): Promise<void> {
@@ -2434,22 +2685,46 @@ export class ZCodeClient {
   async setMode(mode: string): Promise<void> {
     if (!this.sessionId) throw new LocalizedError("没有活动会话");
     const sessionId = this.sessionId;
-    const isCurrent = this.sessionScope();
-    await this.sendRequest("session/setMode", {
-      sessionId,
-      mode,
-    });
-    if (!isCurrent()) return;
-    if (mode === "plan") this.planEnabled = true;
-    else {
-      this.planEnabled = false;
-      if (BASE_SESSION_MODES.has(mode)) this.baseMode = mode;
+    return this.queueModeChange(sessionId, () => this.applyMode(sessionId, mode));
+  }
+
+  private async queueModeChange(sessionId: string, action: () => Promise<void>): Promise<void> {
+    const changing = (this.modeChanges.get(sessionId) ?? Promise.resolve()).catch(() => {}).then(action);
+    this.modeChanges.set(sessionId, changing);
+    try { await changing; }
+    finally { if (this.modeChanges.get(sessionId) === changing) this.modeChanges.delete(sessionId); }
+  }
+
+  private async applyMode(sessionId: string, mode: string, restoring = false): Promise<void> {
+    const previous = this.sessionId === sessionId
+      ? { baseMode: this.baseMode, planEnabled: this.planEnabled }
+      : this.sessionControlStates.get(sessionId) ?? { baseMode: "build", planEnabled: false };
+    const next = {
+      baseMode: BASE_SESSION_MODES.has(mode) ? mode : previous.baseMode,
+      planEnabled: mode === "plan",
+    };
+    await this.sendRequest("session/setMode", { sessionId, mode });
+    this.sessionControlStates.set(sessionId, next);
+    if (!this.disposed && this.sessionId === sessionId) {
+      this.baseMode = next.baseMode;
+      this.planEnabled = next.planEnabled;
+      this.lastControls = { ...this.lastControls, mode: this.displayedMode(), baseMode: this.baseMode, planEnabled: this.planEnabled };
+      this.opts.onEvent({ type: "session_controls", data: this.lastControls });
     }
-    this.lastControls = { ...this.lastControls, mode: this.displayedMode(), baseMode: this.baseMode, planEnabled: this.planEnabled };
-    this.opts.onEvent({
-      type: "session_controls",
-      data: this.lastControls,
-    });
+    this.persistEmptySessionMode(sessionId, next.baseMode, next.planEnabled);
+    if (!restoring) {
+      saveSessionRestoreIntent(sessionId);
+      this.pendingSessionRestores.delete(sessionId);
+    }
+  }
+
+  private persistEmptySessionMode(sessionId: string, baseMode = this.baseMode, planEnabled = this.planEnabled): void {
+    try {
+      persistEmptySessionMode(sessionId, baseMode, planEnabled);
+    } catch (error) {
+      logWarn("Could not persist empty-session permission", error);
+      throw new LocalizedError("权限已更新，但未能保存；请重试，否则重启后可能恢复旧权限。");
+    }
   }
 
   async setThoughtLevel(thoughtLevel: string): Promise<void> {
@@ -2527,6 +2802,9 @@ export class ZCodeClient {
   }
 
   private async requireAvailableSessionModel(): Promise<void> {
+    if (this.sessionId && this.pendingSessionRestores.has(this.sessionId)) {
+      throw new LocalizedError("会话权限尚未恢复完成，请重新连接或明确选择权限后重试。");
+    }
     const isCurrent = this.sessionScope();
     const model = this.sessionModel ?? this.defaultRuntime;
     if (!model || !this.opts.isSessionModelAvailable) return;
@@ -3230,6 +3508,7 @@ export class ZCodeClient {
           ? setTimeout(() => {
               if (this.pending.has(id)) {
                 this.pending.delete(id);
+                if (method === "session/resume") this.noteLateResume(id);
                 reject(new Error(`Request ${method} timed out after ${timeoutMs}ms`));
               }
             }, timeoutMs)
@@ -3268,6 +3547,7 @@ export class ZCodeClient {
       try { this.handleNotification(msg as ZCodeNotification); }
       finally { timing?.add("notificationHandlingMs", performance.now() - started); }
     } else if ("id" in msg && "result" in msg) {
+      this.settleLateResume(msg.id);
       const pending = this.pending.get(msg.id);
       if (pending) {
         if (pending.method === "session/resume") {
@@ -3284,13 +3564,19 @@ export class ZCodeClient {
         pending.resolve(msg.result);
       }
     } else if ("id" in msg && "error" in msg) {
+      this.settleLateResume(msg.id);
       const pending = this.pending.get(msg.id);
       if (pending) {
         if (pending.timer) clearTimeout(pending.timer);
         this.pending.delete(msg.id);
         const err = msg as ZCodeErrorResponse;
         const message = `${err.error.code}: ${err.error.message}`;
-        if (/\b401\b|unauthorized/i.test(message)) this.loginStale = true;
+        if (/\b401\b|unauthorized/i.test(message)) {
+          this.loginStale = true;
+          for (const runtime of [this.sessionRuntime, this.defaultRuntime]) {
+            if (runtime?.apiKey) invalidatePlanAuth(runtime.apiKey);
+          }
+        }
         pending.reject(
           new Error(`ZCode error ${message}`)
         );
@@ -3560,6 +3846,7 @@ export class ZCodeClient {
       p.reject(new LocalizedError("ZCode 客户端已关闭"));
     }
     this.pending.clear();
+    this.clearLateResumes();
     this.rl?.close();
     this.rl = null;
     this.errRl?.close();
@@ -3574,22 +3861,35 @@ export class ZCodeClient {
     }
     if (this.proc) {
       const proc = this.proc;
+      this.proc = null;
       try {
         proc.stdin?.end();
       } catch {
         // ignore
       }
-      proc.kill("SIGTERM");
-      this.killTimer = setTimeout(() => {
+      // Node 22 keeps a failed spawn's handle until the error tick. kill()
+      // then uses pid 0 and signals the current process group.
+      if (childIsRunning(proc)) {
         try {
-          proc.kill("SIGKILL");
+          proc.kill("SIGTERM");
         } catch {
           // ignore
         }
-      }, 2000);
-      this.proc = null;
+        this.killTimer = setTimeout(() => {
+          if (!childIsRunning(proc)) return;
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            // ignore
+          }
+        }, 2000);
+      }
     }
   }
+}
+
+function childIsRunning(proc: ChildProcess): boolean {
+  return (proc.pid ?? 0) > 0 && proc.exitCode === null && proc.signalCode === null;
 }
 
 function readContextUsage(

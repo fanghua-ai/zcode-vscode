@@ -50,11 +50,13 @@ marked.use({
       return cjkMaskedSrc ? defaultEmStrong.call(this, src, cjkMaskedSrc, prevChar) : undefined;
     },
     del(src, maskedSrc, prevChar) {
-      // Marked accepts single-tilde strikethrough. In prose like
-      // `0.15~3.25 ... 2.0~4.0`, those two range separators otherwise pair
-      // across an entire sentence. Consume only digit~digit as plain text;
-      // leave genuine ~~strikethrough~~ and other Markdown untouched.
-      if (prevChar && /^\d$/u.test(prevChar) && /^~\d/u.test(src)) {
+      // A single tilde beside a number is an approximation/range marker.
+      // Consume it before Marked can pair it across a sentence. Explicit
+      // double-tilde strikethrough (including ~~123~~) keeps normal semantics.
+      const singleTilde = src.startsWith("~") && !src.startsWith("~~");
+      const digitBefore = !!prevChar && /^\d$/u.test(prevChar);
+      const numberAfter = /^~[^\S\r\n]*[+−-]?(?:\d|\.\d)/u.test(src);
+      if (singleTilde && (digitBefore || numberAfter)) {
         // Marked types tokenizer.del as returning only Del tokens, while its
         // lexer accepts any inline token from an override at this position.
         return { type: "text", raw: "~", text: "~" } as unknown as NonNullable<ReturnType<typeof defaultDel>>;
@@ -64,42 +66,46 @@ marked.use({
   },
 });
 
-const renderer = new marked.Renderer();
-
-renderer.code = ({ text, lang }: { text: string; lang?: string }) => {
+function renderCode({ text, lang }: { text: string; lang?: string }, streaming: boolean): string {
   const language = (lang || "").trim();
   let highlighted: string;
-  try {
-    if (language && hljs.getLanguage(language)) {
-      highlighted = hljs.highlight(text, { language }).value;
-    } else {
-      highlighted = hljs.highlightAuto(text).value;
-    }
-  } catch {
+  // Re-running a highlighter over a growing code block dominates long replies.
+  // Keep streamed code readable and escaped; highlight once the part settles.
+  if (streaming) {
     highlighted = escapeHtml(text);
+  } else {
+    try {
+      if (language && hljs.getLanguage(language)) {
+        highlighted = hljs.highlight(text, { language }).value;
+      } else {
+        // Unknown languages stay escaped rather than guessing across every grammar.
+        highlighted = escapeHtml(text);
+      }
+    } catch {
+      highlighted = escapeHtml(text);
+    }
   }
   const langClass = language ? ` language-${escapeHtml(language)}` : "";
   const label = language || "code";
   return `<div class="code-block"><div class="code-toolbar"><span class="code-lang">${escapeHtml(
     label
   )}</span><button class="copy-btn" type="button" data-copy="1">Copy</button></div><pre><code class="hljs${langClass}">${highlighted}</code></pre></div>`;
-};
+}
 
-marked.use({ renderer });
+const renderer = new marked.Renderer();
+renderer.code = (code) => renderCode(code, false);
+const streamingRenderer = new marked.Renderer();
+streamingRenderer.code = (code) => renderCode(code, true);
 
-export function renderMarkdown(text: string): string {
-  const closed = closeOpenFences(text);
-  const html = marked.parse(closed, { async: false }) as string;
+export function renderMarkdown(text: string, streaming = false): string {
+  const html = marked.parse(text, {
+    async: false,
+    renderer: streaming ? streamingRenderer : renderer,
+  }) as string;
   return DOMPurify.sanitize(html, {
     ADD_ATTR: ["target", "rel", "data-copy", "class"],
     ADD_TAGS: ["button"],
   });
-}
-
-function closeOpenFences(text: string): string {
-  const ticks = text.match(/```/g)?.length ?? 0;
-  if (ticks % 2 === 1) return `${text}\n\`\`\``;
-  return text;
 }
 
 function escapeHtml(text: string): string {

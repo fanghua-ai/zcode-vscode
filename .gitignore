@@ -10,6 +10,7 @@ DEV.md
 .zcode/
 coverage/
 test-results/
+.vscode-test/
 
 # Local credentials; examples can be tracked when needed.
 .env

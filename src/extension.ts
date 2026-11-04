@@ -1,3 +1,4 @@
+import { allowedDesktopPlugins, DESKTOP_PLUGIN_CHOICES } from "./desktopPluginChoices";
 import { rankWorkspaceFiles, workspaceSearchPatterns } from "./fileSearch";
 import { existingWorkspaceFile, previewFileKind, previewFilesForReply } from "./filePreview";
 import { resolveFileTarget } from "./workspaceFiles";
@@ -38,7 +39,13 @@ import {
 import { disposeLog, getLog, logDebug, logError, logInfo, logWarn } from "./log";
 import { redactSecrets } from "./redact";
 import { parseWebviewMessage } from "./webviewMessages";
+import { desktopPluginForSkill, withDesktopPluginSkillPrompts } from "./desktopPluginSkillPrompts";
+import {
+  MATH_FONT_VERSION, MATH_FONTS_SHA256, formulaFontMode, installMathFontPack,
+  loadMathFontPack, mathFontDataHref, mathFontFaceCss, mathFontPackReady,
+} from "./mathFonts";
 import { StartupTiming } from "./startupTiming";
+import { defenderExclusionCommand, isSlowWindowsStartup, pluginScanFolders } from "./startupSlowness";
 import { SendTiming } from "./sendTiming";
 import { locateAppServer } from "./serverPath";
 import { materializeGitDiff, type StructuredPatch } from "./conversation";
@@ -49,9 +56,11 @@ import { readConfiguredProviderApiKey, readV2Config, readV2Settings, v2Dir } fro
 import { buildQuotaAdapterRegistry, fetchQuotaAdapter, quotaSecretStorageKey, type QuotaAdapterConfig } from "./quotaAdapters";
 import {
   loadTaskFlags,
+  loadSessionArchiveTimes,
   loadOverriddenTitles,
   persistCliSession,
   setSessionDisplayTitle,
+  SessionSyncError,
   setTaskArchived,
   setTaskDeleted,
   upsertDesktopTask,
@@ -66,6 +75,7 @@ const LAST_SESSION_KEY = "zcode.lastSessionId";
 const LAST_BINARY_KEY = "zcode.lastBinaryPath";
 const SESSION_MODELS_KEY = "zcode.sessionModels";
 const NEW_SESSION_DEFAULTS_KEY = "newSessionDefaults";
+const DEFENDER_NOTICE_KEY = "zcode.defenderNoticeDismissed";
 
 function configuredQuotaAdapters(): QuotaAdapterConfig[] {
   const raw = vscode.workspace.getConfiguration("zcode").get<unknown>("quotaAdapters", []);
@@ -175,10 +185,13 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("zcode.language")) provider.pushLanguage();
+      if (e.affectsConfiguration("zcode.formulaFonts")) provider.syncMathFonts();
       if (e.affectsConfiguration("zcode.quotaAdapters")) provider.refreshQuota();
-      if (["binaryPath", "nodePath", "workspacePath", "model"].some(key => e.affectsConfiguration(`zcode.${key}`))) {
+      if (["binaryPath", "nodePath", "workspacePath", "model", "allowedDesktopPlugins"].some(key => e.affectsConfiguration(`zcode.${key}`))) {
         logInfo("ZCode settings changed; restarting session");
         void provider.restart("Settings changed");
+      } else if (e.affectsConfiguration("zcode.showSuppressedPluginSkills")) {
+        provider.refreshListedSkills();
       }
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
@@ -270,7 +283,13 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private viewMessageListener?: vscode.Disposable;
   private viewDisposeListener?: vscode.Disposable;
   private starting: Promise<void> | null = null;
+  private mathFontTask?: Promise<void>;
+  private mathFontPhase: "idle" | "downloading" | "failed" = "idle";
+  private mathFontCssCache?: { key: string; css: string };
+  private mathFontReported = "";
   private timing: StartupTiming | null = null;
+  private appServerPath = "";
+  private defenderNoticeShown = false;
   private readonly sendTiming = new SendTiming(data => logInfo("send timing", data));
   private webviewEpoch = 0;
   private pushedEpoch = -1;
@@ -298,8 +317,38 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private fileSearchCancellation?: vscode.CancellationTokenSource;
   private recentFiles: string[] = [];
   private diagnosticStatus = "disconnected";
+  private startupPhase: "starting" | "restoring" | null = null;
+  private startupPhaseSince = 0;
+  private startupPhaseTimer: NodeJS.Timeout | undefined;
+  private sessionListRequest = 0;
+  private sessionListLimit = 80;
+  private sessionListHasMore = false;
+  private sessionListViews: Record<"active" | "archived", {
+    sessions: SessionSummary[];
+    state: "unknown" | "ready" | "failed";
+    loaded: boolean;
+  }> = {
+    active: { sessions: [], state: "unknown", loaded: false },
+    archived: { sessions: [], state: "unknown", loaded: false },
+  };
   private recentIssues: Array<{at: string; category: IssueCategory}> = [];
   private pendingChip?: ContextChip;
+
+  private resetSessionListCache(): void {
+    this.sessions = [];
+    this.sessionListLimit = 80;
+    this.sessionListHasMore = false;
+    this.sessionListViews = {
+      active: { sessions: [], state: "unknown", loaded: false },
+      archived: { sessions: [], state: "unknown", loaded: false },
+    };
+    this.post({ type: "sessions", sessions: [], referenceSessions: [], includeArchived: false, notice: "ready" });
+  }
+
+  private adoptWorkspace(next: string): void {
+    if (this.workspacePath && !sameWorkspacePath(this.workspacePath, next)) this.resetSessionListCache();
+    this.workspacePath = next;
+  }
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.context.subscriptions.push(
@@ -326,6 +375,108 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   pushLanguage(): void {
     const language = this.interfaceLanguage();
     this.post({ type: "ui_language", language: language.locale, setting: language.setting });
+  }
+
+  private currentFormulaFontMode() {
+    return formulaFontMode(vscode.workspace.getConfiguration("zcode").get("formulaFonts", "auto"));
+  }
+
+  private mathFontDirectory(): string | undefined {
+    const root = this.context.globalStorageUri?.fsPath;
+    return root ? path.join(root, "math-fonts", MATH_FONT_VERSION) : undefined;
+  }
+
+  /** Tell the open page whether formula fonts are available. Does not reload it. */
+  private pushMathFonts(): void {
+    const mode = this.currentFormulaFontMode();
+    const directory = this.mathFontDirectory();
+    const ready = !!directory && mathFontPackReady(directory, MATH_FONTS_SHA256);
+    let status = mode === "off" ? "disabled"
+      : ready ? "ready"
+      : this.mathFontPhase === "downloading" ? "downloading"
+      : this.mathFontPhase === "failed" ? "failed"
+      : "absent";
+    let css = "";
+    if (status === "ready" && directory && this.view) {
+      try {
+        css = this.mathFontCssFor(directory);
+      } catch (error) {
+        logWarn("Could not build formula font CSS", error);
+        this.mathFontCssCache = undefined;
+      }
+    }
+    if (status === "ready" && this.view && !css) status = "failed";
+    const report = `${mode}:${status}`;
+    if (report !== this.mathFontReported) {
+      this.mathFontReported = report;
+      logInfo("formula fonts", { mode, status, ...(css ? { cssBytes: css.length } : {}) });
+    }
+    this.post({ type: "math_fonts", mode, status, css });
+  }
+
+  private mathFontCssFor(directory: string): string {
+    const key = `${directory}\0${MATH_FONTS_SHA256}`;
+    if (this.mathFontCssCache?.key === key) return this.mathFontCssCache.css;
+    const css = mathFontFaceCss(file => mathFontDataHref(fs.readFileSync(path.join(directory, "fonts", file))));
+    this.mathFontCssCache = { key, css };
+    return css;
+  }
+
+  syncMathFonts(): void {
+    if (this.currentFormulaFontMode() === "on") {
+      void this.ensureMathFonts().catch(error => logWarn("Formula font setup failed", error));
+      return;
+    }
+    this.mathFontPhase = "idle";
+    this.pushMathFonts();
+  }
+
+  private async enableMathFonts(): Promise<void> {
+    try {
+      await vscode.workspace.getConfiguration("zcode").update("formulaFonts", "on", vscode.ConfigurationTarget.Global);
+    } catch (error) {
+      logWarn("Could not enable formula fonts", error);
+      this.mathFontPhase = "failed";
+      this.pushMathFonts();
+      return;
+    }
+    await this.ensureMathFonts(true);
+  }
+
+  private async ensureMathFonts(force = false): Promise<void> {
+    if (!force && this.currentFormulaFontMode() !== "on") {
+      this.pushMathFonts();
+      return;
+    }
+    const directory = this.mathFontDirectory();
+    if (!directory) {
+      this.mathFontPhase = "failed";
+      this.pushMathFonts();
+      return;
+    }
+    if (mathFontPackReady(directory, MATH_FONTS_SHA256)) {
+      this.mathFontPhase = "idle";
+      this.pushMathFonts();
+      return;
+    }
+    if (!this.mathFontTask) {
+      this.mathFontPhase = "downloading";
+      this.pushMathFonts();
+      this.mathFontTask = this.installMathFonts(directory).finally(() => { this.mathFontTask = undefined; });
+    }
+    await this.mathFontTask;
+  }
+
+  private async installMathFonts(directory: string): Promise<void> {
+    try {
+      const bytes = await loadMathFontPack();
+      await installMathFontPack(bytes, directory, MATH_FONTS_SHA256);
+      this.mathFontPhase = "idle";
+    } catch (error) {
+      logWarn("Formula font download failed", error);
+      this.mathFontPhase = "failed";
+    }
+    this.pushMathFonts();
   }
 
   private composerChrome(): ComposerChrome {
@@ -426,16 +577,86 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   private finishTiming(timing: StartupTiming): void {
     timing.dispose();
-    logInfo("session timing", timing.snapshot());
+    const snapshot = timing.snapshot();
+    logInfo("session timing", snapshot);
     if (this.timing === timing) this.timing = null;
     this.client?.clearTiming(timing);
+    if (isSlowWindowsStartup(process.platform, snapshot)) {
+      void this.offerDefenderExclusion(Number(snapshot["session/resume"])).catch(error => {
+        logWarn("Slow startup guidance failed", error);
+        void vscode.window.showErrorMessage(t("启动提示操作未完成，请重试或查看日志。"));
+      });
+    }
   }
 
-  private paintTitle(title?: string): void {
+  private beginStartupPhase(phase: "starting" | "restoring"): void {
+    this.startupPhase = phase;
+    this.startupPhaseSince = Date.now();
+    this.postStartupPhase();
+    if (this.startupPhaseTimer) clearInterval(this.startupPhaseTimer);
+    this.startupPhaseTimer = setInterval(() => this.postStartupPhase(), 1000);
+    this.startupPhaseTimer.unref?.();
+  }
+
+  private postStartupPhase(): void {
+    if (!this.startupPhase) return;
+    const waitedSeconds = Math.floor((Date.now() - this.startupPhaseSince) / 1000);
+    this.post({
+      type: "status",
+      status: "connecting",
+      phase: this.startupPhase,
+      ...(waitedSeconds >= 8 ? { waitedSeconds } : {}),
+    });
+  }
+
+  private clearStartupPhase(): void {
+    this.startupPhase = null;
+    if (!this.startupPhaseTimer) return;
+    clearInterval(this.startupPhaseTimer);
+    this.startupPhaseTimer = undefined;
+  }
+
+  /** Explain the measured Defender cost of a cold plugin scan; the user decides. */
+  private async offerDefenderExclusion(resumeMs: number): Promise<void> {
+    if (this.defenderNoticeShown || this.context.globalState.get<boolean>(DEFENDER_NOTICE_KEY)) return;
+    const folders = pluginScanFolders(this.appServerPath, os.homedir(), fs.existsSync);
+    if (!folders.length) return;
+    this.defenderNoticeShown = true;
+    const details = t("查看原因和处理方法");
+    const never = t("不再提示");
+    const choice = await vscode.window.showWarningMessage(
+      t("本次启动恢复会话用了 {0} 秒，Windows 上常见原因是 Microsoft Defender 实时扫描 ZCode 插件文件。",
+        { 0: Math.round(resumeMs / 1000) }),
+      details, never);
+    if (choice === never) {
+      await this.context.globalState.update(DEFENDER_NOTICE_KEY, true);
+      return;
+    }
+    if (choice !== details) return;
+    const copy = t("复制排除命令");
+    const picked = await vscode.window.showWarningMessage(
+      t("启动变慢的原因"),
+      {
+        modal: true,
+        detail: t("长时间未启动后，ZCode 服务端恢复会话前会同步读取插件文件。Microsoft Defender 会在首次打开时逐个扫描这些文件，可能耗时数十秒；短时间内重新打开会命中扫描缓存，所以通常只有几秒。\n\n可选处理：在管理员 PowerShell 中把下列目录加入 Defender 排除项：\n{0}\n\n排除后这些目录不再被实时扫描，请自行权衡。不要排除 Code.exe 进程。复制的命令包含撤销方法。",
+          { 0: folders.join("\n") }),
+      },
+      copy);
+    if (picked !== copy) return;
+    await vscode.env.clipboard.writeText(defenderExclusionCommand(folders,
+      t("在管理员 PowerShell 中运行；只排除 ZCode 插件目录，不要排除 Code.exe。"),
+      t("如需撤销，去掉下一行开头的 # 后运行：")));
+    void vscode.window.showInformationMessage(t("已复制。请在管理员 PowerShell 中运行，然后重启 VS Code。"));
+  }
+
+  private paintTitle(title?: string, sessionId = this.client?.currentSessionId): void {
     const next = (title || this.client?.currentTitle || "").trim();
     if (!next) return;
-    this.post({ type: "session_title", title: next, sessionId: this.client?.currentSessionId });
-    if (this.view) this.view.title = next;
+    const update = (sessions: SessionSummary[]) => sessions.map(session => session.sessionId === sessionId ? { ...session, title: next } : session);
+    this.sessions = update(this.sessions);
+    for (const view of Object.values(this.sessionListViews)) view.sessions = update(view.sessions);
+    this.post({ type: "session_title", title: next, sessionId });
+    if (this.view && sessionId === this.client?.currentSessionId) this.view.title = next;
   }
 
   private indexCurrentSession(title?: string): void {
@@ -486,6 +707,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.setRunningPollVisibility(visible);
     webviewView.webview.options = {
       enableScripts: true,
+      // Fonts are inlined as data URIs. The cache directory is not a webview resource.
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, "dist"),
         vscode.Uri.joinPath(this.context.extensionUri, "media"),
@@ -497,7 +719,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.context.extensionUri,
       nonce,
       this.interfaceLanguage(),
-      this.composerChrome()
+      this.composerChrome(),
+      this.allowedDesktopPlugins()
     );
 
     this.viewMessageListener = webviewView.webview.onDidReceiveMessage((raw: unknown) => {
@@ -685,6 +908,15 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         this.pushLanguage();
         break;
       }
+      case "setDesktopPlugins": {
+        if (typeof msg.enabled !== "boolean" || !DESKTOP_PLUGIN_CHOICES.some(choice => choice.id === msg.text)) break;
+        try { await this.updateDesktopPlugin(msg.text!, msg.enabled); }
+        finally { this.pushDesktopPlugins(); }
+        break;
+      }
+      case "installMathFonts":
+        await this.enableMathFonts();
+        break;
       case "setChrome": {
         const current = this.composerChrome();
         const key = msg.chromeKey as keyof ComposerChrome | undefined;
@@ -707,6 +939,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         }
         break;
       }
+      case "refreshReferenceCatalog":
+        if (msg.sessionId && msg.sessionId === this.client?.currentSessionId) {
+          this.client.refreshSkillCatalog();
+          this.client.refreshSubagentCatalog();
+        }
+        break;
       case "ready":
         // The page posts "ready" once per load. A reload without a new
         // resolveWebviewView (Reload Webviews, renderer recovery) is still a
@@ -714,11 +952,17 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         this.webviewEpoch++;
         this.pushLanguage();
         this.pushChrome();
+        this.pushDesktopPlugins();
         this.pushNewSessionDefaults();
+        void this.syncMathFonts();
         this.flushOpenSettings();
         if (this.starting) await this.starting;
         if (!this.client) await this.startZCode();
-        else if (this.pushedEpoch !== this.webviewEpoch) await this.pushSessionState({ forceHistory: true });
+        else if (this.pushedEpoch !== this.webviewEpoch) {
+          await this.pushSessionState({ forceHistory: true });
+          this.client?.refreshSkillCatalog();
+          this.client?.refreshSubagentCatalog();
+        }
         this.pushEditorContext();
         if (this.pendingChip) {
           this.post({ type: "addChip", chip: this.pendingChip });
@@ -853,7 +1097,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         await this.newSession();
         break;
       case "listSessions":
-        await this.refreshSessions(!!msg.includeArchived);
+        try {
+          await this.refreshSessions(!!msg.includeArchived, undefined, msg.listVisible === true, msg.loadMore === true);
+        } finally {
+          // Even superseded/hidden failures must release the requesting button.
+          if (msg.requestId) this.post({ type: "session_list_complete", requestId: msg.requestId });
+        }
         break;
       case "switchSession":
         if (msg.sessionId) await this.switchSession(msg.sessionId);
@@ -907,6 +1156,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       case "retryLast": {
         const ticket = this.switchTicket;
         const attachments = readImageAttachments(msg.attachments);
+        let planModeApplied = false;
         let client = this.client;
         let sessionId = msg.sessionId || client?.currentSessionId;
         if (!msg.text && !attachments.length) break;
@@ -929,15 +1179,25 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
               : "会话已切换，请在当前会话重新发送。"));
           }
           const activeClient = assertRetryOwner(client);
+          if (msg.planMode) {
+            await activeClient.setMode("plan");
+            assertRetryOwner(activeClient);
+            planModeApplied = true;
+          }
           const prompt = buildPrompt(msg.text || "", prepareFileContext(msg.chips ?? [], this.workspacePath, vscode.workspace.textDocuments ?? []));
           await activeClient.sendMessage(prompt, attachments);
+          if (msg.commandId) this.post({ type: "send_admitted", commandId: msg.commandId, sessionId });
           if (activeClient === this.client && activeClient.currentSessionId === sessionId && ticket === this.switchTicket) this.indexCurrentSession();
         } catch (error) {
           logError("retry last message failed", error);
+          if (msg.planMode && !planModeApplied && client && client === this.client && client.currentSessionId === sessionId && ticket === this.switchTicket) {
+            this.post({ type: "session_controls", ...client.confirmedControls() });
+          }
           this.post({
             type: "send_rejected",
             sessionId,
-            text: msg.text,
+            ...(msg.commandId ? { commandId: msg.commandId } : {}),
+            text: msg.recoveryText ?? msg.text,
             chips: msg.chips ?? [],
             ...(attachments.length ? { attachments } : {}),
             message: userFacingError(error),
@@ -948,6 +1208,24 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       case "openRecoverySettings":
         if (msg.setting === "binaryPath" || msg.setting === "nodePath") await this.runRecoveryAction(msg.setting);
         break;
+      case "promptDesktopPluginSkill": {
+        const name = msg.text?.trim() || "";
+        const plugin = desktopPluginForSkill(name);
+        if (!plugin) break;
+        const enable = t("允许此插件");
+        const open = t("打开设置");
+        const action = await vscode.window.showInformationMessage(
+          t("{0} 所属插件已关闭。允许后会记住并重启当前会话，仍遵循桌面端原有开关。", { 0: name }),
+          enable,
+          open,
+        );
+        if (action === enable) {
+          await this.updateDesktopPlugin(plugin, true);
+        } else if (action === open) {
+          this.showChromeSettings("enable-desktop-plugins");
+        }
+        break;
+      }
       case "openCommunity":
         await vscode.env.openExternal(vscode.Uri.parse(COMMUNITY_URL));
         break;
@@ -1124,7 +1402,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   private sessionReferences(references?: SessionReference[]): SessionReference[] {
     if (!Array.isArray(references)) return [];
-    const available = new Map(this.sessions.filter(session => !session.archivedAt).map(session => [session.sessionId, session.title]));
+    const available = new Map(this.sessionListViews.active.sessions.map(session => [session.sessionId, session.title]));
     const seen = new Set<string>();
     return references.flatMap(reference => {
       if (!reference || typeof reference.sessionId !== "string" || !/^sess_[A-Za-z0-9_-]+$/.test(reference.sessionId)) {
@@ -1395,21 +1673,30 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   async quickSwitchSession(): Promise<void> {
-    await this.refreshSessions();
-    if (this.sessions.length === 0) {
-      vscode.window.showInformationMessage(t("此工作区还没有会话。"));
-      return;
+    await this.refreshSessions(false, undefined, true);
+    for (;;) {
+      const active = this.sessionListViews.active;
+      if (active.state === "failed" && !active.loaded) {
+        vscode.window.showInformationMessage(t("会话列表加载失败"));
+        return;
+      }
+      if (active.sessions.length === 0 && !this.sessionListHasMore) {
+        vscode.window.showInformationMessage(t("此工作区还没有会话。"));
+        return;
+      }
+      const items: Array<vscode.QuickPickItem & { sessionId?: string; loadMore?: boolean }> = active.sessions.map(s => ({
+        label: s.title || t("未命名"), description: s.model?.modelId,
+        detail: s.sessionId, sessionId: s.sessionId,
+      }));
+      if (this.sessionListHasMore) items.push({ label: t("加载更多会话"), loadMore: true });
+      const picked = await vscode.window.showQuickPick(items, { placeHolder: t("切换 ZCode 会话") });
+      if (!picked) return;
+      if (picked.loadMore) await this.refreshSessions(false, undefined, true, true);
+      else {
+        if (picked.sessionId) await this.switchSession(picked.sessionId);
+        return;
+      }
     }
-    const picked = await vscode.window.showQuickPick(
-      this.sessions.map((s) => ({
-        label: s.title || t("未命名"),
-        description: s.model?.modelId,
-        detail: s.sessionId,
-        sessionId: s.sessionId,
-      })),
-      { placeHolder: t("切换 ZCode 会话") }
-    );
-    if (picked) await this.switchSession(picked.sessionId);
   }
 
   async quickSelectModel(): Promise<void> {
@@ -1485,13 +1772,16 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   async restart(reason: string): Promise<void> {
     logInfo("Restarting ZCode", reason);
+    this.pushDesktopPlugins();
     this.disposeClient();
     await this.startZCode({ force: true });
   }
 
   private sessionIsArchived(sessionId: string): boolean {
-    if (this.sessions.some((s) => s.sessionId === sessionId && s.archivedAt)) return true;
-    return !!this.workspacePath && loadTaskFlags(this.workspacePath).archived.includes(sessionId);
+    const archiveTimes = loadSessionArchiveTimes([sessionId]);
+    const archived = archiveTimes.has(sessionId) ? archiveTimes.get(sessionId)
+      : this.sessions.find(session => session.sessionId === sessionId)?.archivedAt;
+    return !!archived || (!!this.workspacePath && loadTaskFlags(this.workspacePath).archived.includes(sessionId));
   }
 
   private async switchSession(sessionId: string): Promise<void> {
@@ -1503,7 +1793,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       await this.startZCode({ resumeSessionId: sessionId });
       return;
     }
-    if (this.client.currentSessionId === sessionId) return;
+    if (this.client.currentSessionId === sessionId && this.client.sessionAttached) return;
     const client = this.client;
     const timing = new StartupTiming("switch", true);
     this.timing = timing;
@@ -1579,6 +1869,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     if (sessionId && client.isGenerating()) {
       this.pendingModel = { sessionId, providerId, modelId };
       this.currentModel = { providerId, modelId };
+      client.stageSessionModel(this.currentModel);
       this.post({
         type: "models",
         current: this.currentModel,
@@ -1693,6 +1984,53 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** Serialize read-modify-write updates from individual plugin switches. */
+  private pluginSettingChanges: Promise<void> = Promise.resolve();
+
+  private updateDesktopPlugin(id: string, allowed: boolean): Promise<void> {
+    const operation = this.pluginSettingChanges.catch(() => {}).then(async () => {
+      const current = this.allowedDesktopPlugins();
+      const next = allowedDesktopPlugins(allowed ? [...current, id] : current.filter(item => item !== id));
+      if (JSON.stringify(next) !== JSON.stringify(current)) {
+        try {
+          await vscode.workspace.getConfiguration("zcode").update("allowedDesktopPlugins", next, vscode.ConfigurationTarget.Global);
+        } catch (error) {
+          logError("Could not save plugin choices", error);
+          this.pushDesktopPlugins();
+          const message = error instanceof Error ? error.message : String(error);
+          if (/allowedDesktopPlugins.*not a registered configuration/i.test(message)) {
+            const reload = t("重新加载窗口");
+            const selected = await vscode.window.showInformationMessage(
+              t("VS Code 尚未注册新版插件设置。请重新加载窗口后，再允许此插件。"), reload,
+            );
+            if (selected === reload) await vscode.commands.executeCommand("workbench.action.reloadWindow");
+          } else {
+            vscode.window.showErrorMessage(t("保存插件设置失败：{0}", { 0: userFacingError(error) }));
+          }
+        }
+      }
+    });
+    this.pluginSettingChanges = operation;
+    return operation;
+  }
+
+  private allowedDesktopPlugins(): string[] {
+    return allowedDesktopPlugins(vscode.workspace.getConfiguration("zcode").get("allowedDesktopPlugins"));
+  }
+
+  private pushDesktopPlugins(): void {
+    this.post({ type: "desktop_plugins", allowed: this.allowedDesktopPlugins() });
+  }
+
+  private desktopPluginOverlay(): { suppressDesktopPlugins?: boolean; desktopPluginOverlayPath?: string; allowedDesktopPlugins?: string[] } {
+    if (this.allowedDesktopPlugins().length === DESKTOP_PLUGIN_CHOICES.length) return {};
+    return {
+      suppressDesktopPlugins: true,
+      desktopPluginOverlayPath: path.join(this.context.extensionPath, "dist", "desktopPluginOverlayPreload.cjs"),
+      allowedDesktopPlugins: this.allowedDesktopPlugins(),
+    };
+  }
+
   private async startZCode(opts?: {
     force?: boolean;
     createNew?: boolean;
@@ -1729,11 +2067,13 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       binaryPath = await locateAppServer(config.get<string>("binaryPath") || "", {
         preferred: this.context.globalState.get<string>(LAST_BINARY_KEY) || "",
       });
+      this.appServerPath = binaryPath;
       timing.add("locateBinary", Date.now() - locateStarted);
     } catch (e) {
       timing.add("locateBinary", Date.now() - locateStarted);
       const message = userFacingError(e);
       logError("Could not locate ZCode app-server", e);
+      this.clearStartupPhase();
       this.showStartupError(message);
       this.post({ type: "session_error", message });
       return;
@@ -1747,9 +2087,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
     }
     workspacePath = preferredWorkspacePath(workspacePath, readV2Settings()?.recentProjects);
-    this.workspacePath = workspacePath;
+    this.adoptWorkspace(workspacePath);
 
-    this.post({ type: "status", status: "resolving_credentials" });
+    this.beginStartupPhase("starting");
 
     const loginStarted = Date.now();
     this.desktopAppVersion = desktopVersion(binaryPath);
@@ -1783,6 +2123,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     timing.add("resolveRuntime", Date.now() - loginStarted);
     timing.note("loginNetwork", loginNetwork);
     if (!resolved.ok || !resolved.runtime) {
+      this.clearStartupPhase();
       this.post({
         type: "setup",
         reason: resolved.reason,
@@ -1800,22 +2141,27 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     if (resolved.warning) {
       vscode.window.showWarningMessage(`ZCode: ${resolved.warning}`);
     }
-    const configStarted = Date.now();
-    syncCliConfig(runtime, readV2Config());
-    timing.add("syncCliConfig", Date.now() - configStarted);
+    try {
+      this.syncStartupConfig(runtime, timing);
+    } catch (error) {
+      this.failStartupPreparation(error);
+      return;
+    }
 
-    this.post({ type: "status", status: "connecting" });
     this.disposeClient();
 
     const remembered =
       opts?.resumeSessionId ||
       (opts?.createNew ? undefined : this.context.workspaceState.get<string>(LAST_SESSION_KEY));
 
+    this.beginStartupPhase(remembered ? "restoring" : "starting");
+
     const client = new ZCodeClient({
       binaryPath,
       nodePath: nodePath || undefined,
       workspacePath,
       env: runtimeEnv(runtime),
+      ...this.desktopPluginOverlay(),
       compileCachePath: path.join(this.context.globalStorageUri.fsPath, "runtime-compile-cache"),
       runtime,
       resolveSessionRuntime: (model) => this.resolveSessionModelRuntime(model),
@@ -1849,6 +2195,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (this.client !== client) return;
       const message = userFacingError(e);
       logError("ZCode startup failed", e);
+      this.clearStartupPhase();
       this.showStartupError(message);
       this.post({ type: "session_error", message });
     }
@@ -1901,12 +2248,13 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       newSessionDefaults?: NewSessionDefaults;
     }
   ): Promise<void> {
-    this.post({ type: "status", status: "connecting" });
+    this.beginStartupPhase(launch.remembered ? "restoring" : "starting");
     this.disposeClient();
     const client = new ZCodeClient({
       binaryPath: launch.binaryPath,
       nodePath: launch.nodePath || undefined,
       workspacePath: launch.workspacePath,
+      ...this.desktopPluginOverlay(),
       pendingLogin: loginPromise,
       compileCachePath: path.join(this.context.globalStorageUri.fsPath, "runtime-compile-cache"),
       resolveSessionRuntime: (model) => this.resolveSessionModelRuntime(model),
@@ -1921,13 +2269,17 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     client.setViewVisible(this.view?.visible === true);
     client.setTiming(timing);
     this.startRunningPoll();
+    // Observe rejection immediately, even when configuration failure returns first.
     const startup = client.start({
       createNew: launch.createNew,
       resumeSessionId: launch.remembered,
       applyModel: !!launch.createNew,
       newSessionDefaults: launch.newSessionDefaults,
       chooseResume: (listed, rejected) => this.chooseStartupSession(listed, launch.remembered, rejected),
-    });
+    }).then(
+      () => ({ status: "fulfilled" as const }),
+      reason => ({ status: "rejected" as const, reason })
+    );
     const settled = loginPromise.then((resolved) => {
       timing.add("resolveRuntime", Date.now() - loginStarted);
       timing.note("loginNetwork", resolved.exchangedLogin === true);
@@ -1939,17 +2291,27 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (!resolved.ok || !resolved.runtime) return false;
       this.runtime = resolved.runtime;
       if (resolved.warning) vscode.window.showWarningMessage(`ZCode: ${resolved.warning}`);
-      const configStarted = Date.now();
-      syncCliConfig(resolved.runtime, readV2Config());
-      timing.add("syncCliConfig", Date.now() - configStarted);
+      this.syncStartupConfig(resolved.runtime, timing);
       client.setDefaultRuntime(resolved.runtime);
       return true;
     });
-    const [started, ready] = await Promise.allSettled([startup, settled]);
+    const ready = await settled.then(
+      value => ({ status: "fulfilled" as const, value }),
+      reason => ({ status: "rejected" as const, reason })
+    );
     if (this.client !== client) return;
-    if (ready.status === "rejected" || ready.value === false) {
+    if (ready.status === "rejected") {
+      // Config failed while the backend may still be starting. Stop this
+      // attempt immediately; its later result must not replace the error.
+      this.disposeClient();
+      this.failStartupPreparation(ready.reason);
+      return;
+    }
+    if (ready.value === false) {
       const resolved = await loginPromise.catch(() => null);
-      if (this.client === client) this.disposeClient();
+      if (this.client !== client) return;
+      this.clearStartupPhase();
+      this.disposeClient();
       this.post({
         type: "setup",
         reason: resolved?.reason,
@@ -1960,9 +2322,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.pushNewSessionDefaults();
       return;
     }
+    const started = await startup;
+    if (this.client !== client) return;
     if (started.status === "rejected") {
       const message = userFacingError(started.reason);
       logError("ZCode startup failed", started.reason);
+      this.clearStartupPhase();
       this.showStartupError(message);
       this.post({ type: "session_error", message });
       return;
@@ -1977,6 +2342,23 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       await vscode.commands.executeCommand("workbench.action.openSettings", `@id:zcode.${action}`);
     } else if (action === "pickModel") await this.quickSelectModel();
     else await this.startZCode({ force: true });
+  }
+
+  private syncStartupConfig(runtime: ResolvedRuntime, timing: StartupTiming): void {
+    const started = Date.now();
+    try {
+      syncCliConfig(runtime, readV2Config());
+    } finally {
+      timing.add("syncCliConfig", Date.now() - started);
+    }
+  }
+
+  private failStartupPreparation(error: unknown): void {
+    const message = userFacingError(error);
+    logError("ZCode startup preparation failed", error);
+    this.clearStartupPhase();
+    this.showStartupError(message);
+    this.post({ type: "session_error", message });
   }
 
   private showStartupError(message: string, recoveryOverride?: RecoveryAction): void {
@@ -1998,6 +2380,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const ticket = this.switchTicket;
     if (!client || !sessionId) return;
     const isCurrent = () => client === this.client && sessionId === client.currentSessionId && ticket === this.switchTicket;
+    this.clearStartupPhase();
     this.post({ type: "session_ready", sessionId, title: client.currentTitle || "新会话", viewGen: ticket });
     this.paintTitle(client.currentTitle);
     if (opts?.forceHistory || !client.historyDelivered(sessionId)) {
@@ -2006,7 +2389,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.postHistory(history, ticket);
     }
     client.endViewChange();
+    const indexStarted = Date.now();
     this.indexCurrentSession();
+    this.timing?.add("currentTaskIndex", Date.now() - indexStarted);
     await this.refreshSessions(false, opts?.startupList);
     if (!isCurrent()) return;
     const current = this.sessions.find((s) => s.sessionId === sessionId);
@@ -2019,13 +2404,29 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async refreshSessions(includeArchived = false, startupList?: SessionSummary[]): Promise<void> {
+  private async refreshSessions(includeArchived = false, startupList?: SessionSummary[], listVisible = false, loadMore = false): Promise<void> {
     const client = this.client;
     const ticket = this.switchTicket;
     if (!client) return;
+    const view = includeArchived ? "archived" : "active";
+    const workspacePath = this.workspacePath;
+    const request = ++this.sessionListRequest;
+    const currentRequest = () => client === this.client && ticket === this.switchTicket
+      && request === this.sessionListRequest && sameWorkspacePath(workspacePath, this.workspacePath);
     try {
-      const listed = startupList ?? await client.listSessions(true);
-      if (client !== this.client || ticket !== this.switchTicket) return;
+      const limit = startupList ? 80 : loadMore ? this.sessionListLimit * 2 : this.sessionListLimit;
+      const page = !startupList && (listVisible || limit > 80)
+        ? await client.listSessionsPage(true, limit)
+        : { sessions: startupList ?? await client.listSessions(true), hasMore: undefined };
+      if (!currentRequest()) return;
+      const serverList = page.sessions;
+      this.sessionListLimit = limit;
+      this.sessionListHasMore = page.hasMore ?? serverList.length >= limit;
+      const indexStarted = Date.now();
+      const archiveTimes = loadSessionArchiveTimes(serverList.map(s => s.sessionId));
+      const listed = serverList.map(s => archiveTimes.has(s.sessionId)
+        ? { ...s, archivedAt: archiveTimes.get(s.sessionId) || undefined }
+        : s);
       // Persistent flags are authoritative and must be read after the list returns.
       const flags = this.workspacePath
         ? loadTaskFlags(this.workspacePath)
@@ -2033,53 +2434,75 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       const archived = new Set(flags.archived);
       const deleted = new Set(flags.deleted);
       const overridden = loadOverriddenTitles(this.workspacePath);
-      this.sessions = listed
+      const available = listed
         .map((s) => {
           const title = overridden[s.sessionId] || s.title;
           const model = s.model || this.sessionModelFor(s.sessionId);
           return { ...s, title, model };
         })
         .filter((s) => !deleted.has(s.sessionId))
-        .filter((s) =>
-          includeArchived
-            ? archived.has(s.sessionId) || !!s.archivedAt
-            : !archived.has(s.sessionId) && !s.archivedAt
-        )
         .map((s) => ({
           ...s,
-          archivedAt: s.archivedAt ?? (archived.has(s.sessionId) ? 1 : undefined),
+          archivedAt: s.archivedAt || (archived.has(s.sessionId) ? 1 : undefined),
         }));
+      // Both tabs come from the same all-session response. Keep references
+      // independent of the tab currently displayed, including restores/deletes.
+      this.sessionListViews.active = { sessions: available.filter(s => !s.archivedAt), state: "ready", loaded: true };
+      this.sessionListViews.archived = { sessions: available.filter(s => !!s.archivedAt), state: "ready", loaded: true };
+      const displayed = this.sessionListViews[view].sessions;
+      this.sessions = displayed;
       this.post({
         type: "sessions",
-        sessions: this.sessions,
-        currentId: this.client.currentSessionId,
+        sessions: displayed,
+        referenceSessions: this.sessionListViews.active.sessions.map(({ sessionId, title }) => ({ sessionId, title })),
+        currentId: client.currentSessionId,
         includeArchived,
+        notice: "ready",
+        hasMore: this.sessionListHasMore,
       });
-      if (!includeArchived) {
-        for (const s of listed) {
-          const ws = this.workspacePath || s.workspacePath || "";
-          if (!ws || archived.has(s.sessionId) || deleted.has(s.sessionId)) continue;
-          upsertDesktopTask({
-            workspacePath: ws,
-            sessionId: s.sessionId,
-            title: s.title,
-            model: s.model
-              ? `${s.model.providerId}/${s.model.modelId}`
-              : this.runtime
-                ? `${this.runtime.providerId}/${this.runtime.modelId}`
-                : undefined,
-            createdAt: s.createdAt,
-            updatedAt: s.updatedAt,
-            mode:
-              s.sessionId === this.client.currentSessionId
-                ? this.client.currentMode()
-                : undefined,
-          });
-        }
-        // A server list may be paginated. Never delete desktop tasks absent from it.
+      let indexed = 0;
+      for (const s of listed) {
+        const ws = this.workspacePath || s.workspacePath || "";
+        if (!ws || deleted.has(s.sessionId)) continue;
+        upsertDesktopTask({
+          workspacePath: ws,
+          sessionId: s.sessionId,
+          title: s.title,
+          model: s.model
+            ? `${s.model.providerId}/${s.model.modelId}`
+            : this.runtime
+              ? `${this.runtime.providerId}/${this.runtime.modelId}`
+              : undefined,
+          createdAt: s.createdAt,
+          updatedAt: s.updatedAt,
+          archived: archived.has(s.sessionId) || !!s.archivedAt,
+          mode:
+            s.sessionId === client.currentSessionId
+              ? client.currentMode()
+              : undefined,
+        });
+        indexed++;
       }
+      // A server list may be paginated. Never delete desktop tasks absent from it.
+      this.timing?.add("sessionListIndex", Date.now() - indexStarted);
+      this.timing?.addCount("sessionListIndexCount", indexed);
     } catch (e) {
+      if (!currentRequest()) return;
       logWarn("listSessions failed", e);
+      const cached = this.sessionListViews[view];
+      cached.state = "failed";
+      // The webview keeps one list. A hidden failure must not replace the
+      // page currently on screen, and a page with no cache cannot borrow the other.
+      if (!listVisible) return;
+      this.post({
+        type: "sessions",
+        sessions: cached.loaded ? cached.sessions : [],
+        referenceSessions: this.sessionListViews.active.sessions.map(({ sessionId, title }) => ({ sessionId, title })),
+        currentId: this.client?.currentSessionId,
+        includeArchived,
+        notice: cached.loaded ? "stale" : "initial",
+        hasMore: this.sessionListHasMore,
+      });
     }
   }
 
@@ -2094,7 +2517,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       logError("session management operation failed", e);
       // Management failures must never terminate the running conversation UI.
       // Report even after a switch: the user still needs the operation's outcome.
-      this.post({ type: "toast", text: saved
+      this.post({ type: "toast", text: e instanceof SessionSyncError ? userFacingError(e) : saved
         ? t("{0}已保存，但后续同步未完成：{1}", { 0: action(), 1: userFacingError(e) })
         : t("{0}未能完成：{1}", { 0: action(), 1: userFacingError(e) }) });
     }
@@ -2111,11 +2534,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (this.client?.currentSessionId === sessionId) {
         await this.client.renameSession(next);
       }
-      this.post({
-        type: "session_title",
-        title: next,
-        sessionId,
-      });
+      this.paintTitle(next, sessionId);
       await this.refreshSessions();
       this.post({ type: "toast", text: t("已重命名") });
     });
@@ -2209,7 +2628,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const hasLiveCatalog = !!client && this.livePicker?.client === client && this.livePicker.sessionId === sessionId;
     if (client && sessionId && (!hasLiveCatalog || !hasFreshCurrent)) {
       try {
-        const live = await client.readAvailableModels();
+        const live = await client.readAvailableModels(!forceRead);
         if (client !== this.client || sessionId !== client.currentSessionId || ticket !== this.switchTicket) return;
         this.livePicker = {
           client,
@@ -2238,20 +2657,31 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.pushNewSessionDefaults();
   }
 
-  /** session/list can lag the desktop index. Read archive flags only after that list returns. */
-  private sessionExclusions(extra: Iterable<string> = []): Set<string> {
+  /** Merge CLI archive facts before choosing, even before the first list refresh. */
+  private sessionExclusions(
+    extra: Iterable<string> = [],
+    listed: Array<{ sessionId: string; archivedAt?: number }> = []
+  ): Set<string> {
     const flags = this.workspacePath
       ? loadTaskFlags(this.workspacePath)
       : { archived: [], deleted: [] };
-    return new Set([...flags.archived, ...flags.deleted, ...extra]);
+    const excluded = new Set([...flags.archived, ...flags.deleted, ...extra]);
+    const archiveTimes = loadSessionArchiveTimes(listed.map(session => session.sessionId));
+    for (const session of listed) {
+      // An explicit CLI null also overrides an old archivedAt in a server page.
+      if (archiveTimes.has(session.sessionId) ? archiveTimes.get(session.sessionId) : session.archivedAt) {
+        excluded.add(session.sessionId);
+      }
+    }
+    return excluded;
   }
 
   private nextUsableSession(
     listed: Array<{ sessionId: string; archivedAt?: number }>,
     extra: string[] = []
   ): { sessionId: string; archivedAt?: number } | undefined {
-    const excluded = this.sessionExclusions(extra);
-    return listed.find((s) => !excluded.has(s.sessionId) && !s.archivedAt);
+    const excluded = this.sessionExclusions(extra, listed);
+    return listed.find((s) => !excluded.has(s.sessionId));
   }
 
   private chooseStartupSession(
@@ -2259,13 +2689,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     remembered: string | undefined,
     rejected: ReadonlySet<string>
   ): string | undefined {
-    const excluded = this.sessionExclusions(rejected);
-    if (remembered && !excluded.has(remembered)) {
-      const known = listed.find((s) => s.sessionId === remembered);
-      // Absent from this page: the list is capped, so keep a session the index still allows.
-      if (!known || !known.archivedAt) return remembered;
-    }
-    return listed.find((s) => !excluded.has(s.sessionId) && !s.archivedAt)?.sessionId;
+    const candidates = remembered && !listed.some(session => session.sessionId === remembered)
+      ? [...listed, { sessionId: remembered }] : listed;
+    const excluded = this.sessionExclusions(rejected, candidates);
+    if (remembered && !excluded.has(remembered)) return remembered;
+    return listed.find((s) => !excluded.has(s.sessionId))?.sessionId;
   }
 
   private rememberSession(sessionId: string): void {
@@ -2319,6 +2747,27 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           slashCommands: data.slashCommands ?? [],
         });
         this.paintTitle(data.title);
+        break;
+      }
+      case "skill_catalog": {
+        const data = event.data as {
+          sessionId: string;
+          skills?: Array<{ name: string; description: string; path: string }>;
+        };
+        if (data.sessionId === this.client?.currentSessionId) {
+          const config = vscode.workspace.getConfiguration("zcode");
+          const skills = withDesktopPluginSkillPrompts(
+            data.skills ?? [],
+            this.allowedDesktopPlugins(),
+            config.get<boolean>("showSuppressedPluginSkills") !== false,
+          );
+          this.post({ type: "skill_catalog", sessionId: data.sessionId, skills });
+        }
+        break;
+      }
+      case "subagent_catalog": {
+        const data = event.data as { sessionId: string; agents: Array<{ name: string; description: string; source: string }> };
+        if (data.sessionId === this.client?.currentSessionId) this.post({ type: "subagent_catalog", ...data });
         break;
       }
       case "assistant_text":
@@ -2431,14 +2880,15 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     // Catch up immediately after reopening the panel, then resume the regular
     // poll. Hidden panels do not need to keep background badges current.
     this.client.pollBackgroundRuns();
-    // Without node:sqlite each poll may rebuild a WASM snapshot; poll less often as a fallback.
+    // An unsupported runtime cannot read session storage; avoid repeatedly retrying at the normal rate.
     this.runningPoll = setInterval(() => this.client?.pollBackgroundRuns(), nativeSqliteAvailable() ? 1500 : 15000);
+    this.runningPoll.unref?.();
   }
 
-  private pendingOpenSettings = false;
+  private pendingOpenSettings: string | null = null;
 
-  showChromeSettings(): void {
-    this.pendingOpenSettings = true;
+  showChromeSettings(focus?: string): void {
+    this.pendingOpenSettings = focus ?? "";
     void vscode.commands.executeCommand("workbench.view.extension.zcode-sidebar").then(() => {
       this.flushOpenSettings();
     });
@@ -2446,6 +2896,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   refreshQuota(): void {
     this.client?.refreshQuotaNow();
+  }
+
+  refreshListedSkills(): void {
+    this.client?.refreshSkillCatalog();
   }
 
   async setQuotaApiKey(): Promise<void> {
@@ -2483,9 +2937,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private flushOpenSettings(): void {
-    if (!this.pendingOpenSettings || !this.view) return;
-    this.pendingOpenSettings = false;
-    this.post({ type: "openSettings" });
+    if (this.pendingOpenSettings === null || !this.view) return;
+    const focus = this.pendingOpenSettings;
+    this.pendingOpenSettings = null;
+    this.post({ type: "openSettings", ...(focus ? { focus } : {}) });
   }
 
   private post(msg: Record<string, unknown>): void {
@@ -2534,6 +2989,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   dispose(): void {
     this.fileSearchCancellation?.cancel();this.fileSearchCancellation?.dispose();
     this.releaseViewListeners();
+    this.clearStartupPhase();
     this.disposeClient();
   }
 }
@@ -2572,6 +3028,8 @@ export type WebviewIn = {
   modelId?: string;
   restart?: boolean;
   includeArchived?: boolean;
+  listVisible?: boolean;
+  loadMore?: boolean;
   requestId?: string;
   actionRequestId?: string;
   optionId?: string;

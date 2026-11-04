@@ -41,7 +41,7 @@ export function defaultCandidatePaths(
   if (platform === "darwin") {
     return [
       "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
-      path.join(homedir, "Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"),
+      path.posix.join(homedir, "Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"),
     ];
   }
   if (platform === "win32") {
@@ -51,7 +51,7 @@ export function defaultCandidatePaths(
   return [
     "/opt/ZCode/resources/glm/zcode.cjs",
     "/usr/lib/zcode/resources/glm/zcode.cjs",
-    path.join(homedir, ".local/share/ZCode/resources/glm/zcode.cjs"),
+    path.posix.join(homedir, ".local/share/ZCode/resources/glm/zcode.cjs"),
   ];
 }
 
@@ -144,35 +144,39 @@ export function candidatesFromExecutable(
 }
 
 export function linuxDesktopDirs(homedir: string, env: NodeJS.ProcessEnv): string[] {
-  const user = env.XDG_DATA_HOME || path.join(homedir, ".local", "share");
+  const user = env.XDG_DATA_HOME || path.posix.join(homedir, ".local", "share");
   const system = (env.XDG_DATA_DIRS || "/usr/local/share:/usr/share")
-    .split(path.delimiter)
+    .split(":")
     .filter(Boolean);
   return [
     user,
     ...system,
     "/var/lib/flatpak/exports/share",
-    path.join(homedir, ".local", "share", "flatpak", "exports", "share"),
+    path.posix.join(homedir, ".local", "share", "flatpak", "exports", "share"),
     "/var/lib/snapd/desktop",
-  ].map((dir) => path.join(dir, "applications"));
+  ].map((dir) => path.posix.join(dir, "applications"));
 }
 
 export function appServerLaunch(input: {
   binaryPath: string;
   nodePath?: string;
   execPath: string;
+  /** Plain script loaded with node --require. Ignored for a native binary. */
+  preloadPath?: string;
 }): { command: string; args: string[]; electronAsNode: boolean } {
   const script = input.binaryPath.endsWith(".cjs") || input.binaryPath.endsWith(".js");
+  const preload = script ? input.preloadPath?.trim() || "" : "";
+  const prefix = preload ? ["--require", preload] : [];
   if (!script) {
     return { command: input.binaryPath, args: ["app-server"], electronAsNode: false };
   }
   const nodePath = input.nodePath?.trim() || "";
   if (nodePath) {
-    return { command: nodePath, args: [input.binaryPath, "app-server"], electronAsNode: false };
+    return { command: nodePath, args: [...prefix, input.binaryPath, "app-server"], electronAsNode: false };
   }
   return {
     command: input.execPath,
-    args: [input.binaryPath, "app-server"],
+    args: [...prefix, input.binaryPath, "app-server"],
     electronAsNode: true,
   };
 }
@@ -267,7 +271,7 @@ export async function locateAppServer(
       const names = listDir(dir) ?? [];
       for (const name of names) {
         if (!/zcode/i.test(name) || !name.endsWith(".desktop")) continue;
-        const text = readFile(path.join(dir, name));
+        const text = readFile(path.posix.join(dir, name));
         const execPath = text ? parseDesktopExec(text) : null;
         if (!execPath) continue;
         for (const candidate of candidatesFromExecutable(execPath, "linux")) {

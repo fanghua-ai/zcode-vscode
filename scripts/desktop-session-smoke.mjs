@@ -61,22 +61,68 @@ await build({stdin:{contents:`
 import {ZCodeClient} from ${JSON.stringify(path.resolve(process.env.ZCODE_REVIEW_SOURCE || 'src/zcodeClient.ts'))};
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
+import {persistCliSession,loadSessionExecutionState} from ${JSON.stringify(path.resolve('src/taskIndex.ts'))};
 import fs from 'node:fs';
 import {isSessionModelAvailable, resolveRuntimeForSession} from ${JSON.stringify(path.resolve('src/desktop.ts'))};
 import path from 'node:path';
 (async()=>{
-const events=[];
-const client=new ZCodeClient({isSessionModelAvailable,resolveSessionRuntime:resolveRuntimeForSession,binaryPath:process.env.TEST_BINARY,workspacePath:process.env.TEST_WORKSPACE,compileCachePath:path.join(process.env.HOME,"compile-cache"),
+const events=[];let seededVersion=false;
+const makeClient=()=>new ZCodeClient({isSessionModelAvailable,resolveSessionRuntime:resolveRuntimeForSession,binaryPath:process.env.TEST_BINARY,workspacePath:process.env.TEST_WORKSPACE,compileCachePath:path.join(process.env.HOME,"compile-cache"),
  env:{ZCODE_PERSONAL_PROVIDER_CONFIG_FILE:process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,ZCODE_BUILTIN_PROVIDER_CONFIG_FILE:process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE:process.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE},
  runtime:{providerId:'builtin:bigmodel-coding-plan',providerName:'Missing legacy provider',modelId:'test',kind:'openai',baseURL:'http://127.0.0.1',apiKey:'TEST-ONLY',models:{},source:'custom-provider'},
- onEvent:event=>{events.push(event);if(event.type==='session_ready'){
+ onEvent:event=>{events.push(event);if(event.type==='session_title'){
+ if(!seededVersion){
  const db=new DatabaseSync(path.join(process.env.HOME,'.zcode/cli/db/db.sqlite'));
- db.prepare('INSERT OR IGNORE INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES(?,?,?,?,?,?,?,?)').run(event.data.sessionId,'fixture-project','fixture-session',process.env.TEST_WORKSPACE,'Fixture','3.14.4',Date.now(),Date.now());db.close();
+ db.exec('PRAGMA busy_timeout=5000');
+ // Match the host: index the empty identity before applying post-create defaults.
+ db.prepare('INSERT OR IGNORE INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES(?,?,?,?,?,?,?,?)').run('version-fixture','fixture-project','version-fixture',process.env.TEST_WORKSPACE,'Fixture','3.14.4',Date.now(),Date.now());db.close();seededVersion=true;
+ }
+ assert.ok(persistCliSession({sessionId:event.data.sessionId,workspacePath:process.env.TEST_WORKSPACE,title:event.data.title,mode:client.currentMode()}));
+
  }}});
+let client=makeClient();
 
 const baseline=process.env.TEST_BASELINE==='1';if(baseline){const create=client.newSession.bind(client);client.newSession=async()=>{await create();await client.setModel('fake','test');};}
 try {
  await client.start({createNew:true});if(baseline)await client.setModel('fake','test');
+
+ if(!baseline){
+  const restart=async()=>{
+   const id=client.currentSessionId;client.dispose();client=makeClient();
+   await client.start({resumeSessionId:id});assert.equal(client.currentSessionId,id);
+  };
+  for(const mode of ['yolo','edit','plan']){
+   await client.newSession({mode});assert.equal(client.currentMode(),mode);
+   await restart();assert.equal(client.currentMode(),mode,'empty default lost after restart: '+mode);
+  }
+  await client.setMode('yolo');await client.setMode('plan');
+  await restart();assert.equal(client.currentMode(),'plan');
+  assert.equal(client.confirmedControls().baseMode,'yolo','plan must preserve the full-access base permission');
+  await client.setMode('edit');await restart();assert.equal(client.currentMode(),'edit');
+  await client.setMode('build');await restart();assert.equal(client.currentMode(),'build');
+  console.log('Real backend: empty-session defaults and manual permissions survive process restarts, including plan/base separation.');
+  for(const [initial,requested] of [['yolo','build'],['build','yolo']]){
+   await client.newSession({mode:initial});const source=client.currentSessionId;
+   await client.newSession();const destination=client.currentSessionId;
+   assert.notEqual(source,destination,'new session reused the previous identity');
+   await client.switchSession(source);
+   const rpc=client.sendRequest.bind(client);let accepted,release;
+   const ack=new Promise(resolve=>accepted=resolve),gate=new Promise(resolve=>release=resolve);
+   client.sendRequest=async(method,params,...rest)=>{
+    const result=await rpc(method,params,...rest);
+    if(method==='session/setMode'&&params.sessionId===source){accepted();await gate;}
+    return result;
+   };
+   const changing=client.setMode(requested);await ack;
+   await client.switchSession(destination);const destinationMode=client.currentMode();
+   release();await changing;client.sendRequest=rpc;
+   assert.equal(client.currentMode(),destinationMode,'late acknowledgement changed destination controls');
+   await client.switchSession(source);await restart();
+   assert.equal(client.currentMode(),requested,'accepted permission lost after switch/restart: '+requested);
+  }
+  console.log('Real backend: late permission upgrade/downgrade acknowledgements persist the source without changing destination controls.');
+  await client.newSession();
+ }
  const first=client.currentSessionId;assert.ok(first);
  for(let round=0;round<2;round++){
   if(round) {await client.newSession();assert.notEqual(client.currentSessionId,first);}
@@ -86,11 +132,48 @@ try {
   const models=await client.readAvailableModels();if(models.current)assert.equal(models.current.providerId,'fake');
   await client.sendMessage('Session regression test '+round);
   const deadline=Date.now()+15000;
-  while(Date.now()<deadline&&!events.some(event=>event.type==='assistant_text_delta'&&event.data.fullText?.includes('Image received.')))await new Promise(resolve=>setTimeout(resolve,100));
-  assert.ok(events.some(event=>event.type==='assistant_text_delta'&&event.data.fullText?.includes('Image received.')),'real backend did not deliver model output: '+JSON.stringify(events.slice(-10)));
+  const received=()=>events.some(event=>event.type==='assistant_text_delta'&&event.data.fullText?.includes('Image received.') ||
+    event.type==='transcript_sync'&&event.data.sessionId===session&&event.data.items?.some(item=>item.role==='assistant'&&item.text?.includes('Image received.')));
+  while(Date.now()<deadline&&!received())await new Promise(resolve=>setTimeout(resolve,100));
+  assert.ok(received(),'real backend did not deliver model output: '+JSON.stringify(events.slice(-10)));
   events.length=0;
  }
 
+ if(!baseline){
+  for(const failure of ['base','plan','plan-after-ack','manual-override']){
+   await client.setMode('yolo');await client.setMode('plan');
+   const id=client.currentSessionId;client.dispose();client=makeClient();
+   await client.start({createNew:true});
+   const rpc=client.sendRequest.bind(client);let injected=false;
+   client.sendRequest=async(method,params,...rest)=>{
+    if(method==='session/setMode'&&params.sessionId===id&&!injected&&params.mode===(failure==='base'?'yolo':'plan')){
+     injected=true;if(failure==='plan-after-ack')await rpc(method,params,...rest);
+     throw new Error('Injected restore failure');
+    }
+    return rpc(method,params,...rest);
+   };
+   await assert.rejects(client.switchSession(id),/Injected restore failure/);
+   assert.ok(injected);
+   await assert.rejects(client.sendMessage('MUST_NOT_SEND_AFTER_PARTIAL_RESTORE'),/会话权限尚未恢复完成/);
+   assert.deepEqual(loadSessionExecutionState(id),{mode:'yolo',planEnabled:true},'partial restore overwrote the full target: '+failure);
+   if(failure==='manual-override')await client.setMode('edit');
+   client.dispose();client=makeClient();await client.start({resumeSessionId:id});
+   assert.equal(client.currentSessionId,id);
+   assert.equal(client.currentMode(),failure==='manual-override'?'edit':'plan');
+   assert.equal(client.confirmedControls().baseMode,failure==='manual-override'?'edit':'yolo');
+   const db=new DatabaseSync(path.join(process.env.HOME,'.zcode/cli/db/db.sqlite'));
+   assert.equal(db.prepare("SELECT count(*) AS n FROM session_entry WHERE session_id=? AND type='zcode-vscode/permission_restore'").get(id).n,0);
+   db.close();
+  }
+  console.log('Real backend: base/plan failures, lost acknowledgements and process-restart retries preserve the full target; explicit choices replace failed restore targets.');
+  await client.setMode('yolo');await client.setMode('plan');
+  const id=client.currentSessionId;client.dispose();client=makeClient();
+  await client.start({resumeSessionId:id});
+  assert.equal(client.currentMode(),'plan','history-bearing chat lost plan after restart');
+  assert.equal(client.confirmedControls().baseMode,'yolo');
+  assert.ok((await client.loadHistory()).items.some(item=>item.role==='user'&&item.text==='Session regression test 1'));
+  console.log('Real backend: history-bearing chats preserve plan/base state and history across process restart.');
+ }
  await client.setMode('plan');assert.equal(client.currentMode(),'plan');
  await client.newSession();assert.equal(client.currentMode(),'build','new session inherited previous plan mode');
  console.log('Real backend: new session clears previous plan state.');
@@ -173,7 +256,7 @@ try {
  console.log('Real ZCode client: initial creation, first send, consecutive creation and second send passed.');
 }finally{client.dispose();}
 })().catch(error=>{console.error(error);process.exitCode=1;});
-`,resolveDir:process.cwd(),sourcefile:'session-client.ts'},outfile:harness,bundle:true,platform:'node',format:'cjs',external:['node-sqlite3-wasm'],plugins:[{name:'isolated-vscode',setup(builder){builder.onResolve({filter:/^vscode$/},()=>({path:path.resolve('src/testSupport/vscode.ts')}));builder.onResolve({filter:/^\.\/log$/},()=>({path:'log',namespace:'mock'}));builder.onLoad({filter:/.*/,namespace:'mock'},()=>({contents:'export const logInfo=()=>{},logWarn=()=>{},logError=()=>{},logDebug=()=>{};'}));}}]});
+`,resolveDir:process.cwd(),sourcefile:'session-client.ts'},outfile:harness,bundle:true,platform:'node',format:'cjs',plugins:[{name:'isolated-vscode',setup(builder){builder.onResolve({filter:/^vscode$/},()=>({path:path.resolve('src/testSupport/vscode.ts')}));builder.onResolve({filter:/^\.\/log$/},()=>({path:'log',namespace:'mock'}));builder.onLoad({filter:/.*/,namespace:'mock'},()=>({contents:'export const logInfo=()=>{},logWarn=()=>{},logError=()=>{},logDebug=()=>{};'}));}}]});
 try {
  const child=spawn(process.execPath,[harness],{env:{PATH:process.env.PATH,HOME:root,XDG_CONFIG_HOME:path.join(root,'config'),XDG_DATA_HOME:path.join(root,'data'),XDG_CACHE_HOME:path.join(root,'cache'),LANG:'C.UTF-8',TEST_BINARY:binary,TEST_WORKSPACE:path.join(root,'workspace'),TEST_BASELINE:process.env.ZCODE_REVIEW_SOURCE?'1':'0',ZCODE_PERSONAL_PROVIDER_CONFIG_FILE:personal,ZCODE_BUILTIN_PROVIDER_CONFIG_FILE:bundled,ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE:bundled},stdio:'inherit'});
  const code=await new Promise((resolve,reject)=>{child.on('error',reject);child.on('exit',resolve)});

@@ -158,3 +158,9 @@ test("sensitive message types require their essential fields", () => {
     assert.deepEqual(parseWebviewMessage(raw), { ok: false, rejection: { reason: "missing-field", field } });
   }
 });
+
+test("session page requests accept only boolean load-more flags", () => {
+  assert.deepEqual(parseWebviewMessage({type:"listSessions",listVisible:true,loadMore:true}),
+    {ok:true,message:{type:"listSessions",listVisible:true,loadMore:true}});
+  assert.equal(parseWebviewMessage({type:"listSessions",loadMore:"all"}).ok,false);
+});

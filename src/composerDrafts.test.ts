@@ -58,3 +58,38 @@ test("conversation references survive reload and failed-send recovery without cr
   assert.deepEqual(recovered.sessionRefs, [sessionRef]);
   assert.equal(restored.get("B").text, "draft B");
 });
+
+test("multiple skill selections survive reload, handoff and failed-send recovery", () => {
+  const first = { name: "alpha", path: "/skills/one/SKILL.md" };
+  const second = { name: "beta", path: "C:\\My Skills\\two\\SKILL.md" };
+  const drafts = new ComposerDrafts(undefined);
+  drafts.set("A", "question", [], [], [], [first, second]);
+  const restored = new ComposerDrafts(JSON.parse(JSON.stringify(drafts.serialize())));
+  assert.deepEqual(restored.get("A").skills, [first, second]);
+  restored.set("", "pending", [], [], [], [first]);
+  assert.deepEqual(restored.takePending("A").skills, [first, second]);
+  assert.deepEqual(restored.recover("A", { text: "failed", chips: [], skills: [second] }).skills, [first, second]);
+  assert.equal(restored.get("B").skills, undefined);
+});
+
+test("subagent selections survive draft persistence and failed-send recovery", () => {
+  const agents = [{ name: "Explore" }, { name: "demo:reviewer" }];
+  const drafts = new ComposerDrafts(undefined);
+  drafts.set("A", "question", [], [], [], [], agents);
+  const restored = new ComposerDrafts(JSON.parse(JSON.stringify(drafts.serialize())));
+  assert.deepEqual(restored.recover("A", { text: "retry", chips: [], agents }).agents, agents);
+  assert.equal(restored.get("B").agents, undefined);
+});
+
+
+test("empty Plan drafts survive reload and pending handoff without leaking into other sessions", () => {
+  const drafts = new ComposerDrafts(undefined);
+  drafts.set("", "", [], [], [], [], [], true);
+  const restored = new ComposerDrafts(JSON.parse(JSON.stringify(drafts.serialize())));
+  assert.equal(restored.takePending("A").planEnabled, true);
+  assert.equal(restored.get("").planEnabled, undefined);
+  assert.equal(restored.get("B").planEnabled, undefined);
+  restored.set("A", "", []);
+  assert.equal(restored.get("A").planEnabled, undefined);
+  assert.equal(restored.recover("A", { text: "retry", chips: [], planEnabled: true }).planEnabled, true);
+});

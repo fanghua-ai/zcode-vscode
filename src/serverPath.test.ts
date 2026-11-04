@@ -200,6 +200,33 @@ test("an explicit nodePath overrides the editor runtime", () => {
   assert.equal(launch.electronAsNode, false);
 });
 
+test("a script app-server can load a process-local preload", () => {
+  const launch = appServerLaunch({
+    binaryPath: "/opt/ZCode/resources/glm/zcode.cjs",
+    execPath: "/usr/share/code/code",
+    preloadPath: "/ext/dist/desktopPluginOverlayPreload.cjs",
+  });
+  assert.deepEqual(launch, {
+    command: "/usr/share/code/code",
+    args: ["--require", "/ext/dist/desktopPluginOverlayPreload.cjs", "/opt/ZCode/resources/glm/zcode.cjs", "app-server"],
+    electronAsNode: true,
+  });
+});
+
+test("a native app-server binary ignores the preload", () => {
+  const launch = appServerLaunch({
+    binaryPath: "/opt/ZCode/zcode",
+    nodePath: "/usr/bin/node",
+    execPath: "/usr/share/code/code",
+    preloadPath: "/ext/dist/desktopPluginOverlayPreload.cjs",
+  });
+  assert.deepEqual(launch, {
+    command: "/opt/ZCode/zcode",
+    args: ["app-server"],
+    electronAsNode: false,
+  });
+});
+
 test("a native app-server binary is launched directly", () => {
   const launch = appServerLaunch({
     binaryPath: "/opt/ZCode/zcode",

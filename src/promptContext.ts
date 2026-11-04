@@ -82,6 +82,14 @@ function escapeMdUrl(text: string): string {
   return text.replace(/%/g,"%25").replace(/#/g,"%23").replace(/</g,"%3C").replace(/>/g,"%3E").replace(/\r/g,"%0D").replace(/\n/g,"%0A");
 }
 
+function markdownLink(label: string, href: string): string {
+  return `[${escapeMdLabel(label)}](${/[\s()]/.test(href) ? `<${href}>` : href})`;
+}
+
+export function markdownLinkRef(label: string, path: string): string {
+  return markdownLink(label, escapeMdUrl(markdownPath(path)));
+}
+
 /** Desktop-style file mention: `[desktop.ts](./src/desktop.ts)` or `#L10-L20`. */
 export function fileMarkdownRef(chip: ContextChip): string {
   const name = fileBaseName(chip.relPath);
@@ -92,7 +100,7 @@ export function fileMarkdownRef(chip: ContextChip): string {
         ? `#L${chip.selectionStart}`
         : `#L${chip.selectionStart}-L${chip.selectionEnd}`;
   }
-  return `[${escapeMdLabel(name)}](${/[\s()]/.test(href) ? `<${href}>` : href})`;
+  return markdownLink(name, href);
 }
 
 function fenceLang(languageId?: string): string {
@@ -198,6 +206,31 @@ function parseLeadingFileLink(text: string): {
   };
 }
 
+/** Restore serialized skill references from an older draft or a rejected send. */
+export function extractLeadingSkills(text: string): { text: string; skills: Array<{ name: string; path: string }> } {
+  let rest = text;
+  const skills: Array<{ name: string; path: string }> = [];
+  for (;;) {
+    const link = parseLeadingFileLink(rest);
+    if (!link || !/^\$[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(link.label) || link.hasRange) break;
+    skills.push({ name: link.label.slice(1), path: link.title });
+    rest = link.rest.replace(/^[ \t]+/, "");
+  }
+  return { text: rest, skills };
+}
+
+export function extractLeadingAgents(text: string): { text: string; agents: Array<{ name: string }> } {
+  let rest = text;
+  const agents: Array<{ name: string }> = [];
+  for (;;) {
+    const match = /^@([A-Za-z0-9][A-Za-z0-9._:-]{0,255})(?:\s+|$)/.exec(rest);
+    if (!match) break;
+    agents.push({ name: match[1] });
+    rest = rest.slice(match[0].length);
+  }
+  return { text: rest, agents };
+}
+
 export function parsePromptDisplay(text: string): {
   body: string;
   chips: Array<{ label: string; title: string }>;
@@ -246,7 +279,7 @@ export function parsePromptDisplay(text: string): {
     if (!link) break;
     chips.push({ label: link.label, title: link.title });
     rest = link.rest;
-    {
+    if (!link.label.startsWith("$")) {
       const fence = rest.match(/^(`{3,})[^\n]*\n[\s\S]*?(?:^|\n)\1[ \t]*(?:\n|$)/);
       if (fence && fence.index === 0) {
         rest = rest.slice(fence[0].length).replace(/^\n+/, "");
