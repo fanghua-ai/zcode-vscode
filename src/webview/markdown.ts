@@ -11,9 +11,10 @@ marked.use({
 
 // CommonMark's flanking rules treat CJK letters after `**` as intraword text,
 // so a closing strong delimiter directly followed by Chinese is left literal.
-// Keep Marked's normal tokenizer and retry only that case with the following
+// Keep Marked's normal tokenizer and retry that case with the following
 // CJK code point represented as punctuation in its delimiter-only mask. The
-// actual source remains untouched, including the rendered text.
+// actual source remains untouched, including the rendered text. Quoted openers
+// immediately following CJK text receive the same delimiter-only treatment.
 const defaultEmStrong = new marked.Tokenizer().emStrong;
 const defaultDel = new marked.Tokenizer().del;
 const cjkLetter = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -47,7 +48,12 @@ marked.use({
       const token = defaultEmStrong.call(this, src, maskedSrc, prevChar);
       if (token) return token;
       const cjkMaskedSrc = maskCjkAdjacentStrongClosers(src, maskedSrc);
-      return cjkMaskedSrc ? defaultEmStrong.call(this, src, cjkMaskedSrc, prevChar) : undefined;
+      // An opening quote after ** is punctuation too: CJK immediately before
+      // the opener must not prevent Chinese quoted phrases from becoming bold.
+      const cjkOpener = src.startsWith("**") && !src.startsWith("***") && cjkLetter.test(prevChar || "");
+      return cjkMaskedSrc || cjkOpener
+        ? defaultEmStrong.call(this, src, cjkMaskedSrc ?? maskedSrc, cjkOpener ? "." : prevChar)
+        : undefined;
     },
     del(src, maskedSrc, prevChar) {
       // A single tilde beside a number is an approximation/range marker.

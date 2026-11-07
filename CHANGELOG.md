@@ -1,5 +1,43 @@
 # 更新日志 / Changelog
 
+## 2.2.1 — 2026-11-07
+
+### 中文
+- 修复 Z.ai 套餐登录时重复兑换桌面端已取得的业务凭据，避免因此无法恢复会话。
+- 个人 Coding Plan 的订阅查询暂时失败时，保留已取得的认证凭据，避免误切到 Start Plan。
+- 在设置中提供「复制日志」，复制近期日志时自动脱敏。
+- 复制诊断信息时保留近期的套餐登录阶段、服务端错误码和模型失败分类，方便反馈启动或发送问题。
+- 修复仅有 Start Plan 的账号登录与套餐选择，使用对应的凭据、模型和额度，并正确恢复模型名称大小写不同的已有会话；套餐不可用时不再自动切换到付费 API。
+- 压缩上下文期间保留已完成回复的复制按钮和时间。
+- 修复工具运行时进度更新导致命令悬停提示闪动的问题。
+- 展开底部的终端或查阅工具分组时，自动露出组内第一项。
+- 文件变更卡片不再计入尚未成功的工具编辑；保留完成事件省略的编辑参数，刷新重新展开的文件列表，并避免迟到请求覆盖新列表。
+- 调整运行中旋转图标的明暗顺序，使亮色线条沿旋转方向领着拖尾。
+- 展开底部工具卡片时自动显示详情开头，并保留标题可见，避免内容被输入区遮挡。
+- 修复中文紧接带引号的加粗内容时，星号原样显示的问题。
+- 空输入框支持用上下方向键回看当前会话已加载的历史消息文字；输入新内容后退出回看，不自动重新附加历史附件。
+- 补接模型流中的工具原始参数，避免 Bash 等工具只显示输出、不显示执行命令。
+- 修复工具执行中进度更新替换点击目标、导致展开或折叠操作失效的问题；保留手动展开状态。
+- 修复插件市场介绍页中的更新日志、许可证和第三方声明链接无法打开的问题。
+
+### English
+- Reuse the Z.ai business credential from the desktop app to prevent a duplicate exchange from blocking session restoration.
+- Keep resolved personal Coding Plan credentials when the subscription check is inconclusive, avoiding an unintended switch to Start Plan.
+- Add Copy Log in settings with automatic redaction of recent logs.
+- Include recent plan sign-in stages, service error codes, and model failure categories in copied diagnostics.
+- Fix sign-in and plan selection for Start Plan-only accounts with the matching credentials, models, and quota; restore sessions across model-name casing differences and avoid automatically falling back to a metered API when a plan is unavailable.
+- Keep copy buttons and timestamps on completed replies during context compaction.
+- Keep tool command hover tips stable during progress updates.
+- Reveal the first tool when expanding a terminal or exploration group near the bottom.
+- Count local tool edits only after completion, retain omitted edit details, refresh reopened file lists, and ignore outdated file-list responses.
+- Correct the working spinner fade so its bright ray leads the trailing segments.
+- Reveal details when expanding tools near the bottom, keeping their headers visible above the composer.
+- Render quoted bold phrases immediately following Chinese text correctly.
+- Browse loaded message text in the current conversation with Up/Down from an empty composer; typing exits history browsing without reattaching historical files.
+- Read original tool arguments from model-stream events so Bash and other tools retain their input alongside output.
+- Keep tool headers stable during progress updates so expand/collapse clicks work while tools run and manual expansion is preserved.
+- Fix changelog, license, and third-party notice links on the Marketplace overview page.
+
 ## 2.2.0 — 2026-11-04
 
 本版本汇总并正式发布 2.1.0–2.1.7 预览版中经过验证的改进。以下为相较上一稳定版 2.0.2 的主要变化；与 2.1.7 预览版相比没有新增功能。

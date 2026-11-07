@@ -21,6 +21,10 @@ import {
   readV2Config,
   readV2Settings,
   tryPlanOAuth,
+  readStartPlanAccess,
+  readStartPlanAuth,
+  hasPersonalCodingPlan,
+  planAuthErrorDetails,
   zcodeDir,
 } from "./credentials";
 import { readDesktopJson, readDesktopJsonWithRetry } from "./desktopJson";
@@ -69,6 +73,8 @@ export interface ResolveResult {
   warning?: string;
   /** True when this call listed or copied a plan key over the network. */
   exchangedLogin?: boolean;
+  /** Account-plan failure must not silently start a metered API provider. */
+  accountPlanUnavailable?: boolean;
 }
 
 interface TeamPlanRef {
@@ -334,7 +340,7 @@ function loadBuiltinProviderRules(binaryPath: string): Array<{
 }
 
 /** Overlay that entitles ZCode built-in account providers in this app-server process. */
-export function buildAccountProviderSync(binaryPath: string): {
+export function buildAccountProviderSync(binaryPath: string, runtime?: ResolvedRuntime | null): {
   revision: string;
   basedOnZCodeBuiltinRevision: string;
   providers: Record<string, unknown>;
@@ -350,13 +356,16 @@ export function buildAccountProviderSync(binaryPath: string): {
   }
   const hash = crypto.createHash("sha256").update(path.resolve(active)).digest("hex");
   const basedOn = `zcode-builtin:${fileRev}:${hash}`;
-  const current = currentAccountProviderId();
+  const family = runtime ? familyOfProvider(runtime.providerId) : null;
+  const current = runtime && family && isDesktopOauthProvider(runtime.providerId)
+    ? `account:${family}-${runtime.source === "desktop-team-oauth" ? "team-coding-plan" : kindOfProvider(runtime.providerId, "individual-coding-plan")}`
+    : currentAccountProviderId();
   const providers: Record<string, unknown> = {};
   const states: Record<string, unknown> = {};
   for (const rule of loadBuiltinProviderRules(binaryPath)) {
     const active = !rule.hidden && rule.providerId === current;
     providers[rule.providerId] = {
-      builtinModelIds: rule.builtinModelIds,
+      builtinModelIds: active && runtime?.providerId.includes("start-plan") ? Object.keys(runtime.models) : rule.builtinModelIds,
       access: { type: rule.accessType, entitled: active },
     };
     states[rule.providerId] = {
@@ -454,7 +463,7 @@ export function readPlanSelection(settings: V2Settings | null = readV2Settings()
       providerId: builtinPlanProviderId(domain, kind),
     };
   }
-  if (kind === "individual-coding-plan" || kind === "") {
+  if (kind === "individual-coding-plan") {
     return {
       family: domain,
       kind: "individual-coding-plan",
@@ -477,6 +486,7 @@ function kindOfProvider(providerId: string, fallback: PlanKind): PlanKind {
   if (providerId.includes("team-coding-plan")) return "team-coding-plan";
   if (providerId.includes("start-plan")) return "start-plan";
   if (providerId.includes("individual-coding-plan")) return "individual-coding-plan";
+  if (providerId.endsWith("-coding-plan")) return fallback === "team-coding-plan" ? fallback : "individual-coding-plan";
   return fallback;
 }
 
@@ -573,16 +583,17 @@ export async function resolveProviderRequestAuth(
   const family = familyOfProvider(providerId, plan?.family);
   if (!family) return null;
   const kind = kindOfProvider(providerId, plan?.kind ?? "individual-coding-plan");
+  if (kind === "start-plan") return readStartPlanAuth(family);
   if (kind === "team-coding-plan") {
     if (!plan?.team || plan.family !== family) return null;
     return tryPlanOAuth(family, plan.team, appVersion, rejectedFingerprint);
   }
-  if (!(kind !== "start-plan" && usesProjectTokens(appVersion))) {
+  if (!usesProjectTokens(appVersion)) {
     const stored = readStoredPlanApiKey(providerId.startsWith("account:")
       ? providerId : `account:${family}-${kind}`);
     if (stored) return { apiKey: stored };
   }
-  return tryPlanOAuth(family, undefined, kind === "start-plan" ? undefined : appVersion, rejectedFingerprint);
+  return tryPlanOAuth(family, undefined, appVersion, rejectedFingerprint);
 }
 
 function productPlanBaseUrl(family: PlanFamily, kind: PlanKind): string {
@@ -635,6 +646,12 @@ export function readCliDefaultModel(): { providerId: string; modelId: string } |
 }
 
 export function readConfiguredDefaultModel(runtime: ResolvedRuntime | null): { providerId: string; modelId: string } | undefined {
+  if (runtime?.providerId.includes("start-plan")) {
+    const family = familyOfProvider(runtime.providerId);
+    const account = `account:${family}-start-plan`;
+    const registered = loadBuiltinProviderRules(resolveBinaryPath()).some(rule => rule.providerId === account && !rule.hidden);
+    return { providerId: registered ? account : runtime.providerId, modelId: runtime.modelId };
+  }
   const cli = readCliDefaultModel();
   if (cli) return cli;
   // When the CLI has no default yet (common on a fresh Windows install),
@@ -1132,16 +1149,25 @@ export async function resolveRuntime(opts?: {
   const finish = (
     runtime: ResolvedRuntime,
     warning?: string
-  ): ResolveResult => ({
-    ok: true,
-    runtime,
-    picker,
-    disabledModelKeys: [...disabledModelKeys],
-    managedProviderIds: pickerResolution.managedProviderIds,
-    providerInventoryAuthoritative: pickerResolution.providerInventoryAuthoritative,
-    warning,
-    exchangedLogin,
-  });
+  ): ResolveResult => {
+    if (runtime.providerId.includes("start-plan")) {
+      for (let index = picker.length - 1; index >= 0; index--) {
+        if (picker[index].providerId === runtime.providerId) picker.splice(index, 1);
+      }
+      picker.push(...Object.keys(runtime.models).map(modelId => ({ providerId: runtime.providerId,
+        providerName: runtime.providerName, kind: runtime.kind, modelId, label: modelId, hasKey: true })));
+    }
+    return {
+      ok: true,
+      runtime,
+      picker,
+      disabledModelKeys: [...disabledModelKeys],
+      managedProviderIds: pickerResolution.managedProviderIds,
+      providerInventoryAuthoritative: pickerResolution.providerInventoryAuthoritative,
+      warning,
+      exchangedLogin,
+    };
+  };
 
   const fail = (reason: string, hint: string): ResolveResult => ({
     ok: false,
@@ -1152,6 +1178,8 @@ export async function resolveRuntime(opts?: {
     managedProviderIds: pickerResolution.managedProviderIds,
     providerInventoryAuthoritative: pickerResolution.providerInventoryAuthoritative,
     exchangedLogin,
+    accountPlanUnavailable: isPlanFamily(settings?.providerFamilyDomain)
+      && settings?.modelProviderFamilyModes?.[settings.providerFamilyDomain] !== "apiKey",
   });
 
   const tryStored = (
@@ -1160,8 +1188,7 @@ export async function resolveRuntime(opts?: {
     preferredModel?: string
   ): ResolvedRuntime | null => {
     if (!providerId) return null;
-    if (usesProjectTokens(opts?.appVersion) && /^(?:account|builtin):/.test(providerId) && isDesktopOauthProvider(providerId) &&
-        !providerId.includes("start-plan")) return null;
+    if (isDesktopOauthProvider(providerId)) return null;
     if (!isProviderInDesktopInventory(providerId)) return null;
     if (!isProviderRuntimeSelectable(providerId)) return null;
     const provider = providers[providerId];
@@ -1179,6 +1206,7 @@ export async function resolveRuntime(opts?: {
     );
   };
 
+  let personalPlanAbsent = false;
   const resolveOauth = async (
     family: PlanFamily,
     kind: PlanKind,
@@ -1186,12 +1214,43 @@ export async function resolveRuntime(opts?: {
     providerId: string,
     preferredModel?: string
   ): Promise<ResolvedRuntime | null> => {
+    if (kind === "individual-coding-plan") personalPlanAbsent = false;
+    if (kind === "start-plan") {
+      try {
+        exchangedLogin = true;
+        const access = await readStartPlanAccess(family, opts?.appVersion);
+        if (!access) return null;
+        const configured = providers[providerId] ?? fallbackPlanProvider(family, kind);
+        const models = access.models.length ? Object.fromEntries(access.models.map(id => [id, configured.models?.[id] ?? {}]))
+          : configured.models ?? {};
+        if (!Object.keys(models).length || (preferredModel && !Object.hasOwn(models, preferredModel))) return null;
+        const provider = { ...configured, kind: "anthropic", options: { baseURL: productPlanBaseUrl(family, kind) }, models };
+        return toRuntime(providerId, provider, preferredModel || Object.keys(models)[0], access.auth.apiKey, "desktop-personal-oauth");
+      } catch (error) {
+        logWarn("Start Plan access unavailable", planAuthErrorDetails(error));
+        return null;
+      }
+    }
     const provider = providers[providerId] ?? fallbackPlanProvider(family, kind);
     const modelId = pickSelectableModelId(providerId, provider, preferredModel);
     if (modelId === null) return null;
-    if (!prefer && !(kind !== "start-plan" && usesProjectTokens(opts?.appVersion))) {
+    const entitled = async (apiKey: string) => {
+      if (prefer) return true;
+      // Keep a resolved personal credential when the subscription service
+      // cannot confirm entitlement. The model endpoint still enforces access.
+      try {
+        personalPlanAbsent = (await hasPersonalCodingPlan(family, apiKey)) === false;
+        return !personalPlanAbsent;
+      }
+      catch (error) {
+        logWarn("Personal Coding Plan entitlement unavailable; keeping resolved credentials", planAuthErrorDetails(error));
+        return true;
+      }
+    };
+    if (!prefer && !usesProjectTokens(opts?.appVersion)) {
       const stored = await readStoredPlanApiKeyWithRetry(`account:${family}-${kind}`);
       if (stored) {
+        if (!(await entitled(stored))) return null;
         return toRuntime(
           providerId,
           provider,
@@ -1202,8 +1261,9 @@ export async function resolveRuntime(opts?: {
       }
     }
     exchangedLogin = true;
-    const oauth = await tryPlanOAuth(family, prefer, kind === "start-plan" ? undefined : opts?.appVersion);
+    const oauth = await tryPlanOAuth(family, prefer, opts?.appVersion);
     if (!oauth?.apiKey) return null;
+    if (!(await entitled(oauth.apiKey))) return null;
     return {
       ...toRuntime(providerId, provider, modelId, oauth.apiKey,
         prefer ? "desktop-team-oauth" : "desktop-personal-oauth"),
@@ -1217,7 +1277,11 @@ export async function resolveRuntime(opts?: {
   const selectedKey =
     (domain && settings?.modelProviderFamilySelectedKeys?.[domain]) || "";
   const team = parseTeamPlanKey(selectedKey);
-  const plan = readPlanSelection(settings);
+  const explicitPlan = readPlanSelection(settings);
+  const selectionKind = settings?.providerFamilyConnectionSelections?.[domain]?.kind;
+  const plan = explicitPlan ?? (isPlanFamily(domain) && mode !== "apiKey" && !selectionKind ? {
+    family: domain, kind: "individual-coding-plan" as const, providerId: builtinPlanProviderId(domain, "individual-coding-plan"),
+  } : null);
 
   const isOauthCodingPlan = (providerId: string) =>
     isDesktopOauthProvider(providerId) || providerId === team?.providerId;
@@ -1243,7 +1307,7 @@ export async function resolveRuntime(opts?: {
   }
   if (opts?.preferredProviderId && !preferredProviderUnavailable && !preferredModelUnavailable) {
     const pid = opts.preferredProviderId;
-    if (isOauthCodingPlan(pid) && (mode === "oauth" || team)) {
+    if (isOauthCodingPlan(pid) && (mode !== "apiKey" || team)) {
       const target = oauthTarget(pid, plan, team);
       if (!target) {
         return fail(
@@ -1251,13 +1315,16 @@ export async function resolveRuntime(opts?: {
           "Open the ZCode desktop app, make sure the team plan is selected, then Retry."
         );
       }
-      const picked = await resolveOauth(
+      let picked = await resolveOauth(
         target.family,
         target.kind,
         target.team,
         target.providerId,
         opts.preferredModelId
       );
+      if (!picked && !opts.strictPreferredProvider && target.kind === "individual-coding-plan" && personalPlanAbsent) {
+        picked = await resolveOauth(target.family, "start-plan", undefined, builtinPlanProviderId(target.family, "start-plan"));
+      }
       if (picked) {
         logInfo("Using OAuth coding/team plan selected in VS Code", {
           providerId: picked.providerId,
@@ -1314,19 +1381,25 @@ export async function resolveRuntime(opts?: {
         return finish(stored);
       }
       logWarn("Desktop is in API-key mode but no key is saved");
-    } else if (plan) {
-      const picked = await resolveOauth(
+    } else {
+      if (!plan) return fail("Could not reuse the desktop plan login", "Open the ZCode desktop app and select an available plan, then Retry.");
+      // Older desktop settings without a selection default to personal Coding
+      // Plan, including accounts that also have a free Start Plan.
+      let picked = await resolveOauth(
         plan.family,
         plan.kind,
         plan.team,
         plan.providerId
       );
+      // A stale personal default is not evidence of a Coding Plan subscription.
+      // Only the desktop's independent Start Plan entitlement can replace it.
+      if (!picked && plan.kind === "individual-coding-plan" && personalPlanAbsent) {
+        picked = await resolveOauth(plan.family, "start-plan", undefined, builtinPlanProviderId(plan.family, "start-plan"));
+      }
       if (picked) {
         logInfo("Reusing ZCode desktop OAuth selection", {
           domain,
-          kind: plan.kind,
-          organizationId: plan.team?.organizationId,
-          projectId: plan.team?.projectId,
+          kind: picked.providerId.includes("start-plan") ? "start-plan" : plan.kind,
           providerId: picked.providerId,
           modelId: picked.modelId,
         });

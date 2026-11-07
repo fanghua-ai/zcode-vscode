@@ -38,7 +38,7 @@ try {
         builder.onResolve({ filter: /^vscode$/ }, () => ({ path: path.resolve("src/testSupport/vscode.ts") }));
         builder.onResolve({ filter: /^\.\/log$/ }, () => ({ path: "log", namespace: "test" }));
         builder.onLoad({ filter: /.*/, namespace: "test" }, () => ({
-          contents: "export const logInfo=()=>{}, logWarn=()=>{}, logError=()=>{}, logDebug=()=>{}, getLog=()=>({show(){}}), disposeLog=()=>{};",
+          contents: "export const logInfo=()=>{}, logWarn=()=>{}, logError=()=>{}, logDebug=()=>{}, getLog=()=>({show(){}}), disposeLog=()=>{}, readRedactedLog=()=>'';",
         }));
       },
     }],

@@ -7,8 +7,16 @@ export class DiffDocuments implements vscode.TextDocumentContentProvider, vscode
 
   private readonly contents = new Map<string, string>();
 
+  private readonly closeListener = vscode.workspace.onDidCloseTextDocument(document => {
+    this.contents.delete(document.uri.toString());
+  });
+
   provideTextDocumentContent(uri: vscode.Uri): string {
     return this.contents.get(uri.toString()) ?? "";
+  }
+
+  release(uri: vscode.Uri): void {
+    this.contents.delete(uri.toString());
   }
 
   /** Build a unique URI whose path ends with the real filename for language mode. */
@@ -24,6 +32,7 @@ export class DiffDocuments implements vscode.TextDocumentContentProvider, vscode
   }
 
   dispose(): void {
+    this.closeListener.dispose();
     this.contents.clear();
   }
 }

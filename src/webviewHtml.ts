@@ -2066,7 +2066,10 @@ export function getWebviewHtml(
             <option value="en">English</option>
           </select>
         </div>
-        <button type="button" class="settings-action" id="copy-diagnostics">${t("复制诊断信息")}</button>
+        <button type="button" class="settings-action" id="copy-diagnostics" aria-describedby="diagnostics-export-help">${t("复制诊断信息")}</button>
+        <div class="settings-help" id="diagnostics-export-help">${t("复制或导出诊断信息时会自动脱敏；完成后请自行再检查一遍。")}</div>
+        <button type="button" class="settings-action" id="copy-log" aria-describedby="log-export-help">${t("复制日志")}</button>
+        <div class="settings-help" id="log-export-help">${t("复制本次窗口运行的近期日志并自动脱敏，分享前请再检查一遍。")}</div>
         <div class="settings-section">${t("问题跳转")}</div>
         <label class="settings-switch"><span>${t("显示问题跳转按钮")}</span><span class="switch"><input type="checkbox" id="show-question-jump" data-chrome="showQuestionJump"${chrome.showQuestionJump ? " checked" : ""}><i></i></span></label>
         <div class="settings-section">${t("额度")}</div>

@@ -26,7 +26,15 @@ export const window = {
 };
 export const recoveryCalls: Array<{command?:string;args?:unknown[];url?:string}> = [];
 export const commands = { registerCommand: disposable, async executeCommand(command:string,...args:unknown[]){recoveryCalls.push({command,args});} };
+const closedDocumentListeners = new Set<(document: { uri: { toString(): string } }) => void>();
+export const closeTestDocument = (uri: { toString(): string }) => {
+  for (const listener of closedDocumentListeners) listener({ uri });
+};
 export const workspace = {
+  onDidCloseTextDocument(listener: (document: { uri: { toString(): string } }) => void) {
+    closedDocumentListeners.add(listener);
+    return { dispose() { closedDocumentListeners.delete(listener); } };
+  },
   async findFiles() { return testFiles.map(fsPath => ({fsPath})); },
   getConfiguration() { return { get(key: string, fallback?: unknown) {
       if (key === "language") return languageSetting;

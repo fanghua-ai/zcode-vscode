@@ -1,4 +1,5 @@
 {
+  "diagnostics.exportHelp": "Copied or exported diagnostics are automatically redacted. Please review them again before sharing.",
   "command.showChromeSettings.title": "ZCode: Open display settings",
   "config.showSuppressedPluginSkills.description": "While those plugins are off, still list the document, PDF, presentation, spreadsheet, and browser skills in /. Choosing one does not send the skill. Enabling is remembered and later startups launch their MCP processes.",
   "command.setQuotaApiKey.title": "ZCode: Set quota API key",

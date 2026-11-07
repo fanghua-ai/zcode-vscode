@@ -154,6 +154,12 @@ export const messages: Record<string, string> = {
   "请等待图片添加完成，或移除失败的图片。": "Wait for images to finish uploading, or remove failed images.",
 
   "复制诊断信息": "Copy diagnostics",
+  "复制日志": "Copy log",
+  "复制本次窗口运行的近期日志并自动脱敏，分享前请再检查一遍。": "Copy recent logs from this window with automatic redaction. Review them before sharing.",
+  "日志已脱敏并复制，分享前请再检查一遍。": "Logs redacted and copied. Review them before sharing.",
+  "当前没有可复制的日志。": "There are no logs to copy yet.",
+  "复制或导出诊断信息时会自动脱敏；完成后请自行再检查一遍。": "Copied or exported diagnostics are automatically redacted. Please review them again before sharing.",
+  "诊断信息已脱敏并复制，请自行再检查一遍。": "Diagnostics redacted and copied. Please review them again before sharing.",
   "诊断信息已复制（不含聊天内容或登录凭据）。": "Diagnostics copied (no chat content or sign-in credentials).",
   "查看待处理请求": "View pending request",
   "需要批准 · 查看": "Approval needed · View",

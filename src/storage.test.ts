@@ -438,13 +438,14 @@ test("copy diagnostics uses an allowlist and omits credentials, session IDs and 
   };
   state.workspacePath = os.homedir() + "/项目";
   state.client = {diagnosticSummary: () => ({
-    binaryPath: "/missing/zcode.cjs", nodePath: os.homedir() + "/node", serverReady: true,
+    binaryPath: "/Users/MAC_PRIVATE/bin/zcode.cjs", nodePath: "C:\\Users\\WIN_PRIVATE\\node.exe", serverReady: true,
     sessionAttached: true, synchronizationFailures: 1, pendingPermissions: 1, pendingQuestions: 0,
     apiKey: "SECRET_CREDENTIAL", sessionId: "PRIVATE_SESSION_ID", chat: "PRIVATE_CHAT_CONTENT",
   })};
   state.post({type: "session_error", message: "snapshot PRIVATE_CHAT_CONTENT apiKey=SECRET_CREDENTIAL"});
   await state.copyDiagnostics();
   assert.ok(!copied.includes("SECRET_CREDENTIAL") && !copied.includes("PRIVATE_SESSION_ID") && !copied.includes("PRIVATE_CHAT_CONTENT"));
+  assert.doesNotMatch(copied, /MAC_PRIVATE|WIN_PRIVATE/);
   const report = JSON.parse(copied);
   assert.equal(report.extensionVersion, "1.3.6-local.test");
   assert.equal(report.workspace.effectivePath, "~/项目");

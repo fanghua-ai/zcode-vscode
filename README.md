@@ -1,6 +1,6 @@
 # ZCode Chat
 
-[中文](#中文) · [English](#english) · [更新日志 / Changelog](CHANGELOG.md) · [许可证 / License](LICENSE) · [第三方声明 / Third-party notices](THIRD-PARTY-NOTICES.txt) · [源码 / Source](https://github.com/fanghua-ai/zcode-vscode) · [问题反馈 / Issues](https://github.com/fanghua-ai/zcode-vscode/issues)
+[中文](#中文) · [English](#english) · [更新日志 / Changelog](https://github.com/fanghua-ai/zcode-vscode/blob/main/CHANGELOG.md) · [许可证 / License](https://github.com/fanghua-ai/zcode-vscode/blob/main/LICENSE) · [第三方声明 / Third-party notices](https://github.com/fanghua-ai/zcode-vscode/blob/main/THIRD-PARTY-NOTICES.txt) · [源码 / Source](https://github.com/fanghua-ai/zcode-vscode) · [问题反馈 / Issues](https://github.com/fanghua-ai/zcode-vscode/issues)
 
 ## 中文
 
@@ -43,7 +43,7 @@
 
 **Linux** 已测试，目前使用基本正常；**Windows** 已由作者实际测试，但仍发现过会话互不可见的适配问题；**macOS ARM64 和 Intel** 已通过 GitHub CI 的类型检查、完整单元测试、构建和打包检查，以及 VS Code 最低支持版 1.106.0 与当前稳定版中的 SQLite 扩展宿主回归。macOS 的真实账号登录、端到端聊天和界面体验仍待验证。[完整验证记录](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917427) · [SQLite 宿主验证记录](https://github.com/fanghua-ai/zcode-vscode/actions/runs/41789711444)
 
-本版本支持 **ZCode 桌面端 3.12.3–3.16.3**。已验证 3.12.3、3.14.4 和 3.16.3；3.14.4 已完成真实会话切换与停止回归，3.16.2 起适配了会话列表协议变化。更早或更新的桌面版本不在支持范围内。
+常规兼容范围为 **ZCode 桌面端 3.12.3–3.16.3**。已验证 3.12.3、3.14.4 和 3.16.3；3.14.4 已完成真实会话切换与停止回归，3.16.2 起适配了会话列表协议变化。另已在 Windows 上验证 **3.17.1** 的 BigModel 免费 Start Plan 登录、模型选择和发送消息。
 
 2.0.2 进一步适配桌面端 **3.16.2** 的 Coding Plan 鉴权和自定义 API 配置。3.16.2 已通过隔离配置下的真实运行时会话切换、停止和附件回归；Z.AI 个人套餐仍需真实账号验证；macOS 的 CI 验证不包含桌面端真实账号聊天。
 
@@ -68,7 +68,7 @@
 
 市场有两条更新通道：
 
-- **稳定版**使用偶数次版本号，当前是 **2.2.0**。直接安装会留在稳定版，不会自动升到预览版。
+- **稳定版**使用偶数次版本号，当前是 **2.2.1**。直接安装会留在稳定版，不会自动升到预览版。
 - **预览版**使用奇数次版本号。只有在扩展页面选择 **Install Pre-Release Version**，或执行 `code --install-extension fanghua.zcode-desktop-chat --pre-release` 的用户才会安装预览版，并继续接收更高的预览版。之后若发布更高版本号的稳定版，预览版会被该稳定版替换。
 
 也可以手动安装 VSIX。文件名是 `zcode-desktop-chat-<版本>.vsix`，请选择与要安装的稳定版或预览版一致的文件：
@@ -308,7 +308,7 @@ For development and contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). This 
 
 **Linux** has been tested and is currently working well. **Windows** has been tested by the author, but session visibility issues have still been found. **macOS ARM64 and Intel** have passed type checks, the full unit suite, builds and package checks in GitHub CI, plus SQLite regression tests inside real VS Code extension hosts on the minimum supported version 1.106.0 and the current stable version. Real-account sign-in, end-to-end chat and the UI experience on macOS still need verification. [Full verification](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917427) · [SQLite host verification](https://github.com/fanghua-ai/zcode-vscode/actions/runs/41789711444)
 
-This version supports **ZCode desktop 3.12.3-3.16.3**. Versions 3.12.3, 3.14.4, and 3.16.3 have been verified; 3.14.4 completed real session-switching and stop-behavior checks, and the session-list protocol change starting in 3.16.2 is handled. Earlier or newer desktop versions are outside the supported range.
+The general compatibility range is **ZCode desktop 3.12.3–3.16.3**. Versions 3.12.3, 3.14.4, and 3.16.3 have been verified. Session switching and stopping were tested on 3.14.4, and the extension handles the session-list protocol change introduced in 3.16.2. Sign-in, model selection, and messaging with a free BigModel Start Plan were also verified on **3.17.1** on Windows.
 
 Version 2.0.2 also adapts Coding Plan authentication and custom API configuration for desktop **3.16.2**. Its actual runtime has passed session-switching, stop, and attachment regressions with isolated fixtures. Z.AI personal plans still need real-account validation; macOS CI does not cover real-account desktop chat.
 
@@ -333,7 +333,7 @@ Search for **ZCode Chat** by **fanghua** in the VS Code Extensions Marketplace, 
 
 The Marketplace has two update channels:
 
-- **Stable** releases use an even minor version. The current stable release is **2.2.0**. A normal install stays on stable and is not upgraded to a preview.
+- **Stable** releases use an even minor version. The current stable release is **2.2.1**. A normal install stays on stable and is not upgraded to a preview.
 - **Preview** releases use an odd minor version. Only users who choose **Install Pre-Release Version** on the extension page, or run `code --install-extension fanghua.zcode-desktop-chat --pre-release`, receive a preview and later higher previews. A later stable release with a higher version replaces the preview.
 
 You can also install a VSIX manually. Its name is `zcode-desktop-chat-<version>.vsix`; choose the file for the stable or preview release you want:

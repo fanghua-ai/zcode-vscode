@@ -27,7 +27,7 @@ import {
   workspaceObject,
 } from "./desktop";
 import { fetchPlanQuota, invalidatePlanAuth, type PlanQuotaLimit, type QuotaLine, type PlanAuth } from "./credentials";
-import { desktopVersion } from "./diagnostics";
+import { desktopVersion, modelFailureDetails, recordDiagnosticEvent } from "./diagnostics";
 import { DESKTOP_PLUGIN_OVERLAY_ENV } from "./desktopPluginOverlay";
 import { appServerLaunch, startupExitMessage } from "./serverPath";
 import { StartupTiming } from "./startupTiming";
@@ -287,6 +287,7 @@ export interface ZCodeEvent {
 
 export interface ZCodeClientOptions {
   binaryPath: string;
+  desktopAppVersion?: string | null;
   nodePath?: string;
   workspacePath: string;
   env?: Record<string, string>;
@@ -383,6 +384,8 @@ export class ZCodeClient {
   private slashCommands: Array<{ name: string; description: string; inputHint: string }> = [];
   private defaultRuntime: ResolvedRuntime | null;
   private sessionRuntime: ResolvedRuntime | null;
+  /** Keep a failed Start setup from retrying with a stale paid/personal default. */
+  private startSessionRuntime: ResolvedRuntime | null = null;
   private runtimeNeedsRevalidation = false;
   private pendingPermissions = new Map<string, PermissionRequest>();
   private pendingUserInputs = new Map<string, UserInputRequest>();
@@ -474,7 +477,7 @@ export class ZCodeClient {
 
   constructor(opts: ZCodeClientOptions) {
     this.opts = opts;
-    this.desktopAppVersion = desktopVersion(opts.binaryPath);
+    this.desktopAppVersion = opts.desktopAppVersion === undefined ? desktopVersion(opts.binaryPath) : opts.desktopAppVersion;
     this.defaultRuntime = opts.runtime ?? null;
     this.sessionRuntime = opts.runtime ?? null;
   }
@@ -723,12 +726,13 @@ export class ZCodeClient {
       ...process.env,
       ...appServerEnv(binaryPath),
       ...(this.opts.env ?? {}),
+      ...(this.desktopAppVersion ? { ZCODE_APP_VERSION: this.desktopAppVersion } : {}),
       ...(preloadPath && args[0] === "--require" ? { [DESKTOP_PLUGIN_OVERLAY_ENV]: "1", ZCODE_VSCODE_ALLOWED_PLUGINS: JSON.stringify(this.opts.allowedDesktopPlugins ?? []) } : {}),
     }, this.opts.compileCachePath);
     this.activeTiming?.note("runtimeCompileCacheRequested", !!env.NODE_COMPILE_CACHE && env.NODE_DISABLE_COMPILE_CACHE !== "1");
     if (launch.electronAsNode) env.ELECTRON_RUN_AS_NODE = "1";
 
-    logInfo("Starting app-server", { cmd, args, cwd: workspacePath });
+    logInfo("Starting app-server", { cmd, args, cwd: workspacePath, appVersion: env.ZCODE_APP_VERSION ?? null });
 
     this.startupError = null;
     this.serverReady = false;
@@ -865,7 +869,8 @@ export class ZCodeClient {
   }
 
   private async syncAccountProviders(): Promise<void> {
-    const payload = buildAccountProviderSync(this.opts.binaryPath);
+    await this.awaitStartupLogin();
+    const payload = buildAccountProviderSync(this.opts.binaryPath, this.defaultRuntime);
     if (!payload) return;
     const started = Date.now();
     try {
@@ -1088,6 +1093,7 @@ export class ZCodeClient {
     this.liveModelReady = false;
 
     const createdRuntime = this.defaultRuntime;
+    this.startSessionRuntime = createdRuntime?.providerId.includes("start-plan") ? createdRuntime : null;
     this.setSessionModel(createdRuntime ? { providerId: createdRuntime.providerId, modelId: createdRuntime.modelId } : null);
     this.sessionRuntime = createdRuntime;
     const created = await this.sendRequest("session/create", {
@@ -1122,6 +1128,7 @@ export class ZCodeClient {
   private async resumeSessionInner(sessionId: string, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
     await this.modeChanges.get(sessionId)?.catch(() => {});
     const changingSession = this.sessionId !== sessionId;
+    if (changingSession) this.startSessionRuntime = null;
     this.releaseStopWait();
     this.runtimeNeedsRevalidation = true;
     this.sessionGeneration++;
@@ -1322,7 +1329,9 @@ export class ZCodeClient {
           sub?.snapshot?.settings?.model?.current ||
           sub?.session?.model
       );
-      if (snapModel) {
+      const matchesStart = !requestedRuntime?.providerId.includes("start-plan") || (snapModel &&
+        sameDesktopLogin(requestedRuntime, snapModel.providerId) && Object.hasOwn(requestedRuntime.models, snapModel.modelId));
+      if (snapModel && matchesStart) {
         await this.alignAndEmitModel(snapModel);
         this.liveModelReady = true;
       }
@@ -1331,7 +1340,7 @@ export class ZCodeClient {
     }
 
     try {
-      if (kind === "created" && !this.liveModelReady && attachedSnapshot?.settings?.model?.available?.length === 0) {
+      if (kind === "created" && !requestedRuntime?.providerId.includes("start-plan") && !this.liveModelReady && attachedSnapshot?.settings?.model?.available?.length === 0) {
         // Announce the created identity first: the host persists its workspace
         // metadata on session_ready. Configuring a shell before that can make
         // even valid providers appear absent from the workspace registry.
@@ -1342,7 +1351,7 @@ export class ZCodeClient {
         const registered = available.find(model => !model.disabledReason &&
           model.providerId === requestedRuntime.providerId && model.modelId === requestedRuntime.modelId);
         if (registered) await this.setModel(registered.providerId, registered.modelId);
-        else await this.ensureSessionModel(attachedSnapshot);
+        else await this.ensureSessionModel(attachedSnapshot, requestedRuntime.providerId.includes("start-plan") ? requestedRuntime : undefined);
       } else await this.ensureSessionModel(attachedSnapshot);
     } catch (e) {
       logWarn("Could not apply model to session", e);
@@ -2039,6 +2048,11 @@ export class ZCodeClient {
     const data = { sessionId: this.sessionId, status, message };
     const key = JSON.stringify(data);
     if (!force && key === this.projectionStatusKey) return;
+    if (status === "error" && key !== this.projectionStatusKey) {
+      const details = modelFailureDetails(this.replica?.control?.lastError);
+      logWarn("Model turn failed", details);
+      recordDiagnosticEvent("model_turn_failed", details);
+    }
     this.projectionStatusKey = key;
     this.opts.onEvent({ type: "status", data });
   }
@@ -2148,7 +2162,7 @@ export class ZCodeClient {
         // question, so it stays its own item and paints between replies.
         items.push({ id, role: "assistant", text: "", ...timing, running: false, tools: [], steps: [modelStep] });
       } else if (row.kind === "toolCall") {
-        const inputText = row.inputText ?? (row.input ? JSON.stringify(row.input) : "");
+        const inputText = row.inputText || (row.input ? JSON.stringify(row.input) : "");
         const tool = { toolCallId: row.toolCallId, toolName: row.toolName ?? "Tool",
           status: mapToolStatus(row.status ?? "running"), inputText, outputText: row.output?.text,
           fileChange: parseFileChange(row.toolName ?? "", row.input) ?? undefined };
@@ -2440,7 +2454,18 @@ export class ZCodeClient {
       }
       if (!this.viewVisible || !isCurrent() || !isModelCurrent() || request !== this.quotaRequest) return;
     }
-    const plan = this.opts.readQuotaPlan ? this.opts.readQuotaPlan() : readPlanSelection();
+    let plan = this.opts.readQuotaPlan ? this.opts.readQuotaPlan() : readPlanSelection();
+    if (model?.providerId.includes("start-plan")) {
+      const family = model.providerId.includes("bigmodel") ? "bigmodel" : model.providerId.includes("zai") ? "zai" : null;
+      plan = family ? { family, kind: "start-plan", providerId: model.providerId } : null;
+    } else if (model?.providerId.includes("individual-coding-plan") ||
+        (!plan && model?.providerId.endsWith("-coding-plan") && this.reusableRuntime(model)?.source === "desktop-personal-oauth")) {
+      const family = model.providerId.includes("bigmodel") ? "bigmodel" : model.providerId.includes("zai") ? "zai" : null;
+      plan = family ? { family, kind: "individual-coding-plan", providerId: model.providerId } : null;
+    } else if (model?.providerId.includes("team-coding-plan") &&
+        (plan?.kind !== "team-coding-plan" || !model.providerId.includes(plan.family))) {
+      plan = null;
+    }
     if (!plan) {
       if (this.lastQuota.length > 0 || this.lastPlanQuota.length > 0) {
         this.lastPlanQuota = [];
@@ -2489,7 +2514,7 @@ export class ZCodeClient {
     }
   }
 
-  private async ensureSessionModel(attachedSnapshot?: SessionSnapshot): Promise<void> {
+  private async ensureSessionModel(attachedSnapshot?: SessionSnapshot, startRuntime = this.startSessionRuntime ?? undefined): Promise<void> {
     if (this.liveModelReady) return;
     const isCurrent = this.sessionScope();
     // The attach path has already subscribed and checked the resume revision.
@@ -2506,7 +2531,9 @@ export class ZCodeClient {
       this.noteRevision(snapshot.runtime?.stateRevision);
     }
     const current = extractModel(snapshot?.settings?.model?.current) || extractModel(snapshot?.session?.model);
-    if (current) {
+    const matchesStart = (model: { providerId: string; modelId: string }) => !startRuntime ||
+      (sameDesktopLogin(startRuntime, model.providerId) && Object.hasOwn(startRuntime.models, model.modelId));
+    if (current && matchesStart(current)) {
       await this.alignAndEmitModel(current);
       if (!isCurrent()) return;
       this.liveModelReady = true;
@@ -2518,11 +2545,15 @@ export class ZCodeClient {
       ...(cliDefault ? [cliDefault] : []),
       ...catalog.available.filter((m) => !m.disabledReason),
       ...(Array.isArray(snapshot?.settings?.model?.available) ? [] : listStoredProviderModels()),
-    ];
+    ].filter(matchesStart);
     // Cold sessions advertise an empty registry before the first send loads
     // their workspace profile. The backend resolves its configured default
     // after its identity is persisted; an empty shell is not evidence of an invalid model.
     if (!tries.length && Array.isArray(snapshot?.settings?.model?.available) && !snapshot.settings.model.available.length) {
+      if (startRuntime) {
+        if (reusable) return this.ensureSessionModel(undefined, startRuntime);
+        throw new LocalizedError("暂时没有可用的模型。");
+      }
       if (reusable) return this.ensureSessionModel();
       return;
     }
@@ -2537,7 +2568,7 @@ export class ZCodeClient {
           logWarn("Could not validate default model against desktop inventory", m.providerId, m.modelId, error);
         }
         if (!isCurrent()) return;
-        if (runtime === false) {
+        if (runtime === false || (startRuntime && this.opts.resolveSessionRuntime && !runtime)) {
           logWarn("Skipping unavailable default model", m.providerId, m.modelId);
           continue;
         }
@@ -2552,7 +2583,7 @@ export class ZCodeClient {
     if (isCurrent()) {
       // An empty workspace registry may populate only during the first model
       // operation. Refresh once before ruling out the attached candidates.
-      if (reusable) return this.ensureSessionModel();
+      if (reusable) return this.ensureSessionModel(undefined, startRuntime);
       throw lastError ?? new LocalizedError("暂时没有可用的模型。");
     }
   }
@@ -2638,6 +2669,7 @@ export class ZCodeClient {
     }
     await this.alignAndEmitModel({ providerId, modelId });
     if (!isCurrent()) return;
+    if (!providerId.includes("start-plan")) this.startSessionRuntime = null;
     this.liveModelReady = true;
     // Thought levels depend on the model that was just selected. The subscribe
     // snapshot was taken before that, so the next controls read must hit the server.
@@ -3657,13 +3689,15 @@ export class ZCodeClient {
         delta?: string;
         title?: string;
         toolName?: string;
+        toolCallId?: string;
+        input?: unknown;
         status?: string;
         message?: string;
       };
     };
 
     if (!p?.type) return;
-    if (p.type === "model.streaming") return;
+    if (p.type === "model.streaming" && p.payload?.kind !== "tool_call") return;
     if (p.sessionId === this.sessionId && this.projectionPhase() && (p.type === "turn.started" || p.type === "turn.completed" || p.type === "turn.failed")) {
       if (p.type !== "turn.started") void this.resyncConversation();
       return;
@@ -3674,6 +3708,14 @@ export class ZCodeClient {
       return;
     }
     if (p.sessionId && this.sessionId && p.sessionId !== this.sessionId) return;
+
+    if (p.type === "model.streaming") {
+      // Scheduled events may omit input already delivered by this stream.
+      if (p.payload?.toolCallId && p.payload.input !== undefined) {
+        this.emitToolCall(normalizeToolUpdated({ ...p.payload, kind: "scheduled" }));
+      }
+      return;
+    }
 
     if (p.type === "session.updated" && p.payload) {
       this.emitContextUsage(p.payload);
@@ -3709,6 +3751,7 @@ export class ZCodeClient {
         payload?.message ||
         "The model failed to complete this turn";
       logWarn("turn.failed", message, payload?.error);
+      recordDiagnosticEvent("model_turn_failed", modelFailureDetails({ ...payload?.error, message }));
       this.opts.onEvent({
         type: "session_error",
         data: { message },

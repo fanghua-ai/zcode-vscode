@@ -614,37 +614,57 @@ function quotaAt(row: unknown, mapping: QuotaLimitCalculation): { remainingCount
 
 function requestJson(url: URL, method: "GET" | "POST", headers: Record<string, string>, body?: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let request: import("http").ClientRequest | undefined;
+    let responseBody: import("http").IncomingMessage | undefined;
+    const finish = (error?: QuotaAdapterError, value?: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      if (error) {
+        reject(error);
+        responseBody?.destroy?.();
+        request?.destroy();
+      } else resolve(value);
+    };
+    const deadline = setTimeout(() => finish(new QuotaAdapterError("request-failed")), 10_000);
     const transport = url.protocol === "https:" ? https : http;
-    const request = transport.request(url, { method, headers, timeout: 10_000 }, response => {
-      if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
-        response.resume();
-        reject(new QuotaAdapterError("request-failed"));
-        return;
-      }
-      const chunks: Buffer[] = [];
-      let size = 0;
-      response.on("data", (chunk: Buffer | string) => {
-        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        size += bytes.byteLength;
-        if (size > MAX_RESPONSE_BYTES) {
-          request.destroy();
-          reject(new QuotaAdapterError("bad-response"));
+    try {
+      request = transport.request(url, { method, headers, timeout: 10_000 }, response => {
+        responseBody = response;
+        response.on("aborted", () => finish(new QuotaAdapterError("request-failed")));
+        response.on("close", () => { if (response.complete === false) finish(new QuotaAdapterError("request-failed")); });
+        if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+          response.resume();
+          finish(new QuotaAdapterError("request-failed"));
           return;
         }
-        chunks.push(bytes);
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on("data", (chunk: Buffer | string) => {
+          if (settled) return;
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += bytes.byteLength;
+          if (size > MAX_RESPONSE_BYTES) {
+            finish(new QuotaAdapterError("bad-response"));
+            return;
+          }
+          chunks.push(bytes);
+        });
+        response.on("end", () => {
+          if (settled) return;
+          try {
+            finish(undefined, JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown);
+          } catch {
+            finish(new QuotaAdapterError("bad-response"));
+          }
+        });
+        response.on("error", () => finish(new QuotaAdapterError("request-failed")));
       });
-      response.on("end", () => {
-        try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown);
-        } catch {
-          reject(new QuotaAdapterError("bad-response"));
-        }
-      });
-      response.on("error", () => reject(new QuotaAdapterError("request-failed")));
-    });
-    request.on("timeout", () => request.destroy(new QuotaAdapterError("request-failed")));
-    request.on("error", () => reject(new QuotaAdapterError("request-failed")));
-    request.end(body);
+      request.on("timeout", () => finish(new QuotaAdapterError("request-failed")));
+      request.on("error", () => finish(new QuotaAdapterError("request-failed")));
+      request.end(body);
+    } catch { finish(new QuotaAdapterError("request-failed")); }
   });
 }
 

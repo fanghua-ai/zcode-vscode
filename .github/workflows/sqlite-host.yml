@@ -2,7 +2,7 @@ name: SQLite host compatibility
 
 on:
   push:
-    branches: [main, 'codex/test-sqlite-*']
+    branches: [main, preview, 'codex/test-sqlite-*']
   pull_request:
     paths:
       - 'src/taskIndex.ts'

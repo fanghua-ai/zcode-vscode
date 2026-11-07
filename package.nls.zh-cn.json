@@ -1,4 +1,5 @@
 {
+  "diagnostics.exportHelp": "复制或导出诊断信息时会自动脱敏；完成后请自行再检查一遍。",
   "command.showChromeSettings.title": "ZCode: 打开显示设置",
   "config.showSuppressedPluginSkills.description": "这些插件关闭时，仍在 / 菜单列出文档、PDF、演示文稿、表格和浏览器技能。选中后不发送该技能。启用会记住，之后启动会拉起这些 MCP。",
   "command.setQuotaApiKey.title": "ZCode: 设置额度 API Key",

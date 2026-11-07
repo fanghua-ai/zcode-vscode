@@ -2,7 +2,7 @@ import { cacheDraftPreview, forgetDraftPreview, cacheImageThumbnail } from "../d
 import { errorGuidance } from "../errorGuidance";
 import { lucideIcon } from "../lucideIcons";
 import { fileMentions, type MentionChoice } from "./fileMentions";
-import { renderMessageImages, clearMessageThumbnailLoads, renderDraftImages, imageThumbnail, showImagePreview, showDraftPreview, refreshImageLabels, CLOSE, type ImageTarget } from "./imageAttachments";
+import { renderMessageImages, clearMessageThumbnailLoads, renderDraftImages, imageThumbnail, showImagePreview, closeImagePreview, showDraftPreview, refreshImageLabels, CLOSE, type ImageTarget } from "./imageAttachments";
 import { readImageAttachments, IMAGE_MAX_BYTES, IMAGE_MAX_COUNT, IMAGE_MIMES, type DraftImage, type ImageAttachment } from "../attachmentTypes";
 import { greetingKey, nextGreetingDelay } from "../greeting";
 import { EMPTY_LOGO } from "./emptyLogo";
@@ -390,7 +390,10 @@ function persistComposerDraft(): void {
   vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId });
 }
 
+let inputHistory: { texts: string[]; index: number; original: string } | undefined;
+
 function restoreComposerDraft(draft: ComposerDraft): void {
+  inputHistory = undefined;
   draftPlanEnabled = draft.planEnabled === true;
   const restored = draft.skills?.length ? { text: draft.text, skills: draft.skills } : extractLeadingSkills(draft.text);
   const persisted = /^\/([a-zA-Z][a-zA-Z0-9_-]*) ([\s\S]*)$/.exec(restored.text);
@@ -428,7 +431,7 @@ function prepareComposerSwitch(): void {
   previewRequest = "";
   for(const request of thumbnailRequests.values())request.resolve(undefined);
   thumbnailRequests.clear();
-  document.getElementById("image-preview")?.remove();
+  closeImagePreview();
   // Repeated reset notifications must not erase typing during the handoff.
   if (holdStreams && draftSessionId === "") return;
   persistComposerDraft();
@@ -2798,7 +2801,7 @@ function upsertGitCard(bubble: HTMLElement, turn: ConversationTurn): void {
   let card = messagesEl.querySelector<HTMLElement>(
     `.git-changes[data-turn-id="${CSS.escape(turn.turnId)}"]`
   );
-  const signature = `${change.summary.files}:${change.summary.additions}:${change.summary.deletions}:${change.summary.state ?? ""}:${change.canRewind ? 1 : 0}`;
+  const signature = `${change.target.rowId}:${change.target.entityId}:${change.summary.files}:${change.summary.additions}:${change.summary.deletions}:${change.summary.state ?? ""}:${change.canRewind ? 1 : 0}`;
   if (!card) {
     card = document.createElement("div");
     card.className = "git-changes";
@@ -2837,6 +2840,7 @@ function upsertGitCard(bubble: HTMLElement, turn: ConversationTurn): void {
   }
   const rewind = card.querySelector<HTMLButtonElement>(".git-rewind");
   if (rewind) rewind.hidden = !change.canRewind;
+  delete card.dataset.fileRequestId;
   gitFileLists.delete(turn.turnId);
   if (card.classList.contains("open")) requestGitFiles(card);
 }
@@ -2925,14 +2929,12 @@ function requestGitFiles(card: HTMLElement): void {
   const turnId = card.dataset.turnId || "";
   const body = card.querySelector<HTMLElement>(".git-body");
   if (!body) return;
-  const cached = gitFileLists.get(turnId);
-  if (cached) {
-    renderGitFiles(body, cached);
-    return;
-  }
   body.innerHTML = `<div class="git-loading">${t("正在读取文件变更…")}</div>`;
+  const requestId = crypto.randomUUID();
+  card.dataset.fileRequestId = requestId;
   post({
     type: "loadFileChanges",
+    requestId,
     turnId,
     rowId: Number(card.dataset.rowId),
     entityId: card.dataset.entityId,
@@ -3076,10 +3078,11 @@ function openLocalReview(card: HTMLElement, row: HTMLElement | null): void {
   post({ type: "openDiff", fileChange: file.change });
 }
 
-function showGitFiles(turnId: string, files: GitFileChange[], error?: string): void {
+function showGitFiles(turnId: string, files: GitFileChange[], error?: string, requestId?: string): void {
   const card = messagesEl.querySelector<HTMLElement>(
     `.git-changes[data-turn-id="${CSS.escape(turnId)}"]`
   );
+  if (requestId && card?.dataset.fileRequestId !== requestId) return;
   const body = card?.querySelector<HTMLElement>(".git-body");
   if (!body) return;
   if (error) {
@@ -3369,7 +3372,7 @@ function adoptTrailingAnswer(fullText: string): void {
 // Desktop-parity command glyphs, traced from the app's lucide icon set.
 const GOAL_ICON = '<svg class="timeline-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 13V2l8 4-8 4"/><path d="M20.561 10.222a9 9 0 1 1-12.55-5.29"/><path d="M8.002 9.997a5 5 0 1 0 8.9 2.02"/></svg>';
 /** lucide loader — the 8-ray glyph the desktop spins while a turn is working. */
-const WORKING_SPINNER = '<svg class="working-spinner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path opacity=".95" d="M12 2v4"/><path opacity=".83" d="m16.2 7.8 2.9-2.9"/><path opacity=".71" d="M18 12h4"/><path opacity=".59" d="m16.2 16.2 2.9 2.9"/><path opacity=".47" d="M12 18v4"/><path opacity=".35" d="m4.9 19.1 2.9-2.9"/><path opacity=".23" d="M2 12h4"/><path opacity=".15" d="m4.9 4.9 2.9 2.9"/></svg>';
+const WORKING_SPINNER = '<svg class="working-spinner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path opacity=".95" d="M12 2v4"/><path opacity=".15" d="m16.2 7.8 2.9-2.9"/><path opacity=".23" d="M18 12h4"/><path opacity=".35" d="m16.2 16.2 2.9 2.9"/><path opacity=".47" d="M12 18v4"/><path opacity=".59" d="m4.9 19.1 2.9-2.9"/><path opacity=".71" d="M2 12h4"/><path opacity=".83" d="m4.9 4.9 2.9 2.9"/></svg>';
 const SWITCH_ICON = '<svg class="timeline-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg>';
 const COMPACT_ICON = '<svg class="timeline-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 20v-4"/><path d="M7 4v4"/><path d="M17 20v-4"/><path d="M17 4v4"/><path d="M3 12h18"/><path d="m7 8 5-4 5 4"/><path d="m7 16 5 4 5-4"/></svg>';
 /** Default command glyph: lucide square-pen, used by custom commands. */
@@ -4283,6 +4286,30 @@ function fillPlanCardEl(
   }
 }
 
+function revealToolDetails(header: HTMLElement, firstTool?: HTMLElement): void {
+  requestAnimationFrame(() => {
+    if (!header.isConnected || header.getAttribute("aria-expanded") !== "true") return;
+    const details = firstTool ?? header.parentElement?.querySelector<HTMLElement>(":scope > .tool-body");
+    if (!details?.isConnected) return;
+    // Reveal the command's beginning through both scrollports. Long output
+    // must not push the clicked header out of view or scroll its own contents.
+    const work = header.closest<HTMLElement>(".work-fold-body");
+    for (const viewport of [work, messagesEl]) {
+      if (!viewport) continue;
+      const bounds = viewport.getBoundingClientRect();
+      const top = bounds.top + (viewport === messagesEl ? messagesChromeTop() : 0);
+      const inputTop = (!questionRail.hidden ? questionRail : composerEl.querySelector(".composer-card") ?? composerEl).getBoundingClientRect().top;
+      const bottom = Math.min(bounds.bottom, inputTop) - 8;
+      const headerTop = header.getBoundingClientRect().top;
+      const detailRect = details.getBoundingClientRect();
+      if (detailRect.top < bottom - 32) continue;
+      const previewBottom = Math.min(detailRect.bottom, headerTop + Math.min(Math.max(0, bottom - top), 180));
+      const delta = Math.min(previewBottom - bottom, headerTop - top);
+      if (delta > 0) viewport.scrollTop += delta;
+    }
+  });
+}
+
 function fillToolCallEl(
   el: HTMLElement,
   data: {
@@ -4316,7 +4343,8 @@ function fillToolCallEl(
   const rawOutput = data.outputText || el.dataset.rawOutput || prevOutput;
   el.dataset.rawOutput = rawOutput;
   const outputText = /(?:^|[.:])analyze_image$/i.test(toolName) ? formatImageAnalysisOutput(rawOutput) : prettifyToolIo(rawOutput);
-  const change = data.fileChange;
+  if (data.fileChange) el.dataset.fileChange = JSON.stringify(data.fileChange);
+  const change: FileChange | undefined = data.fileChange ?? (el.dataset.fileChange ? JSON.parse(el.dataset.fileChange) : undefined);
   const previousCategory = el.dataset.processCategory;
   const category = processCategory(toolName, inputText);
   el.dataset.processCategory = category;
@@ -4344,7 +4372,7 @@ function fillToolCallEl(
       displayInput=JSON.stringify(parameters,null,2);
     } catch { displayInput=t("正在接收参数…"); }
   }
-  if (change && change.kind !== "read") noteLocalFile(change, el);
+  if (change && change.kind !== "read" && status === "completed") noteLocalFile(change, el);
   const fileHtml =
     change && change.kind === "read"
       ? `<div class="file-change">
@@ -4373,21 +4401,74 @@ function fillToolCallEl(
     !hideIo && outputText ? `${imageAnalysis ? `<div class="tool-section-label" ${uiLabelAttributes("结果")}>${t("结果")}</div>` : ""}<div class="tool-io out">${escapeText(outputText)}</div>` : ""
   }${fileHtml}`;
   el.classList.toggle("collapsed", !expanded);
-  el.innerHTML = `<button type="button" class="tool-head" aria-expanded="${expanded ? "true" : "false"}">${processIcon(shellCall ? "terminal" : category)}<span class="tool-name" ${category === "tool" && !imageAnalysis ? "" : uiLabelAttributes(imageAnalysis ? "分析图片" : labelKey)}>${escapeText(imageAnalysis ? t("分析图片") : category === "tool" ? toolName : t(labelKey))}</span><span class="tool-preview" title="${escapeText(imageAnalysis ? "" : preview || toolName)}">${escapeText(imageAnalysis ? "" : preview || toolName)}</span><span class="tool-status ${escapeText(status)}" ${uiLabelAttributes(toolStatusKey(status))}>${escapeText(t(toolStatusKey(status)))}</span><svg class="process-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button><div class="tool-body">${bodyHtml}</div>`;
+  const markup = `<button type="button" class="tool-head" aria-expanded="${expanded ? "true" : "false"}">${processIcon(shellCall ? "terminal" : category)}<span class="tool-name" ${category === "tool" && !imageAnalysis ? "" : uiLabelAttributes(imageAnalysis ? "分析图片" : labelKey)}>${escapeText(imageAnalysis ? t("分析图片") : category === "tool" ? toolName : t(labelKey))}</span><span class="tool-preview" title="${escapeText(imageAnalysis ? "" : preview || toolName)}">${escapeText(imageAnalysis ? "" : preview || toolName)}</span><span class="tool-status ${escapeText(status)}" ${uiLabelAttributes(toolStatusKey(status))}>${escapeText(t(toolStatusKey(status)))}</span><svg class="process-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button><div class="tool-body">${bodyHtml}</div>`;
+  const head = el.querySelector<HTMLButtonElement>(":scope > .tool-head");
+  const body = el.querySelector<HTMLElement>(":scope > .tool-body");
+  if (head && body) {
+    // Keep the click target alive while progress arrives between pointer down/up.
+    const template = document.createElement("template");
+    template.innerHTML = markup;
+    const nextHead = template.content.querySelector<HTMLButtonElement>(".tool-head")!;
+    const currentPreview = head.querySelector<HTMLElement>(".tool-preview")!;
+    const nextPreview = nextHead.querySelector<HTMLElement>(".tool-preview")!;
+    const nextTitle = nextPreview.title;
+    // Hover temporarily clears the native title. Ignore that presentation
+    // difference so an output update cannot replace the hovered element.
+    nextPreview.title = currentPreview.title;
+    if (head.innerHTML !== nextHead.innerHTML) {
+      currentPreview.textContent = nextPreview.textContent;
+      nextPreview.replaceWith(currentPreview);
+      head.replaceChildren(...nextHead.childNodes);
+    }
+    if ((currentPreview.dataset.tipBackup ?? currentPreview.title) !== nextTitle) {
+      setTitled(currentPreview, nextTitle);
+    }
+    head.setAttribute("aria-expanded", String(expanded));
+    const nextBody = template.content.querySelector<HTMLElement>(".tool-body")!;
+    // Match sections independently: adding output must not detach the input or
+    // reset a selection/scroll position in an existing output node.
+    const sections = Array.from(body.children);
+    for (const next of Array.from(nextBody.children)) {
+      const current = sections.find(section => section.className === next.className
+        && (section.className !== "tool-section-label" || section.getAttribute("data-i18n-key") === next.getAttribute("data-i18n-key")));
+      if (!current) {
+        body.insertBefore(next, sections[0] ?? null);
+        continue;
+      }
+      sections.splice(sections.indexOf(current), 1);
+      if (current.classList.contains("tool-io")) {
+        const value = next.textContent ?? "";
+        const text = current.firstChild;
+        if (text instanceof Text) {
+          const previous = text.data;
+          if (previous !== value) {
+            let start = 0;
+            while (start < previous.length && start < value.length && previous[start] === value[start]) start++;
+            let end = 0;
+            while (end < previous.length - start && end < value.length - start
+              && previous[previous.length - 1 - end] === value[value.length - 1 - end]) end++;
+            text.replaceData(start, previous.length - start - end, value.slice(start, value.length - end));
+          }
+        } else if (value) current.append(document.createTextNode(value));
+      } else if (!current.isEqualNode(next)) current.replaceWith(next);
+    }
+    for (const obsolete of sections) obsolete.remove();
+  } else el.innerHTML = markup;
   if (!suspendScroll && (previousCategory !== category || prevStatus !== status)) refreshProcessGroups(el.parentElement);
   if (userToggle) el.dataset.userToggle = userToggle;
-  el.querySelector(".tool-head")?.addEventListener("click", () => {
+  (el.querySelector(".tool-head") as HTMLButtonElement).onclick = () => {
     const open = el.classList.contains("collapsed");
     el.classList.toggle("collapsed", !open);
     el.dataset.userToggle = open ? "open" : "closed";
     el.querySelector(".tool-head")?.setAttribute("aria-expanded", open ? "true" : "false");
-  });
+    if (open) revealToolDetails(el.querySelector<HTMLElement>(".tool-head")!);
+  };
   el.querySelectorAll<HTMLButtonElement>("[data-open], .file-path").forEach((btn) => {
-    btn.addEventListener("click", (ev) => {
+    btn.onclick = (ev) => {
       ev.stopPropagation();
       const p = btn.dataset.open || btn.dataset.path || change?.path;
       if (p) post({ type: "openFile", path: p });
-    });
+    };
   });
   el.querySelector<HTMLButtonElement>("[data-diff]")?.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -4521,7 +4602,12 @@ function refreshProcessGroups(parent: HTMLElement | null): void {
       button.setAttribute("aria-expanded", String(open));
       for (const node of group) { node.classList.toggle("group-hidden", !open); node.classList.add("group-detail"); }
     };
-    button.addEventListener("click", () => { first.dataset.groupToggle = first.dataset.groupToggle === "open" ? "closed" : "open"; paint(); });
+    button.addEventListener("click", () => {
+      const open = first.dataset.groupToggle !== "open";
+      first.dataset.groupToggle = open ? "open" : "closed";
+      paint();
+      if (open) revealToolDetails(button, first);
+    });
     first.before(button);
     paint();
   }
@@ -4686,8 +4772,10 @@ function syncReplyFooter(anchor: HTMLElement, force: boolean): void {
   ensureReplyFooter(anchor, Number.isFinite(sent) && sent > 0 ? sent : undefined);
 }
 
-function settleReplyFooters(): void {
-  for (const turn of groupTurns()) {
+function settleReplyFooters(tailRunning = false): void {
+  const turns = groupTurns();
+  if (tailRunning) turns.pop();
+  for (const turn of turns) {
     let anchor: HTMLElement | null = null;
     for (const el of turn) {
       if (el.classList.contains("msg-meta")) continue;
@@ -5904,7 +5992,7 @@ function reconcileAppendedQuestion(
   foldOldTurns();
   syncQueuedMessages();
   applyStoredConversation();
-  if (!(activeSince > 0) && !tailStillRunning(items)) settleReplyFooters();
+  settleReplyFooters(activeSince > 0 || tailStillRunning(items));
   if (isGenerating) ensureWorkingIndicator();
   const currentDomRows = messagesEl.children.length;
   reportHistoryRenderTiming(started, performance.now() - started, "transcript-sync", items.length, previousDomRows, currentDomRows, truncated, "append");
@@ -6127,7 +6215,7 @@ function renderHistory(
   modelMarks = modelMarks.filter(mark => !covered.has(mark.toId));
   renderModelMarks(new Set());
   restoreGoalHistoryMarks();
-  if (!(activeSince > 0) && !tailStillRunning(items)) settleReplyFooters();
+  settleReplyFooters(activeSince > 0 || tailStillRunning(items));
   // The redraw wiped the spinner; a live turn still needs it at the tail.
   if (isGenerating) ensureWorkingIndicator();
   if (!completionRevealPending) {
@@ -6369,6 +6457,7 @@ function activeChips(): ContextChip[] { return [...explicitChips]; }
 function sendMessage(immediate = false): void {
   if (holdStreams || !sessionConnected) return;
   mentions.close();
+  inputHistory = undefined;
   const body = input.value.trim();
   const planShortcut = draftPlanEnabled;
   if (activeCommand && (selectedSkills.length || selectedAgents.length)) {
@@ -7188,6 +7277,34 @@ input.addEventListener("keydown", (e) => {
       return;
     }
   }
+  const mentionMenu = document.getElementById("file-mentions");
+  if (!e.defaultPrevented && !open && (!mentionMenu || mentionMenu.hidden)
+      && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey
+      && (e.key === "ArrowUp" || e.key === "ArrowDown")
+      && input.selectionStart === input.selectionEnd) {
+    if (!inputHistory && e.key === "ArrowUp" && input.value === "") {
+      const texts = [...messagesEl.querySelectorAll<HTMLElement>(".message.user:not(.queued)")]
+        .filter(node => node.dataset.sessionId === currentSessionId)
+        .map(node => parsePromptDisplay(node.dataset.rawText || "").body)
+        .filter(text => text.trim() && !isCompactCommand(text));
+      if (texts.length) inputHistory = { texts, index: texts.length, original: input.value };
+    }
+    const history = inputHistory;
+    const boundary = e.key === "ArrowUp"
+      ? !input.value.slice(0, input.selectionStart).includes("\n")
+      : !input.value.slice(input.selectionEnd).includes("\n");
+    if (history && boundary) {
+      e.preventDefault();
+      history.index = Math.max(0, Math.min(history.texts.length, history.index + (e.key === "ArrowUp" ? -1 : 1)));
+      input.value = history.index === history.texts.length ? history.original : history.texts[history.index];
+      input.setSelectionRange(input.value.length, input.value.length);
+      resizeComposerInput();
+      updateComposerActions();
+      persistComposerDraft();
+      if (history.index === history.texts.length) inputHistory = undefined;
+      return;
+    }
+  }
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && isGenerating) {
     e.preventDefault();
     sendMessage(true);
@@ -7200,6 +7317,7 @@ input.addEventListener("keydown", (e) => {
 });
 
 input.addEventListener("input", () => {
+  inputHistory = undefined;
   resizeComposerInput();
   maybeActivateTypedCommand();
   updateComposerActions();
@@ -7344,6 +7462,9 @@ defaultSessionThoughtSelect.addEventListener("change", () => {
 
 document.getElementById("copy-diagnostics")!.addEventListener("click", () => {
   closeSettings(); settingsButton.focus(); post({type: "copyDiagnostics"});
+});
+document.getElementById("copy-log")!.addEventListener("click", () => {
+  closeSettings(); settingsButton.focus(); post({type: "copyLog"});
 });
 document.getElementById("pending-action")!.addEventListener("click", () => {
   const prompt = pendingPrompt();
@@ -7782,7 +7903,7 @@ window.addEventListener("message", (event) => {
     }
     case "file_changes":
       if (holdStreams) break;
-      showGitFiles(String(msg.turnId || ""), msg.files ?? [], msg.error);
+      showGitFiles(String(msg.turnId || ""), msg.files ?? [], msg.error, msg.requestId);
       break;
     case "preview_files":
       if (holdStreams || msg.sessionId !== currentSessionId) break;

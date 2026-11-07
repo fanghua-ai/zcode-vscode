@@ -843,6 +843,21 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   const fail=messages.querySelectorAll('.goal-mark')[1];
   check(fail&&fail.classList.contains('failed')&&fail.textContent.includes('目标未达成'),'failed goal marker wrong: '+(fail?.textContent||''));
  });
+ await test('context compaction keeps the previous answer copy button and time',()=>{
+  reset();
+  const earlier=[
+   {id:'prior-q',role:'user',turnId:'prior',text:'A question',createdAt:Date.now()-5000},
+   {id:'prior-a',role:'assistant',turnId:'prior',text:'An answer'},
+  ];
+  emit({type:'history',sessionId:'A',viewGen:gen,activeSince:Date.now(),items:[...earlier,
+   {id:'compact-q',role:'user',turnId:'compact',text:'/compact'},
+   {id:'compact-a',role:'assistant',turnId:'compact',text:'',steps:[{kind:'compact',status:'running',origin:'manual'}]},
+  ]});
+  const footers=messages.querySelectorAll('.reply-meta:not([hidden])');
+  check(footers.length===1&&footers[0].dataset.copyText==='An answer','compression removed the previous answer footer');
+  check(footers[0].querySelector('.msg-copy')&&!footers[0].querySelector('.msg-time').hidden,'previous reply controls missing');
+ });
+
  await test('compact timeline shows compressing then compressed like the desktop',()=>{
   reset();
   emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});
@@ -1431,7 +1446,7 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(Math.abs(gap-expected)<=1,`embedded reader gap ${gap}px differs from the existing timeline spacing ${expected}px`);
   check(getComputedStyle(body).gap==='10px','original work timeline spacing changed');
  });
- await test('truncated inline web-reader expands downward without moving its header',async()=>{
+ await test('truncated inline web-reader reveals expanded details while keeping its header visible',async()=>{
   reset();
   const embedded='The page is available.**🌐 Z.ai Built-in Tool: webReader**\n```json\n{"url":"https://example.test/news/"}\n```\n**Output:**\n**webReader_result_summary:** [{"text":{"title":"Example News","description":"Sample news page.","url":"https://example.test/news/","content":"---\\n\\n![Image 1: Sample illustration “';
   const trailing='\n'+ ' '.repeat(48) + '后续结论';
@@ -1468,8 +1483,8 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(body&&getComputedStyle(body).display!=='none'&&body.getBoundingClientRect().height>0,'recovered web-reader summary is not visible after click');
   await new Promise(resolve=>setTimeout(resolve,80));
   check(!scrollbar.hidden&&thumb.getBoundingClientRect().height<thumbBefore,`news reader expansion did not update scrollbar size before scrolling: ${thumbBefore} -> ${thumb.getBoundingClientRect().height}, view=${workViewport.clientHeight}, size=${workViewport.scrollHeight}, style=${thumb.style.height}`);
-  check(Math.abs(workViewport.scrollTop-scrollBefore)<=1,'expanding the news reader changed the internal scroll position');
-  check(Math.abs(head.getBoundingClientRect().top-headerBefore)<=1,'news reader expanded upward instead of retaining its header position');
+  check(head.getBoundingClientRect().top>=workViewport.getBoundingClientRect().top-1,'news reader expansion hid its header');
+  check(reader.querySelector('.tool-body').getBoundingClientRect().top<workViewport.getBoundingClientRect().bottom-10,'news reader details remained hidden');
   reader.querySelector('.tool-io.out').scrollIntoView({block:'nearest'});
   const outputRect=reader.querySelector('.tool-io.out').getBoundingClientRect(), viewport=workViewport.getBoundingClientRect();
   check(outputRect.bottom>viewport.top&&outputRect.top<viewport.bottom,'reader result cannot be reached by scrolling');
@@ -1482,7 +1497,7 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(output.includes('Example News')&&output.includes('https://example.test/news/')&&output.includes('Sample news page.'),'truncated summary fields were lost after toggling the reader');
   check(!output.includes('webReader_result_summary')&&!output.includes('"title"'),'expanded reader kept the broken JSON wrapper');
  });
- await test('expanding a terminal result keeps its header position stable',async()=>{
+ await test('expanding a bottom terminal result reveals details and retains a visible header',async()=>{
   reset();
   emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'terminal-result',role:'assistant',text:'',steps:[
    {kind:'reasoning',text:'Earlier tool output fills the work viewport.\n'.repeat(36)},
@@ -1498,7 +1513,8 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(tool.classList.contains('collapsed'),'terminal result was not collapsed before opening');
   head.click();
   await new Promise(resolve=>setTimeout(resolve,80));
-  check(Math.abs(viewport.scrollTop-scrollBefore)<=1&&Math.abs(head.getBoundingClientRect().top-headerBefore)<=1,'terminal expansion shifted its header upward');
+  check(head.getBoundingClientRect().top>=viewport.getBoundingClientRect().top-1,'terminal expansion hid its header');
+  check(tool.querySelector('.tool-body').getBoundingClientRect().top<viewport.getBoundingClientRect().bottom-10,'terminal details were not revealed');
   const output=tool.querySelector('.tool-io.out');
   output.scrollIntoView({block:'nearest'});
   const rect=output.getBoundingClientRect(),view=viewport.getBoundingClientRect();
@@ -2307,6 +2323,112 @@ $\includegraphics{https://example.invalid/leak}$`+'\n\nCode: `$raw_code$`';emit(
   check(!savedState.composerDrafts['A']?.chips.length,'submitted reference remains in persisted draft');
   emit({type:'send_rejected',commandId:message.commandId,sessionId:'A',message:'rejected'});
   check(document.querySelector('#attachments').textContent.includes('main.ts'),'rejected send lost reference');
+ });
+
+ await test('Chinese quoted emphasis renders bold in streamed and restored answers',async()=>{
+  reset();const text='我的建议是**“规则升级 + 一个只读校验器”为主，机制只加一个可选项**——然后验证。';
+  emit({type:'assistant_text_delta',partId:'quoted-strong',authoritative:true,fullText:text});
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  check(messages.querySelector('.assistant strong')?.textContent==='“规则升级 + 一个只读校验器”为主，机制只加一个可选项','streamed bold missing');
+  emit({type:'history',sessionId:'A',items:[{id:'bold-answer',role:'assistant',text}]});
+  check(messages.querySelector('.assistant strong')?.textContent==='“规则升级 + 一个只读校验器”为主，机制只加一个可选项','restored bold missing');
+ });
+
+ await test('empty composer browses current session text history without replacing typed drafts',()=>{
+  reset();
+  emit({type:'history',sessionId:'A',items:[{id:'h1',role:'user',text:'First question'},{id:'h2',role:'user',text:'Second question'}]});
+  const arrow=key=>input.dispatchEvent(new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true}));
+  input.value='';input.setSelectionRange(0,0);arrow('ArrowUp');check(input.value==='Second question','latest prompt missing');
+  check(input.selectionStart===input.value.length && input.selectionEnd===input.value.length,'recalled prompt caret is not at the end');
+  arrow('ArrowDown');check(input.value==='','single-line history required an extra Down');
+  arrow('ArrowUp');arrow('ArrowUp');check(input.value==='First question','older prompt missing');
+  arrow('ArrowDown');check(input.value==='Second question','newer prompt missing');
+  arrow('ArrowDown');check(input.value==='','original empty draft missing');
+  input.value='my draft';input.setSelectionRange(0,0);arrow('ArrowUp');check(input.value==='my draft','typed draft overwritten');
+  input.value='';input.setSelectionRange(0,0);arrow('ArrowUp');input.value+=' edited';input.dispatchEvent(new Event('input',{bubbles:true}));
+  input.setSelectionRange(0,0);arrow('ArrowUp');check(input.value==='Second question edited','editing did not leave history');
+ });
+
+ await test('expanding a bottom shell reveals command details without hiding its header',async()=>{
+  reset();
+  emit({type:'assistant_reasoning_delta',partId:'scroll-thought',authoritative:true,fullText:Array.from({length:80},(_,i)=>'Thought '+i).join('\n')});
+  emit({type:'tool_call',toolCallId:'bottom-shell',toolName:'Bash',status:'running',inputText:JSON.stringify({command:Array.from({length:12},(_,i)=>'echo command_'+i).join('\n')})});
+  const card=messages.querySelector('.tool-call'),work=card.closest('.work-fold-body');
+  work.scrollTop=work.scrollHeight;messages.scrollTop=messages.scrollHeight;
+  card.querySelector('.tool-head').click();
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const head=card.querySelector('.tool-head').getBoundingClientRect(),body=card.querySelector('.tool-body').getBoundingClientRect();
+  const visibleBottom=Math.min(work.getBoundingClientRect().bottom,messages.getBoundingClientRect().bottom,document.querySelector('.composer-card').getBoundingClientRect().top);
+  check(body.top<visibleBottom-10,'expanded command stayed below viewport');
+  check(head.top>=work.getBoundingClientRect().top-2,'expansion hid the clicked header');
+ });
+
+ await test('expanding a bottom tool group reveals its first tool',async()=>{
+  for(const [toolName,parameters] of [['Bash',{command:'echo grouped'}],['Read',{file_path:'/workspace/a.ts'}]]){
+   reset();
+   emit({type:'assistant_reasoning_delta',partId:'group-thought',authoritative:true,fullText:'Earlier reasoning\n'.repeat(80)});
+   for(let i=0;i<3;i++)emit({type:'tool_call',toolCallId:'group-'+i,toolName,status:'running',inputText:JSON.stringify(parameters)});
+   const group=messages.querySelector('.process-group'),work=group.closest('.work-fold-body');
+   work.scrollTop=work.scrollHeight;messages.scrollTop=messages.scrollHeight;
+   group.click();
+   await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+   const first=group.nextElementSibling.getBoundingClientRect();
+   const bottom=Math.min(work.getBoundingClientRect().bottom,messages.getBoundingClientRect().bottom,document.querySelector('.composer-card').getBoundingClientRect().top);
+   check(first.top<bottom-10,toolName+' group left its first tool hidden');
+   check(group.getBoundingClientRect().top>=work.getBoundingClientRect().top-2,'group header left the work viewport');
+  }
+ });
+
+ await test('only completed edits contribute local file changes',()=>{
+  reset();emit({type:'history',sessionId:'A',items:[{id:'edit-q',role:'user',text:'Edit file'}]});
+  const edit={type:'tool_call',toolCallId:'failed-edit',toolName:'Edit',inputText:JSON.stringify({file_path:'/workspace/a.ts',old_string:'old',new_string:'new'}),fileChange:{path:'/workspace/a.ts',before:'old',after:'new',added:1,removed:1,kind:'edit'}};
+  emit({...edit,status:'running'});check(!messages.querySelector('.git-changes'),'pending edit counted');
+  emit({...edit,status:'error'});check(!messages.querySelector('.git-changes'),'failed edit counted');
+  emit({...edit,toolCallId:'good-edit',status:'running'});
+  emit({type:'tool_call',toolCallId:'good-edit',status:'completed',outputText:'success'});check(messages.querySelector('.git-changes'),'completed edit omitted when result omitted input');
+ });
+ await test('Git files follow target changes and ignore earlier asynchronous responses',()=>{
+  reset();emit({type:'history',sessionId:'A',items:[{id:'git-q',role:'user',text:'Change files'}]});
+  const turn={turnId:'git-request-turn',userText:'Change files',fileChanges:{target:{rowId:2,entityId:'target-old'},summary:{files:1,additions:1,deletions:0},canRewind:true}};
+  emit({type:'conversation_sync',sessionId:'A',editable:null,turns:[turn]});
+  messages.querySelector('.git-head').click();const old=sent.filter(m=>m.type==='loadFileChanges').at(-1);
+  emit({type:'conversation_sync',sessionId:'A',editable:null,turns:[{...turn,fileChanges:{...turn.fileChanges,target:{rowId:3,entityId:'target-new'}}}]});
+  const current=sent.filter(m=>m.type==='loadFileChanges').at(-1);check(current.requestId!==old.requestId,'target change reused old list request');
+  emit({type:'file_changes',turnId:turn.turnId,requestId:current.requestId,files:[{path:'new.ts',additions:1,deletions:0,patches:[]}]});
+  emit({type:'file_changes',turnId:turn.turnId,requestId:old.requestId,files:[{path:'old.ts',additions:1,deletions:0,patches:[]}]});
+  check(messages.querySelector('.git-body').textContent.includes('new.ts')&&!messages.querySelector('.git-body').textContent.includes('old.ts'),'late request replaced current files');
+ });
+
+ await test('tool progress preserves the hovered command preview and its tooltip',async()=>{
+  reset();
+  const event={type:'tool_call',toolCallId:'hover-shell',toolName:'Bash',status:'running',inputText:JSON.stringify({command:'echo hello'})};
+  emit(event);
+  const preview=messages.querySelector('.tool-preview'),tip=document.getElementById('tooltip');
+  preview.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
+  await new Promise(resolve=>setTimeout(resolve,30));
+  check(tip.classList.contains('show')&&preview.title==='','custom tooltip did not take over');
+  emit({...event,outputText:'new progress'});
+  check(messages.querySelector('.tool-preview')===preview,'progress replaced the hover target');
+  check(tip.classList.contains('show')&&tip.textContent==='echo hello'&&preview.title==='','progress disturbed the tooltip');
+ });
+
+ await test('running shell keeps its click target across progress and preserves expansion',()=>{
+  reset();
+  const update={type:'tool_call',toolCallId:'click-shell',toolName:'Bash',status:'running',inputText:JSON.stringify({command:'sleep 1; echo done'})};
+  emit(update);
+  const card=messages.querySelector('.tool-call'),head=card.querySelector('.tool-head');
+  head.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));
+  emit({type:'tool_call',toolCallId:'click-shell',toolName:'Bash',status:'running',inputText:'',outputText:'working'});
+  check(card.querySelector('.tool-head')===head,'progress replaced the pressed button');
+  head.click();check(!card.classList.contains('collapsed'),'running command did not expand');
+  emit({...update,outputText:'still working'});
+  check(!card.classList.contains('collapsed'),'progress lost expansion');
+  check(card.querySelector('.tool-body').textContent.includes('sleep 1; echo done'),'command absent while running');
+  head.click();check(card.classList.contains('collapsed'),'running command did not collapse');
+  emit({type:'tool_call',toolCallId:'click-shell',status:'completed',inputText:'',outputText:'done'});
+  check(card.querySelector('.tool-body').textContent.includes('sleep 1; echo done'),'completion lost original command');
+  check(card.classList.contains('collapsed'),'completion lost explicit collapse');
+  head.click();check(!card.classList.contains('collapsed'),'completed command did not expand');
  });
 
  await test('image-analysis card is compact and hides signed URL queries without changing raw parameters',()=>{

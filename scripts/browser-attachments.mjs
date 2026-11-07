@@ -118,13 +118,26 @@ try {
     await wait(()=>document.querySelector('#image-drafts img')?.naturalWidth>0);
     check(savedState.composerDrafts['paste-A'].images[0].thumbnail.length<65536,'thumbnail is unbounded');
     const tile=document.querySelector('#image-drafts .image-chip').getBoundingClientRect();check(tile.width===tile.height&&tile.width===64,'composer image is not a square thumbnail');
+    const resizeListeners=new Set();
+    const addListener=window.addEventListener, removeListener=window.removeEventListener;
+    window.addEventListener=function(type,listener,...args){if(type==='resize')resizeListeners.add(listener);return addListener.call(this,type,listener,...args);};
+    window.removeEventListener=function(type,listener,...args){if(type==='resize')resizeListeners.delete(listener);return removeListener.call(this,type,listener,...args);};
     const previewButton=document.querySelector('#image-drafts .image-preview-btn');previewButton.focus();previewButton.click();
+    check(resizeListeners.size===1,'preview did not register resize handler');
+    previewButton.click();
+    check(resizeListeners.size===1,'replacing preview leaked resize handler');
     check(!sent.some(message=>message.type==='previewImage'),'unsent draft preview depended on unauthorized backend read');
     await wait(()=>document.querySelector('#image-preview img')?.naturalWidth===8);
     check(document.querySelector('#image-preview img').src==='data:image/png;base64,'+png,'preview used thumbnail instead of original');
     document.querySelector('#image-preview button').click();
     check(!document.getElementById('image-preview')&&document.activeElement===previewButton,'preview close failed to restore focus');
     check(input.value==='caption'&&savedState.composerDrafts['paste-A'].images[0].ref==='pasted-ref','preview changed draft');
+    check(resizeListeners.size===0,'closing preview leaked resize handler');
+    previewButton.click();
+    ready('paste-B');
+    check(resizeListeners.size===0&&!document.getElementById('image-preview'),'session switch leaked preview resize handler');
+    window.addEventListener=addListener;window.removeEventListener=removeListener;
+    ready('paste-A');
 
     input.value='';input.dispatchEvent(new Event('input'));send.click();
     const sending=sent.find(m=>m.type==='send');check(sending&&sending.attachments[0].ref==='pasted-ref'&&sending.text==='','image-only send failed');

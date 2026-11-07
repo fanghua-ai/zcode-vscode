@@ -133,8 +133,14 @@ export async function imageThumbnail(dataUrl: string): Promise<string | undefine
   } catch { return undefined; }
 }
 
+let dismissImagePreview: (() => void) | undefined;
+
+export function closeImagePreview(): void {
+  dismissImagePreview?.();
+}
+
 export function showImagePreview(dataUrl: string): void {
-  document.getElementById("image-preview")?.remove();
+  closeImagePreview();
   const previous = document.activeElement as HTMLElement | null;
   const overlay = document.createElement("div");
   overlay.id = "image-preview";
@@ -278,10 +284,12 @@ export function showImagePreview(dataUrl: string): void {
   const onResize = () => { if (overlay.isConnected && fit) paint(); };
   window.addEventListener("resize", onResize);
   const dismiss = () => {
+    dismissImagePreview = undefined;
     window.removeEventListener("resize", onResize);
     overlay.remove();
     (previous?.isConnected ? previous : document.getElementById("input"))?.focus();
   };
+  dismissImagePreview = dismiss;
   close.onclick = dismiss;
   overlay.onclick = event => { if (event.target === overlay) dismiss(); };
   overlay.onkeydown = event => {

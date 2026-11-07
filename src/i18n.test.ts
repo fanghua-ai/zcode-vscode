@@ -3,6 +3,7 @@ import test from "node:test";
 import { resolveUiLanguage, translate, setUiLanguage, relocalizeUiText } from "./i18n";
 import { getWebviewHtml } from "./webviewHtml";
 import type { Webview, Uri } from "vscode";
+import { readFileSync } from "node:fs";
 
 test("automatic language follows supported VS Code locales and explicit choices win", () => {
   assert.equal(resolveUiLanguage("auto", "zh-cn"), "zh-CN");
@@ -60,4 +61,20 @@ test("initial webview renders the selected language before its first message", (
   assert.ok(html.includes('id="default-session-mode"'));
   assert.ok(html.includes('id="default-session-thought"'));
   assert.ok(html.includes("Reasoning options depend on the model."));
+});
+
+test("diagnostic copy settings explain redaction and review in all localized catalogs", () => {
+  const key = "复制或导出诊断信息时会自动脱敏；完成后请自行再检查一遍。";
+  const webview = { cspSource: "test:", asWebviewUri: () => "test:webview.js" } as unknown as Webview;
+  for (const [locale, file] of [["en", "package.nls.json"], ["zh-CN", "package.nls.zh-cn.json"], ["zh-TW", "package.nls.zh-tw.json"]] as const) {
+    const html = getWebviewHtml(webview, {} as Uri, "test", { locale, setting: locale, vscodeLanguage: locale });
+    const catalog = JSON.parse(readFileSync(file, "utf8"));
+    assert.equal(catalog["diagnostics.exportHelp"], translate(key, locale));
+    assert.ok(html.includes(`id="diagnostics-export-help">${translate(key, locale)}</div>`));
+    assert.ok(html.includes('id="copy-diagnostics" aria-describedby="diagnostics-export-help"'));
+    assert.ok(html.includes(`id="copy-log" aria-describedby="log-export-help">${translate("复制日志", locale)}</button>`));
+    const order = ["copy-diagnostics", "diagnostics-export-help", "copy-log", "log-export-help"]
+      .map(id => html.indexOf(`id="${id}"`));
+    assert.ok(order.every((position, index) => position >= 0 && (index === 0 || position > order[index - 1])));
+  }
 });

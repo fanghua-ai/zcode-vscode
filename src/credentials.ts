@@ -3,9 +3,10 @@ import * as os from "os";
 import * as fs from "fs";
 import * as path from "path";
 import * as https from "https";
-import { readJsonRequest } from "./httpJson";
+import { JsonRequestError, readJsonRequest } from "./httpJson";
 import { logDebug, logInfo, logWarn } from "./log";
 import { readDesktopJson, readDesktopJsonWithRetry } from "./desktopJson";
+import { recordDiagnosticEvent } from "./diagnostics";
 
 /**
  * Decrypt ~/.zcode/v2/credentials.json and exchange BigModel OAuth tokens.
@@ -273,7 +274,79 @@ export function maybeDecryptSecret(
   }
 }
 
-async function httpGetJson(url: string, headers: Record<string, string>): Promise<{ code: number; msg?: string; data: unknown }> {
+interface PlanResponse {
+  code?: number | string;
+  msg?: string;
+  success?: boolean;
+  data?: unknown;
+  httpStatus?: number;
+}
+
+class PlanAuthError extends Error {
+  readonly code = "PLAN_AUTH_FAILED";
+  constructor(readonly stage: string, readonly reason: string, readonly response?: PlanResponse) {
+    // Only fixed local reasons reach errors/logs; never interpolate a server message.
+    super(`Plan login ${stage}: ${reason}`);
+    this.name = "PlanAuthError";
+  }
+}
+
+function resultCode(code: unknown): number | string | undefined {
+  return typeof code === "number" && Number.isFinite(code) ? code
+    : typeof code === "string" && /^-?\d{1,12}$/.test(code) ? code : undefined;
+}
+
+/** Safe diagnostic projection: no response body, URL, error message or credential. */
+export function planAuthErrorDetails(error: unknown) {
+  const value = error as { code?: unknown; status?: unknown; stage?: unknown; message?: unknown; resultCode?: unknown } | null;
+  const code = typeof value?.code === "string" && ["HTTP_STATUS", "INVALID_JSON", "RESPONSE_TOO_LARGE", "ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ENETUNREACH", "ENOTFOUND", "ECONNREFUSED", "CERT_HAS_EXPIRED", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "DEPTH_ZERO_SELF_SIGNED_CERT"].includes(value.code) ? value.code : undefined;
+  const response = error instanceof PlanAuthError ? error.response : undefined;
+  const category = code === "HTTP_STATUS" ? "http" : code === "ETIMEDOUT" ? "timeout"
+    : code === "INVALID_JSON" || code === "RESPONSE_TOO_LARGE" ? "invalid_response"
+    : code ? "network" : error instanceof PlanAuthError ? (response && !bizOk(response) ? "business" : "invalid_response") : "unknown";
+  const reason = error instanceof PlanAuthError ? error.reason
+    : typeof value?.message === "string" && /^project_token_(?:account_changed|project_unavailable|invalid_response|key_unavailable|disabled|expired)$/.test(value.message) ? value.message : undefined;
+  return {
+    code: code ?? (error instanceof PlanAuthError ? error.code : "UNKNOWN_ERROR"), category, reason,
+    status: response?.httpStatus ?? (typeof value?.status === "number" ? value.status : undefined),
+    resultCode: resultCode(response?.code ?? value?.resultCode),
+    responseReason: error instanceof JsonRequestError ? error.responseReason : undefined,
+    stage: error instanceof PlanAuthError ? error.stage
+      : typeof value?.stage === "string" && ["customer_info", "list_keys", "create_key", "copy_secret", "issue_project_token", "subscription_list", "start_plan_balance", "quota"].includes(value.stage) ? value.stage : undefined,
+  };
+}
+
+function requestStage(url: string, method: string): string {
+  const pathname = new URL(url).pathname;
+  return pathname.endsWith("getCustomerInfo") ? "customer_info"
+    : pathname.endsWith("/access_tokens") ? "issue_project_token"
+    : pathname.endsWith("/subscription/list") ? "subscription_list"
+    : pathname.endsWith("/zcode-plan/billing/balance") ? "start_plan_balance"
+    : pathname.includes("/copy/") ? "copy_secret"
+    : pathname.endsWith("/api_keys") ? (method === "POST" ? "create_key" : "list_keys") : "quota";
+}
+
+async function readPlanJson(url: string, method: string, start: Parameters<typeof readJsonRequest>[0]): Promise<PlanResponse> {
+  const stage = requestStage(url, method);
+  let status: number | undefined;
+  try {
+    const raw = await readJsonRequest(start, 15000, value => { status = value; });
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new PlanAuthError(stage, "invalid_response", { httpStatus: status });
+    const response = { ...raw, httpStatus: status } as PlanResponse;
+    logDebug("Plan request completed", { stage, method, host: new URL(url).hostname, status,
+      resultCode: resultCode(response.code), accepted: bizOk(response) });
+    return response;
+  } catch (error) {
+    const target = new URL(url);
+    const details = { ...planAuthErrorDetails(error), stage, method, host: target.hostname, status,
+      ...(stage === "start_plan_balance" ? { appVersion: target.searchParams.get("app_version") } : {}) };
+    logWarn("Plan request failed", details);
+    recordDiagnosticEvent("plan_request_failed", details);
+    throw Object.assign(error instanceof Error ? error : new Error("Plan request failed"), { stage });
+  }
+}
+
+async function httpGetJson(url: string, headers: Record<string, string>): Promise<PlanResponse> {
   try { return await httpGetJsonOnce(url, headers); } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (!["ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ENETUNREACH"].includes(code ?? "")) throw error;
@@ -286,18 +359,18 @@ async function httpGetJson(url: string, headers: Record<string, string>): Promis
 function httpGetJsonOnce(
   url: string,
   headers: Record<string, string>
-): Promise<{ code: number; msg?: string; data: unknown }> {
-  return readJsonRequest(receive => https.get(url, { headers }, receive)) as Promise<{ code: number; msg?: string; data: unknown }>;
+): Promise<PlanResponse> {
+  return readPlanJson(url, "GET", receive => https.get(url, { headers }, receive));
 }
 
 function httpPostJson(
   url: string,
   headers: Record<string, string>,
   body: unknown
-): Promise<{ code: number; msg?: string; data: unknown }> {
+): Promise<PlanResponse> {
   const postData = JSON.stringify(body);
   const target = new URL(url);
-  return readJsonRequest(receive => {
+  return readPlanJson(url, "POST", receive => {
     const req = https.request({
       hostname: target.hostname,
       port: target.port || 443,
@@ -308,7 +381,7 @@ function httpPostJson(
     req.write(postData);
     req.end();
     return req;
-  }) as Promise<{ code: number; msg?: string; data: unknown }>;
+  });
 }
 
 interface Organization {
@@ -334,18 +407,14 @@ export interface OrgProject {
   projectId: string;
 }
 
-function isMarkedCurrent(row: object): boolean {
-  const record = row as Record<string, unknown>;
-  return ["isDefault", "default", "current", "selected", "isCurrent"].some(
-    (key) => record[key] === true
-  );
+function authHash(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex").slice(0, 12);
 }
 
 /**
- * Org/project for a personal or start plan. Team plans pass `prefer` and never
- * reach the list. Display names are not used: a localized name is not an id.
- * One organization and one project is unambiguous. A single current/default
- * flag is unambiguous. Anything else must be chosen in the desktop app.
+ * Match Desktop: personal plans exclude team projects, prefer the named default
+ * organization/project, then use the first available entry. Explicit teams keep
+ * their selected IDs and never fall back to a personal project.
  */
 export function pickOrgAndProject(
   data: unknown,
@@ -358,27 +427,24 @@ export function pickOrgAndProject(
     };
   }
 
-  const orgs = (
-    (data as { organizations?: Organization[] })?.organizations ?? []
-  ).filter(
-    (org) =>
-      !!org?.organizationId && (org.projects ?? []).some((p) => p?.projectId)
-  );
-  const flaggedOrgs = orgs.filter((org) => isMarkedCurrent(org));
-  const pool =
-    flaggedOrgs.length === 1 ? flaggedOrgs : orgs.length === 1 ? orgs : [];
-  const org = pool[0];
-  if (!org?.organizationId) return null;
-
-  const projects = (org.projects ?? []).filter((p) => p?.projectId);
-  const flaggedProjects = projects.filter((p) => isMarkedCurrent(p));
-  const proj =
-    flaggedProjects.length === 1
-      ? flaggedProjects[0]
-      : projects.length === 1
-        ? projects[0]
-        : null;
+  const organizations = (data as { organizations?: Organization[] })?.organizations;
+  const orgs = (Array.isArray(organizations) ? organizations : []).map(org => ({
+    ...org,
+    projects: (Array.isArray(org?.projects) ? org.projects : []).filter(project =>
+      typeof project?.projectId === "string" && project.projectId.trim() && String(project.projectType ?? "").trim() !== "2"),
+  })).filter(org => typeof org.organizationId === "string" && org.organizationId.trim() && org.projects.length);
+  const org = orgs.find(item => typeof item.organizationName === "string" && item.organizationName.includes("默认机构")) ?? orgs[0];
+  if (!org?.organizationId) {
+    logWarn("Plan organization unavailable", { stage: "select_organization", candidates: orgs.length });
+    return null;
+  }
+  logDebug("Plan organization selected", { stage: "select_organization", candidates: orgs.length,
+    organizationHash: authHash(org.organizationId) });
+  const projects = org.projects;
+  const proj = projects.find(item => typeof item.projectName === "string" && item.projectName.includes("默认项目")) ?? projects[0];
   if (!proj?.projectId) return null;
+  logDebug("Plan project selected", { stage: "select_project", candidates: projects.length,
+    projectHash: authHash(proj.projectId) });
   return { organizationId: org.organizationId, projectId: proj.projectId };
 }
 
@@ -393,23 +459,26 @@ async function withCopiedSecret(
       `${keysUrl}/copy/${encodeURIComponent(apiKey)}`,
       headers
     );
-    if (copyResp.code === 200) {
-      const secret = (copyResp.data as { secretKey?: string } | undefined)
-        ?.secretKey?.trim();
-      if (secret) return `${apiKey}.${secret}`;
+    if (bizOk(copyResp)) {
+      const value = (copyResp.data as { secretKey?: unknown } | undefined)?.secretKey;
+      const secret = typeof value === "string" ? value.trim() : "";
+      if (secret) {
+        logDebug("Plan key secret available", { stage: "copy_secret", keyHash: authHash(apiKey) });
+        return `${apiKey}.${secret}`;
+      }
     }
-  } catch {
-    // Desktop does this extra copy step; raw key still works for some plans.
-  }
-  if (requireSecret) {
-    throw new Error("API key copy response is missing secretKey");
+    if (requireSecret) throw new PlanAuthError("copy_secret", bizOk(copyResp) ? "missing_secret" : "rejected", copyResp);
+  } catch (error) {
+    if (requireSecret) throw error;
+    // BigModel legacy plans may accept the raw key; Z.ai must never do so.
+    logWarn("Plan key copy unavailable", { ...planAuthErrorDetails(error), stage: "copy_secret" });
   }
   return apiKey;
 }
 
-function bizOk(resp: { code: number; msg?: string; data: unknown }): boolean {
-  if (typeof resp.code === "number") return resp.code === 0 || resp.code === 200;
-  return resp.data !== undefined;
+function bizOk(resp: PlanResponse): boolean {
+  return resp.success !== false && (resp.code == null
+    || [0, 200, "0", "200"].includes(resp.code));
 }
 
 function bizHeaders(accessToken: string, team?: OrgProject): Record<string, string> {
@@ -423,7 +492,7 @@ function bizHeaders(accessToken: string, team?: OrgProject): Record<string, stri
 
 function isUsableTeamPlanKey(key: ApiKey | undefined): key is ApiKey {
   return (
-    !!key?.apiKey?.trim() &&
+    typeof key?.apiKey === "string" && !!key.apiKey.trim() &&
     key.name === ZCODE_TEAM_API_KEY_NAME &&
     key.keyType === TEAM_PLAN_KEY_TYPE
   );
@@ -444,37 +513,28 @@ export async function resolveApiKey(
       `${host}/api/biz/customer/getCustomerInfo`,
       { Authorization: authorization }
     );
-    if (infoResp.code !== 200) {
-      throw new Error(
-        `Failed to get customer info: ${infoResp.msg ?? infoResp.code}`
-      );
-    }
+    if (!bizOk(infoResp)) throw new PlanAuthError("customer_info", "rejected", infoResp);
     orgProj = pickOrgAndProject(infoResp.data);
   }
   if (!orgProj) {
-    throw new Error(
-      "Desktop selection has no organization, and the account has more than one organization or project"
-    );
+    throw new PlanAuthError("select_project", "project_unavailable");
   }
+  if (prefer) logDebug("Plan team project selected", { stage: "select_project",
+    organizationHash: authHash(prefer.organizationId), projectHash: authHash(prefer.projectId) });
 
   const keysUrl = `${host}/api/biz/v1/organization/${encodeURIComponent(
     orgProj.organizationId
   )}/projects/${encodeURIComponent(orgProj.projectId)}/api_keys`;
   const keysResp = await httpGetJson(keysUrl, headers);
-  if (!bizOk(keysResp)) {
-    throw new Error(
-      `Failed to list API keys: ${keysResp.msg ?? keysResp.code}`
-    );
-  }
-
-  const keys = (keysResp.data as ApiKey[]) ?? [];
+  if (!bizOk(keysResp)) throw new PlanAuthError("list_keys", "rejected", keysResp);
+  if (!Array.isArray(keysResp.data)) throw new PlanAuthError("list_keys", "invalid_response", keysResp);
+  const keys = keysResp.data as ApiKey[];
 
   if (prefer) {
     const existing = keys.find(isUsableTeamPlanKey);
     if (existing) {
       logInfo("Using BigModel team-plan API key", {
-        organizationId: orgProj.organizationId,
-        projectId: orgProj.projectId,
+        stage: "list_keys", keyHash: authHash(existing.apiKey),
         keyType: existing.keyType,
       });
       return withCopiedSecret(keysUrl, headers, existing.apiKey.trim(), requireSecret);
@@ -484,61 +544,34 @@ export async function resolveApiKey(
       name: ZCODE_TEAM_API_KEY_NAME,
       keyType: TEAM_PLAN_KEY_TYPE,
     });
-    if (!bizOk(createResp)) {
-      throw new Error(
-        `Failed to create team API key: ${createResp.msg ?? createResp.code}`
-      );
-    }
+    if (!bizOk(createResp)) throw new PlanAuthError("create_key", "rejected", createResp);
     const created = createResp.data as ApiKey | undefined;
     if (!isUsableTeamPlanKey(created)) {
-      throw new Error(
-        "Team API key creation did not return a usable team-plan key"
-      );
+      throw new PlanAuthError("create_key", "team_key_unavailable", createResp);
     }
     logInfo("Created BigModel team-plan API key", {
-      organizationId: orgProj.organizationId,
-      projectId: orgProj.projectId,
+      stage: "create_key", keyHash: authHash(created.apiKey),
     });
     return withCopiedSecret(keysUrl, headers, created.apiKey.trim(), requireSecret);
   }
 
-  const personal =
-    keys.find((k) => k.name === ZCODE_API_KEY_NAME && k.apiKey) ??
-    keys.find((k) => k.name !== ZCODE_TEAM_API_KEY_NAME && k.apiKey);
+  const personal = keys.find(k => k?.name === ZCODE_API_KEY_NAME);
+  if (personal && (typeof personal.apiKey !== "string" || !personal.apiKey.trim())) throw new PlanAuthError("list_keys", "key_unavailable", keysResp);
   if (personal?.apiKey) {
-    logInfo("Using personal plan API key", { name: personal.name, family });
+    logInfo("Using personal plan API key", { stage: "list_keys", family, keyHash: authHash(personal.apiKey) });
     return withCopiedSecret(keysUrl, headers, personal.apiKey.trim(), requireSecret);
   }
 
   const createResp = await httpPostJson(keysUrl, headers, {
     name: ZCODE_API_KEY_NAME,
   });
-  if (!bizOk(createResp)) {
-    throw new Error(
-      `Failed to create API key: ${createResp.msg ?? createResp.code}`
-    );
-  }
+  if (!bizOk(createResp)) throw new PlanAuthError("create_key", "rejected", createResp);
 
   const newKey = createResp.data as ApiKey | undefined;
-  if (!newKey?.apiKey) {
-    throw new Error("API key creation returned empty key");
+  if (typeof newKey?.apiKey !== "string" || !newKey.apiKey.trim()) {
+    throw new PlanAuthError("create_key", "key_unavailable", createResp);
   }
   return withCopiedSecret(keysUrl, headers, newKey.apiKey.trim(), requireSecret);
-}
-
-async function resolveZaiBizToken(accessToken: string): Promise<string> {
-  const resp = await httpPostJson(
-    `${PLAN_HOST.zai}/api/auth/z/login`,
-    {},
-    { token: accessToken }
-  );
-  if (!bizOk(resp)) {
-    throw new Error(`Failed to exchange Z.AI biz token: ${resp.msg ?? resp.code}`);
-  }
-  const data = resp.data as { access_token?: string; accessToken?: string } | undefined;
-  const token = data?.access_token?.trim() || data?.accessToken?.trim() || "";
-  if (!token) throw new Error("Z.AI biz token response is missing access_token");
-  return token;
 }
 
 /** Desktop-stored key for one account plan. Multiple stored accounts are not guessed. */
@@ -619,7 +652,9 @@ async function resolveLegacyPlanKey(family: PlanFamily, oauth: string, prefer?: 
   if (entry.pending) return entry.pending;
   const current = entry;
   current.pending = (async () => {
-    const authorization = family === "zai" ? `Bearer ${await resolveZaiBizToken(oauth)}` : oauth;
+    // Desktop already exchanged oauth:zai:access_token into a business token.
+    const login = oauth.trim().replace(/^Bearer\s+/i, "");
+    const authorization = family === "zai" ? `Bearer ${login}` : login;
     const apiKey = await resolveApiKey(family, authorization, prefer);
     const latest = await readCredentialsWithRetry();
     if (legacyPlanKeys.get(scope) !== current ||
@@ -628,6 +663,7 @@ async function resolveLegacyPlanKey(family: PlanFamily, oauth: string, prefer?: 
     }
     current.value = { apiKey };
     current.refreshAt = Date.now() + 30_000;
+    logInfo("Plan login resolved", { family, team: !!prefer, stage: "exchange_api_key", credentialHash: authHash(apiKey) });
     return current.value;
   })();
   try { return await current.pending; }
@@ -654,46 +690,47 @@ async function resolveProjectToken(
   if (entry.pending) return entry.pending;
   const current = entry;
   current.pending = (async () => {
-    const login = (family === "zai" ? await resolveZaiBizToken(oauth) : oauth)
-      .trim().replace(/^Bearer\s+/i, "");
+    const login = oauth.trim().replace(/^Bearer\s+/i, "");
     const info = await httpGetJson(`${PLAN_HOST[family]}/api/biz/customer/getCustomerInfo`, { Authorization: login });
-    const data = projectTokenData(info) as { organizations?: Organization[] };
-    // Team projects do not identify a personal Coding Plan.
-    const personal = prefer ? data : { organizations: data.organizations?.map(org => ({
-      ...org, projects: org.projects?.filter(project => String(project.projectType) !== "2"),
-    })).filter(org => org.projects?.length) };
-    const location = pickOrgAndProject(personal, prefer);
+    const data = projectTokenData(info, "customer_info") as { organizations?: Organization[] };
+    const location = pickOrgAndProject(data, prefer);
     if (!location || (prefer && !data.organizations?.some(org =>
       org.organizationId === prefer.organizationId && org.projects?.some(project => project.projectId === prefer.projectId)
-    ))) throw new Error("project_token_project_unavailable");
+    ))) throw new PlanAuthError("select_project", "project_unavailable", info);
+    if (prefer) logDebug("Plan team project selected", { stage: "select_project",
+      organizationHash: authHash(prefer.organizationId), projectHash: authHash(prefer.projectId) });
     const url = `${PLAN_HOST[family]}/api/biz/v1/organization/${encodeURIComponent(location.organizationId)}/projects/${encodeURIComponent(location.projectId)}/api_keys`;
     const headers = bizHeaders(!prefer && family === "zai" ? `Bearer ${login}` : login, prefer);
-    const keys = projectTokenData(await httpGetJson(url, headers));
-    if (!Array.isArray(keys)) throw new Error("project_token_invalid_response");
+    const keysResponse = await httpGetJson(url, headers);
+    const keys = projectTokenData(keysResponse, "list_keys");
+    if (!Array.isArray(keys)) throw new PlanAuthError("list_keys", "invalid_response", keysResponse);
     const name = prefer ? ZCODE_TEAM_API_KEY_NAME : ZCODE_API_KEY_NAME;
     const candidate = keys.find(key => key && typeof key === "object" &&
       "name" in key && key.name === name && (!prefer || ("keyType" in key && key.keyType === TEAM_PLAN_KEY_TYPE)));
     const key = candidate ?? projectTokenData(await httpPostJson(url, headers, {
       name, ...(prefer ? { keyType: TEAM_PLAN_KEY_TYPE } : {}), usageScene: 1,
-    }));
+    }), "create_key");
     if (!key || typeof key !== "object" || !("apiKey" in key) ||
         typeof key.apiKey !== "string" || !key.apiKey.trim() ||
-        (prefer && (!("name" in key) || key.name !== name || !("keyType" in key) || key.keyType !== TEAM_PLAN_KEY_TYPE))) throw new Error("project_token_key_unavailable");
+        (prefer && (!("name" in key) || key.name !== name || !("keyType" in key) || key.keyType !== TEAM_PLAN_KEY_TYPE))) throw new PlanAuthError(candidate ? "list_keys" : "create_key", "key_unavailable");
     const apiKeyId = key.apiKey.trim();
+    logDebug("Plan project key available", { stage: candidate ? "list_keys" : "create_key",
+      family, team: !!prefer, keyHash: authHash(apiKeyId) });
     const started = Date.now();
-    const token = projectTokenData(await httpPostJson(`${url}/${encodeURIComponent(apiKeyId)}/access_tokens`,
-      { Authorization: `Bearer ${login}` }, { clientType: "zcode", clientVersion: version })) as {
+    const tokenResponse = await httpPostJson(`${url}/${encodeURIComponent(apiKeyId)}/access_tokens`,
+      { Authorization: `Bearer ${login}` }, { clientType: "zcode", clientVersion: version });
+    const token = projectTokenData(tokenResponse, "issue_project_token") as {
         enable?: boolean; accessToken?: string; tokenType?: string; expiresAt?: number; expiresIn?: number;
       };
-    if (token.enable === false) throw new Error("project_token_disabled");
+    if (token.enable === false) throw new PlanAuthError("issue_project_token", "disabled", tokenResponse);
     if ((token.enable !== undefined && token.enable !== true) || token.tokenType !== "Bearer" ||
         typeof token.accessToken !== "string" || !token.accessToken.trim() ||
         typeof token.expiresAt !== "number" || !Number.isFinite(token.expiresAt) ||
         typeof token.expiresIn !== "number" || !Number.isFinite(token.expiresIn) || token.expiresIn <= 0) {
-      throw new Error("project_token_invalid_response");
+      throw new PlanAuthError("issue_project_token", "invalid_response", tokenResponse);
     }
     const expiresAt = Math.min(token.expiresAt * 1000, started + token.expiresIn * 1000);
-    if (expiresAt <= Date.now()) throw new Error("project_token_expired");
+    if (expiresAt <= Date.now()) throw new PlanAuthError("issue_project_token", "expired", tokenResponse);
     const latest = await readCredentialsWithRetry();
     if (planTokens.get(scope) !== current ||
         latest[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] !== oauth) {
@@ -701,16 +738,17 @@ async function resolveProjectToken(
     }
     current.value = { apiKey: token.accessToken.trim(), apiKeyId, accountScope: scope };
     current.refreshAt = expiresAt - Math.min(120_000, (expiresAt - started) / 5);
+    logInfo("Plan login resolved", { family, team: !!prefer, stage: "exchange_project_token", credentialHash: authHash(token.accessToken.trim()) });
     return current.value;
   })();
   try { return await current.pending; }
   finally { current.pending = undefined; }
 }
 
-function projectTokenData(response: { code: number; data: unknown }): unknown {
-  if (![0, 200, "0", "200"].includes(response.code) || !response.data || typeof response.data !== "object") {
-    throw new Error("project_token_invalid_response");
-  }
+function projectTokenData(response: PlanResponse, stage: string): unknown {
+  if (!bizOk(response)) throw new PlanAuthError(stage, "rejected", response);
+  if (response.code == null) throw new PlanAuthError(stage, "invalid_response", response);
+  if (!response.data || typeof response.data !== "object") throw new PlanAuthError(stage, "invalid_response", response);
   return response.data;
 }
 
@@ -727,10 +765,14 @@ export async function tryPlanOAuth(
     const accessToken =
       creds[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] ??
       null;
-    if (!accessToken) {
+    if (!accessToken?.trim().replace(/^Bearer\s+/i, "")) {
       logWarn("Desktop OAuth token is unavailable", { family });
       return null;
     }
+    // This entry point reads Desktop credentials, not a CLI OAuth callback.
+    logDebug("Plan desktop credential selected", { family, team: !!prefer, stage: "read_credentials",
+      credentialKind: family === "zai" ? "business" : "oauth", credentialHash: authHash(accessToken),
+      protocol: usesProjectTokens(appVersion) ? "project_token" : "legacy" });
     if (usesProjectTokens(appVersion)) {
       stage = "exchange_project_token";
       const auth = await resolveProjectToken(family, accessToken, appVersion!, prefer, rejectedFingerprint);
@@ -740,7 +782,9 @@ export async function tryPlanOAuth(
     const auth = await resolveLegacyPlanKey(family, accessToken, prefer, rejectedFingerprint);
     return { ...auth, activeProvider: activeProvider ?? family };
   } catch (e) {
-    logWarn("Plan API key exchange failed", { family, team: !!prefer, stage, reason: /^project_token_[a-z_]+$/.test((e as Error).message) ? (e as Error).message : undefined, code: (e as NodeJS.ErrnoException).code ?? (e as Error).name, status: /\b(?:401|403|429|5\d\d)\b/.exec((e as Error).message ?? "")?.[0] });
+    const details = planAuthErrorDetails(e);
+    logWarn("Plan API key exchange failed", { ...details, family, team: !!prefer, exchange: stage, stage: details.stage ?? stage });
+    recordDiagnosticEvent("plan_exchange_failed", { ...details, family, team: !!prefer, exchange: stage });
     return null;
   }
 }
@@ -782,7 +826,7 @@ export async function fetchPlanQuota(plan: {
   team?: OrgProject;
 }, appVersion?: string | null): Promise<PlanQuotaLimit[]> {
   if (plan.kind === "start-plan") {
-    return fetchStartPlanQuota(appVersion);
+    return fetchStartPlanQuota(plan.family, appVersion);
   }
 
   // Team plans exchange a key with the desktop's org and project.
@@ -812,7 +856,8 @@ export async function fetchPlanQuota(plan: {
 }
 
 interface StartPlanBalanceResponse {
-  code?: number;
+  code?: number | string;
+  success?: boolean;
   msg?: string;
   data?: {
     server_time?: number;
@@ -823,6 +868,7 @@ interface StartPlanBalanceResponse {
       status?: string;
       starts_at?: number | string | null;
       ends_at?: number | string | null;
+      entitlements?: Array<{ effective_at?: number | string | null }>;
     }>;
     balances?: Array<{
       user_plan_id?: string;
@@ -832,21 +878,53 @@ interface StartPlanBalanceResponse {
       total_units?: number | string | null;
       remaining_units?: number | string | null;
       expires_at?: number | string | null;
+      capabilities?: string[];
     }>;
   };
 }
 
 const START_PLAN_BALANCE_URL = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
 
-async function fetchStartPlanQuota(appVersion?: string | null): Promise<PlanQuotaLimit[]> {
+// Match the desktop's official-glm-model-id mapping; unknown IDs are unchanged.
+const OFFICIAL_GLM_MODEL_NAMES = new Map([
+  "GLM-5.3", "GLM-5.3-Flash", "GLM-5V-Turbo", "GLM-5.2", "GLM-5.1",
+  "GLM-5.1-Highspeed", "GLM-5", "GLM-5-Turbo", "GLM-4.7", "GLM-4.7-FlashX",
+  "GLM-4.7-Flash", "GLM-4.6", "GLM-4.5-Air", "GLM-4.5", "GLM-4.6V",
+  "GLM-4.6V-Flash", "GLM-4.6V-FlashX", "GLM-4.1V-Thinking-FlashX",
+  "GLM-4.1V-Thinking-Flash", "GLM-4-FlashX-250414", "GLM-4-Flash-250414", "GLM-4V-Flash",
+].map(name => [name.toLowerCase(), name]));
+
+/** Start Plan consumes the desktop's ZCode JWT, never a personal/project API key. */
+export async function readStartPlanAuth(family: PlanFamily): Promise<PlanAuth | null> {
   let credentials: Record<string, string>;
   try {
     credentials = await readCredentialsWithRetry();
   } catch {
-    return [];
+    logDebug("Start Plan credential unavailable", { family, reason: "credentials_read_failed" });
+    return null;
   }
-  const jwt = credentials[CRED_KEYS.zcodeJwtToken]?.trim();
-  if (!jwt) return [];
+  const active = credentials[CRED_KEYS.activeProvider]?.trim();
+  if (active && active !== family) {
+    logDebug("Start Plan credential unavailable", { family, reason: "active_provider_mismatch" });
+    return null;
+  }
+  // BigModel's shared JWT belongs to the active OAuth provider. A scoped
+  // provider copy is the desktop's fallback when that ownership is unknown.
+  const shared = family === "zai" || active === family
+    ? credentials[CRED_KEYS.zcodeJwtToken]?.trim() : "";
+  const scoped = shared ? null : readStoredPlanApiKey(`account:${family}-start-plan`, credentials);
+  const jwt = (shared || scoped || "")
+    .replace(/^Bearer\s+/i, "").trim();
+  logDebug("Start Plan credential lookup", { family, source: jwt ? (shared ? "desktop_jwt" : "provider_credential") : "missing" });
+  return jwt ? { apiKey: jwt } : null;
+}
+
+export async function readStartPlanAccess(family: PlanFamily, appVersion?: string | null): Promise<{
+  auth: PlanAuth; models: string[]; quota: PlanQuotaLimit[];
+} | null> {
+  const auth = await readStartPlanAuth(family);
+  if (!auth) return null;
+  const jwt = auth.apiKey;
 
   const url = new URL(START_PLAN_BALANCE_URL);
   // The desktop app version affects which Start Plan entitlements the service
@@ -854,9 +932,24 @@ async function fetchStartPlanQuota(appVersion?: string | null): Promise<PlanQuot
   if (appVersion && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(appVersion)) {
     url.searchParams.set("app_version", appVersion);
   }
-  const response = await httpGetJson(url.toString(), { Authorization: `Bearer ${jwt}` }) as StartPlanBalanceResponse;
-  if (response.code !== 0) {
-    throw new Error(`Failed to read Start Plan balance: ${response.msg ?? response.code ?? "invalid response"}`);
+  const version = url.searchParams.get("app_version");
+  const headers: Record<string, string> = { Authorization: `Bearer ${jwt}` };
+  if (version) headers["X-ZCode-App-Version"] = version;
+  // The balance endpoint requires the device identity already created by ZCode.
+  try {
+    const state = readDesktopJson<{ deviceMid?: unknown }>(path.join(v2Dir(), "telemetry-state.json"));
+    const deviceMid = typeof state.deviceMid === "string" ? state.deviceMid.trim() : "";
+    if (deviceMid && /^[\x21-\x7e]+$/.test(deviceMid)) headers["X-Device-Mid"] = deviceMid;
+  } catch { /* Desktop owns the device identity. Leave it absent if unreadable. */ }
+  const context = { family, appVersion: version, hasDeviceMid: !!headers["X-Device-Mid"] };
+  logInfo("Checking Start Plan access", context);
+  recordDiagnosticEvent("start_plan_check", context);
+  const response = await httpGetJson(url.toString(), headers) as StartPlanBalanceResponse;
+  if (response.success === false || (response.code !== undefined && !["0", "200"].includes(String(response.code)))) {
+    const details = { family, stage: "start_plan_balance", resultCode: resultCode(response.code) };
+    logWarn("Start Plan balance rejected", details);
+    recordDiagnosticEvent("start_plan_rejected", details);
+    return null;
   }
 
   const plans = Array.isArray(response.data?.plans) ? response.data.plans : [];
@@ -868,11 +961,15 @@ async function fetchStartPlanQuota(appVersion?: string | null): Promise<PlanQuot
     const start = finitePositive(plan.starts_at);
     const end = finitePositive(plan.ends_at);
     return status === "active" &&
-      (id.includes("start-plan") || id.includes("start plan") || name.includes("start-plan") || name.includes("start plan")) &&
+      ((!id && !name) || id.includes("start-plan") || id.includes("start plan") || name.includes("start-plan") || name.includes("start plan")) &&
       (start === null || start <= now) &&
       (end === null || end > now);
   });
-  if (activePlans.length === 0) return [];
+  if (activePlans.length === 0) {
+    logInfo("No active Start Plan found", { family, planCount: plans.length });
+    recordDiagnosticEvent("start_plan_unavailable", { family, reason: "no_active_plan", planCount: plans.length });
+    return null;
+  }
 
   const balances = Array.isArray(response.data?.balances) ? response.data.balances : [];
   const ownedBalances = balances.filter((balance) => activePlans.some((plan) =>
@@ -886,7 +983,30 @@ async function fetchStartPlanQuota(appVersion?: string | null): Promise<PlanQuot
     });
   }
 
-  return ownedBalances
+  const modelIds = ownedBalances.filter(balance => {
+    const expires = finitePositive(balance.expires_at);
+    return expires === null || expires > now;
+  }).flatMap(balance => {
+    const capabilities = (balance.capabilities ?? []).filter(value => typeof value === "string")
+      .map(value => value.trim()).filter(value => /^model:/i.test(value)).map(value => value.slice(6).trim()).filter(Boolean);
+    return capabilities.length ? capabilities : [balance.show_name?.trim() || ""];
+  }).filter(Boolean).map(value => OFFICIAL_GLM_MODEL_NAMES.get(value.toLowerCase()) ?? value);
+  const seenModels = new Set<string>();
+  const models = modelIds.filter(value => {
+    const key = value.toLowerCase();
+    if (seenModels.has(key)) return false;
+    seenModels.add(key);
+    return true;
+  });
+  const effectiveTimes = activePlans.flatMap(plan => plan.entitlements?.length
+    ? plan.entitlements.map(entry => finitePositive(entry.effective_at)) : [finitePositive(plan.starts_at)]);
+  if (!models.length && effectiveTimes.length && effectiveTimes.every(time => time !== null && time > now)) {
+    recordDiagnosticEvent("start_plan_unavailable", { family, reason: "entitlements_not_effective" });
+    return null;
+  }
+  logDebug("Start Plan entitlement resolved", { stage: "start_plan_balance", family, code: resultCode(response.code),
+    activePlanCount: activePlans.length, modelCount: models.length });
+  const quota = ownedBalances
     .map((balance): PlanQuotaLimit | null => {
       const total = finiteNonNegative(balance.total_units);
       // `available_units` subtracts in-flight reservations; the desktop quota
@@ -905,6 +1025,32 @@ async function fetchStartPlanQuota(appVersion?: string | null): Promise<PlanQuot
       };
     })
     .filter((row): row is PlanQuotaLimit => row !== null);
+  return { auth, models, quota };
+}
+
+async function fetchStartPlanQuota(family: PlanFamily, appVersion?: string | null): Promise<PlanQuotaLimit[]> {
+  return (await readStartPlanAccess(family, appVersion))?.quota ?? [];
+}
+
+/** Null means the service did not establish whether the subscription exists. */
+export async function hasPersonalCodingPlan(family: PlanFamily, apiKey: string): Promise<boolean | null> {
+  const response = await httpGetJson(`${PLAN_HOST[family]}/api/biz/subscription/list`, { Authorization: apiKey });
+  const data = response.data;
+  let entitled: boolean | null = null;
+  if (bizOk(response) && Array.isArray(data)) {
+    entitled = false;
+    for (const item of data) {
+      const plan = item as { productId?: string; productName?: string; status?: string; inCurrentPeriod?: boolean } | null;
+      if (!plan || ![plan.productId, plan.productName].some(value => typeof value === "string" && value.toLowerCase().includes("coding"))) continue;
+      if (plan.status === "VALID" && plan.inCurrentPeriod === true) {
+        entitled = true;
+        break;
+      }
+      if (typeof plan.status !== "string" || typeof plan.inCurrentPeriod !== "boolean") entitled = null;
+    }
+  }
+  logDebug("Personal Coding Plan entitlement resolved", { stage: "personal_plan_entitlement", family, code: resultCode(response.code), entitled });
+  return entitled;
 }
 
 function finiteNonNegative(value: unknown): number | null {

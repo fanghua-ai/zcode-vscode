@@ -1,5 +1,5 @@
 /**
- * Mask credentials before text reaches the output channel, error notifications or the clipboard.
+ * Mask credentials in exported/shared text and error notifications.
  * Every pattern repeats a single character class or two disjoint alternatives, so matching stays linear.
  */
 const REDACTED = "[REDACTED]";
@@ -7,7 +7,13 @@ const REDACTED = "[REDACTED]";
 const AUTH_NAMES = "(?:proxy-)?authorization";
 const AUTH_TOKEN = String.raw`[^\s"',;}=\\]`;
 // Usage counters (inputTokens, outputTokens, tokens) do not match these names thanks to the word boundaries.
-const FIELD_NAMES = "api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd";
+const FIELD_NAMES = "api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|client[_-]?secret|secret|password|passwd|pwd|(?:set-)?cookie|(?:x-)?device[_-]?mid";
+const SENSITIVE_FIELD = new RegExp(`^(?:${AUTH_NAMES}|${FIELD_NAMES})$`, "i");
+
+/** A sensitive JSON field owns its whole value, including objects and arrays. */
+export function isSensitiveField(name: string): boolean {
+  return SENSITIVE_FIELD.test(name);
+}
 
 // Name, then a separator that may close the name's own quote (plain or backslash-escaped inside a JSON string).
 // A value whose closing quote is missing (a truncated log line) is masked to the end of the line or text,
@@ -43,6 +49,8 @@ const PATTERNS: Array<[RegExp, string]> = [
   [/\bsk-[A-Za-z0-9_-]{8,}/g, REDACTED],
   // JSON Web Tokens
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED],
+  // A plain Cookie header can contain several credentials separated by semicolons.
+  [/\b((?:set-)?cookie[ \t]*:[ \t]*)[^\r\n]+/gi, `$1${REDACTED}`],
   // "password": "a b;c" / 'secret'='x&y' / {\"token\":\"x\"}: a quoted value is masked up to its closing quote.
   ...quotedValue(FIELD_NAMES),
   // Unquoted values (api_key=..., ?token=..., client_secret: ...) stop at the next separator, so passwords
@@ -54,4 +62,43 @@ export function redactSecrets(text: string): string {
   let result = text;
   for (const [pattern, replacement] of PATTERNS) result = result.replace(pattern, replacement);
   return result;
+}
+
+const ORGANIZATION_FIELDS = "(?:bigmodel[-_])?(?:org|organization|organisation)(?:s|[-_ ]?(?:id|name|hash))?";
+const ORGANIZATION_FIELD = new RegExp(`^(?:${ORGANIZATION_FIELDS})$`, "i");
+
+export function isOrganizationField(name: string): boolean {
+  return ORGANIZATION_FIELD.test(name);
+}
+
+/** Mask scalar identifiers and whole organization objects in JSON or log fragments. */
+export function redactOrganizations(text: string): string {
+  const containers = new RegExp(String.raw`\b${ORGANIZATION_FIELDS}\b\\?["']?\s*[:=]\s*[\[{]`, "gi");
+  let result = "", previous = 0;
+  for (let match = containers.exec(text); match; match = containers.exec(text)) {
+    const start = match.index + match[0].length - 1;
+    const encoded = /\\["']\s*[:=]/.test(match[0]);
+    let end = start, depth = 0, quote = "", escaped = false;
+    while (end < text.length) {
+      let char = text[end++];
+      // One JSON-string layer may escape the fragment's structural quotes.
+      if (encoded && char === "\\" && (text[end] === "\\" || text[end] === '"')) char = text[end++];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === quote) quote = "";
+      } else if (char === '"' || char === "'") quote = char;
+      else if (char === "{" || char === "[") depth++;
+      else if ((char === "}" || char === "]") && --depth === 0) break;
+    }
+    result += text.slice(previous, start) + (encoded ? `\\"${REDACTED}\\"` : `"${REDACTED}"`);
+    previous = end;
+    containers.lastIndex = end;
+  }
+  result += text.slice(previous);
+  for (const [pattern, replacement] of quotedValue(ORGANIZATION_FIELDS)) result = result.replace(pattern, replacement);
+  return result
+    .replace(new RegExp(String.raw`\b(${ORGANIZATION_FIELDS})\b(["']?\s*[:=]\s*)(?=[^\s"'\[{])[^\r\n"&,;}]+`, "gi"), `$1$2"${REDACTED}"`)
+    .replace(/(\/(?:organizations?|orgs?)\/)[^/\s?\#"',;\\]+/gi, `$1${REDACTED}`)
+    .replace(/\borg-[A-Za-z0-9_-]+\b/gi, REDACTED);
 }

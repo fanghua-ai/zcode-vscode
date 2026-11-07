@@ -295,11 +295,9 @@ for (const family of ["bigmodel", "zai"] as const) {
       providerFamilyDomain: family,
       modelProviderFamilyModes: { [family]: "oauth" },
     };
-    assert.deepEqual(readPlanSelection(base), {
-      family,
-      kind: "individual-coding-plan",
-      providerId: `builtin:${family}-coding-plan`,
-    });
+    assert.equal(readPlanSelection(base), null, "missing selection is not proof of a personal subscription");
+    assert.equal(readPlanSelection({ ...base, providerFamilyConnectionSelections: { [family]: { kind: "individual-coding-plan" } } })?.kind,
+      "individual-coding-plan");
     assert.deepEqual(readPlanSelection({
       ...base,
       providerFamilyConnectionSelections: {

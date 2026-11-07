@@ -20,7 +20,7 @@ type Kind = "string" | "longString" | "path" | "dataUrl" | "number" | "boolean" 
   | "fileUris" | "attachments" | "patches" | "fileChange" | "chips" | "chip" | "sessionRefs" | "stringList";
 
 export const KNOWN_WEBVIEW_MESSAGE_TYPES: ReadonlySet<string> = new Set([
-  "archiveSession", "attachFileUris", "copy", "copyDiagnostics", "deleteSession", "editLast",
+  "archiveSession", "attachFileUris", "copy", "copyDiagnostics", "copyLog", "deleteSession", "editLast",
   "fileReferenceDetails", "historyRenderTiming", "insert", "installMathFonts", "listSessions", "loadFileChanges",
   "loadOlder", "loadPreviewFiles", "loadThrough", "newSession", "openCommunity", "openDiff",
   "openFile", "openGitDiff", "openMarkdownFile", "openRecoverySettings", "permissionAnswer",

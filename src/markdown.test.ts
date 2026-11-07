@@ -104,3 +104,17 @@ test("native Markdown handles open backtick and tilde fences without changing th
     }
   });
 });
+
+
+test("Chinese strong delimiters support quoted openers and adjacent closers without rewriting escapes or code", () => {
+  withoutDom(() => {
+    for (const streaming of [false, true]) {
+      const text='结论先行：我的建议是**“规则升级 + 一个只读校验器”为主，机制只加一个可选项**——目标是把静默失败变成响亮失败。';
+      assert.match(renderMarkdown(text,streaming), /我的建议是<strong>“规则升级 \+ 一个只读校验器”为主，机制只加一个可选项<\/strong>——/);
+      assert.match(renderMarkdown('建议是**“规则升级”**然后验证',streaming), /是<strong>“规则升级”<\/strong>然后/);
+      assert.doesNotMatch(renderMarkdown(String.raw`建议是\*\*“原样显示”\*\*`,streaming), /<strong>/);
+      assert.doesNotMatch(renderMarkdown('`建议是**“代码”**`',streaming), /<strong>/);
+      assert.doesNotMatch(renderMarkdown('word**“quoted”**',streaming), /<strong>/);
+    }
+  });
+});

@@ -205,6 +205,31 @@ test("quota refresh runs only while the chat view is visible", () => {
   assert.equal(state.quotaTimer, null);
 });
 
+test("Start session quota follows the resolved session plan rather than stale personal desktop selection", async () => {
+  const calls: unknown[] = [];
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test",
+    readQuotaPlan: () => ({ family: "bigmodel", kind: "individual-coding-plan", providerId: "builtin:bigmodel-coding-plan" }),
+    fetchPlanQuota: async plan => { calls.push(plan); return []; }, onEvent: () => {},
+  });
+  const state = client as unknown as Internals;
+  state.sessionId = "start-session";
+  state.sessionModel = { providerId: "account:bigmodel-start-plan", modelId: "GLM-5.3-Flash" };
+  await state.refreshPlanQuota(); client.dispose();
+  assert.deepEqual(calls, [{ family: "bigmodel", kind: "start-plan", providerId: "account:bigmodel-start-plan" }]);
+});
+
+test("personal account session quota remains available when desktop selection is missing", async () => {
+  const calls: unknown[] = [];
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", readQuotaPlan: () => null,
+    fetchPlanQuota: async plan => { calls.push(plan); return []; }, onEvent: () => {},
+  });
+  const state = client as unknown as Internals;
+  state.sessionId = "personal-session";
+  state.sessionModel = { providerId: "account:bigmodel-individual-coding-plan", modelId: "GLM-5.3" };
+  await state.refreshPlanQuota(); client.dispose();
+  assert.deepEqual(calls, [{ family: "bigmodel", kind: "individual-coding-plan", providerId: "account:bigmodel-individual-coding-plan" }]);
+});
+
 test("built-in provider adapters use the generic quota path and fall back to ZCode quota", async () => {
   const plan = { family: "bigmodel" as const, kind: "individual-coding-plan" as const, providerId: "builtin:bigmodel-coding-plan" };
   const planQuota = [{ label: "5 小时", remainingPercent: 75, usedPercent: 25 }];
@@ -2500,6 +2525,46 @@ test("release after a failed new attachment never replays the previous conversat
   }finally{client.dispose();}
 });
 
+for (const availableStart of [true, false]) {
+  test(`new Start session selects its registered model despite stale personal/paid defaults (available=${availableStart})`, async () => {
+    const { client, state } = fixture();
+    client.setDefaultRuntime({ providerId: "builtin:bigmodel-start-plan", providerName: "Start Plan", modelId: "GLM-5.3-Flash",
+      kind: "anthropic", baseURL: "https://zcode.z.ai/api/v1/zcode-plan/anthropic", apiKey: "TEST-JWT",
+      models: { "GLM-5.3-Flash": {} }, source: "desktop-personal-oauth" });
+    const desired = { providerId: "account:bigmodel-start-plan", modelId: "GLM-5.3-Flash" };
+    const personal = { providerId: "account:bigmodel-individual-coding-plan", modelId: "GLM-5.3" };
+    const paid = { providerId: "paid", modelId: "paid" };
+    let selected = personal;
+    const writes: unknown[] = [];
+    state.subscribeConversation = async () => {};
+    state.sendRequest = async (method, params) => {
+      const snapshot = { settings: { model: { current: selected,
+        available: [paid, personal, ...(availableStart ? [desired] : [])].map(ref => ({ ref })),
+      } } };
+      if (method === "session/create") { state.sessionId = "START"; return {}; }
+      if (method === "session/subscribe") return { snapshot };
+      if (method === "session/read") return snapshot;
+      if (method === "v4/command") {
+        const command = params as { payload: { provider: string; model: string } };
+        writes.push(command.payload);
+        assert.equal(command.payload.provider, desired.providerId);
+        selected = desired;
+        return { status: "accepted" };
+      }
+      if (method === "session/send") assert.fail("failed Start setup must never send through the stale model");
+      return {};
+    };
+    try {
+      if (availableStart) { await client.newSession(); assert.ok(writes.length); assert.deepEqual(selected, desired); }
+      else {
+        await assert.rejects(client.newSession());
+        await assert.rejects(client.sendMessage("RETRY_START_MESSAGE"));
+        assert.equal(writes.length, 0);
+      }
+    } finally { client.dispose(); }
+  });
+}
+
 for (const current of [true, false]) {
   test(`new account session uses workspace registry instead of absent builtin provider (${current ? "current" : "available"})`, async () => {
     const {client,state,events}=fixture();
@@ -3066,4 +3131,22 @@ test("the create response wins over a previous chat's late runtime-preferences i
     await client.newSession();
     assert.equal(client.currentSessionId, "CREATED");
   } finally { client.dispose(); }
+});
+
+
+test("model stream delivers original tool input when scheduled events omit it", () => {
+  const events: ZCodeEvent[] = [];
+  const client = new ZCodeClient({binaryPath:"/unused",workspacePath:"/test",onEvent:event=>events.push(event)});
+  const state = client as unknown as Internals;
+  state.sessionId = "A";
+  try {
+    state.handleSessionEvent({sessionId:"B",type:"model.streaming",payload:{kind:"tool_call",toolCallId:"foreign",toolName:"Bash",input:{command:"wrong session"}}});
+    assert.equal(events.filter(e=>e.type==="tool_call").length,0);
+    state.handleSessionEvent({sessionId:"A",type:"model.streaming",payload:{kind:"tool_call",toolCallId:"shell",toolName:"Bash",input:{command:"date",description:"Read clock"}}});
+    state.handleSessionEvent({sessionId:"A",type:"tool.updated",payload:{kind:"scheduled",toolCallId:"shell",toolName:"Bash",inputOmitted:true,inputRef:"model_stream"}});
+    state.handleSessionEvent({sessionId:"A",type:"tool.updated",payload:{kind:"result",toolCallId:"shell",result:"2026-11-04"}});
+    const tools=events.filter(e=>e.type==="tool_call");
+    assert.equal(JSON.parse((tools[0].data as {inputText:string}).inputText).command,"date");
+    assert.equal((tools[2].data as {outputText:string}).outputText,"2026-11-04");
+  } finally {client.dispose();}
 });

@@ -209,6 +209,8 @@ try {
     check(document.getElementById('language-label').textContent === 'Interface language','language label was not translated');
     check(document.getElementById('input').placeholder === 'Ask ZCode, @ to add context, / to choose commands or capabilities','composer placeholder was not translated');
     check(document.getElementById('conn-label').textContent === 'Stopped','existing status was not translated');
+    check(document.getElementById('diagnostics-export-help').textContent.includes('automatically redacted')
+      && document.getElementById('copy-diagnostics').getAttribute('aria-describedby')==='diagnostics-export-help','diagnostic export review notice missing in English settings');
     check(messages.querySelector('.work-fold-label')?.textContent === 'Worked 1m 5s','work fold did not change language');
     check(permissionTitle.textContent===literalTool+' requires approval','dynamic permission label was reverse-matched or untranslated');
     check(languageTool.querySelector('.tool-status').textContent==='Completed','tool status was not translated');
@@ -226,6 +228,7 @@ try {
     emit({type:'ui_language',language:'zh-CN',setting:'auto'});
     check(languageSelect.value === 'auto','automatic language preference was not retained');
     check(document.getElementById('conn-label').textContent === '已停止','switching language back failed');
+    check(document.getElementById('diagnostics-export-help').textContent.includes('自动脱敏；完成后请自行再检查一遍'),'diagnostic export notice did not switch back to Chinese');
     languageSelect.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
     check(document.getElementById('settings-menu').hidden,'Escape did not close settings menu');
     const usageToggle=document.getElementById('context-meter');

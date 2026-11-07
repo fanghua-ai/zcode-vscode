@@ -152,6 +152,40 @@ async function runScenarios() {
     "reply rendered before its tool");
 
   ready();
+  const updateTool = outputText => emit({ type: "tool_call", toolCallId: "detail", toolName: "read",
+    status: "running", inputText: "test.txt", outputText });
+  const initialOutput = "selected output\n" + "line\n".repeat(150);
+  updateTool(initialOutput);
+  const detail = document.getElementById("tool-detail");
+  detail.querySelector(".tool-head").click();
+  drainFrames();
+  const detailBody = detail.querySelector(".tool-body");
+  const input = detail.querySelector(".tool-io:not(.out)");
+  const output = detail.querySelector(".tool-io.out");
+  const text = output.firstChild;
+  output.style.cssText = "max-height:80px;overflow:auto";
+  output.scrollTop = 40;
+  const scroll = output.scrollTop;
+  const range = document.createRange();
+  range.setStart(text, 0); range.setEnd(text, 8);
+  const selection = getSelection();
+  selection.removeAllRanges(); selection.addRange(range);
+  const mutations = new MutationObserver(() => {});
+  mutations.observe(detailBody, { subtree: true, childList: true, characterData: true });
+  updateTool(initialOutput);
+  check(mutations.takeRecords().length === 0, "identical tool output mutated the detail body");
+  updateTool(initialOutput + "<tail>&");
+  check(detail.querySelector(".tool-io.out") === output && output.firstChild === text
+    && detail.querySelector(".tool-io:not(.out)") === input, "tool append replaced detail nodes");
+  check(selection.toString() === "selected", "tool append lost the selected output");
+  check(output.scrollTop === scroll && scroll > 0, "tool append reset output scroll");
+  check(output.textContent.endsWith("<tail>&") && !output.querySelector("tail"), "tool append failed escaping");
+  updateTool("selected replacement");
+  check(output.firstChild === text && output.textContent === "selected replacement", "tool refresh failed to replace text in place");
+  mutations.disconnect();
+  selection.removeAllRanges();
+
+  ready();
   delta("parked-code", "```javascript\nconst earlier = 1;\n```");
   delta("latest-part", "LATEST_PART"); window.stepFrame();
   emit({ type: "status", sessionId: "stream-test", status: "completedSuccess" });

@@ -10,7 +10,8 @@ import type { PickerModel, ResolvedRuntime } from "./desktop";
 import { ZCodeClient } from "./zcodeClient";
 import { StartupTiming } from "./startupTiming";
 import type { AvailableModel } from "./zcodeClient";
-import { setTestLanguage, setTestFiles, workspace, window as testWindow, recoveryCalls, recoveryNotices, setInformationChoice, configUpdates, resetConfigValues } from "./testSupport/vscode";
+import { setTestLanguage, setTestFiles, workspace, window as testWindow, commands, recoveryCalls, recoveryNotices, setInformationChoice, configUpdates, resetConfigValues } from "./testSupport/vscode";
+import { DiffDocuments } from "./diffDocuments";
 
 function deferred() {
   let resolve!: (value?: unknown) => void;
@@ -122,6 +123,35 @@ test("Markdown file links open workspace images and reject stale or escaping pat
     assert.equal(recoveryNotices.length, rejected.length, "rejected local links gave no actionable feedback");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("failed diff commands release virtual documents from both opening paths", async () => {
+  const originalExecute = commands.executeCommand;
+  const failedDiffUris: Array<{ toString(): string }> = [];
+  commands.executeCommand = async (command: string, ...args: unknown[]) => {
+    if (command === "vscode.diff") {
+      failedDiffUris.push(args[0] as { toString(): string }, args[1] as { toString(): string });
+      throw new Error("DIFF_REJECTED");
+    }
+    return originalExecute(command, ...args);
+  };
+  try {
+    const f = fixture();
+    const state = f.state as typeof f.state & {
+      diffDocs: DiffDocuments;
+      openGitDiff: (filePath: string, patches: unknown[], reverted: boolean) => Promise<void>;
+      openFileDiff: (change: { path: string; kind: "edit"; before: string; after: string }) => Promise<void>;
+    };
+    await assert.rejects(state.openGitDiff("file.ts", [], true), /DIFF_REJECTED/);
+    assert.equal(state.diffDocs.provideTextDocumentContent(failedDiffUris[0] as never), "");
+    assert.equal(state.diffDocs.provideTextDocumentContent(failedDiffUris[1] as never), "");
+    await assert.rejects(state.openFileDiff({ path: "file.ts", kind: "edit", before: "old", after: "new" }), /DIFF_REJECTED/);
+    assert.equal(state.diffDocs.provideTextDocumentContent(failedDiffUris[2] as never), "");
+    assert.equal(state.diffDocs.provideTextDocumentContent(failedDiffUris[3] as never), "");
+    f.dispose();
+  } finally {
+    commands.executeCommand = originalExecute;
   }
 });
 
@@ -239,6 +269,25 @@ test("desktop-managed shortcut and OAuth providers reject stale live catalog mod
     ["account:bigmodel-team-coding-plan", "GLM-5.3"],
     ["other-provider", "live-model"],
   ], "keep configured official OAuth models but reject stale models from both managed catalogs");
+});
+
+test("the Start Plan picker prefers the live account provider over its login alias", () => {
+  const configured: PickerModel = {
+    providerId: "builtin:bigmodel-start-plan",
+    providerName: "Start Plan",
+    kind: "anthropic",
+    modelId: "glm-5.3",
+    label: "GLM-5.3",
+    hasKey: true,
+  };
+  const account = { providerId: "account:bigmodel-start-plan", modelId: "GLM-5.3", label: "GLM-5.3" };
+  const custom = { ...account, providerId: "custom" };
+  assert.equal(mergeAvailablePickerModels([configured], [])[0].providerId, configured.providerId);
+  assert.deepEqual(mergeAvailablePickerModels([configured], [configured, account, custom])
+    .map(model => [model.providerId, model.modelId]), [
+    [account.providerId, account.modelId],
+    [custom.providerId, custom.modelId],
+  ]);
 });
 
 test("authoritative desktop provider inventory rejects deleted providers from the live catalog", () => {
@@ -819,6 +868,27 @@ test("queue mutations require their exact owning session", async () => {
   f.handler({ type: "queueDelete", queueItemId: "q-A" });
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(calls, ["edit", "delete"]);
+  f.dispose();
+});
+
+test("account plan login failure does not silently start an available paid provider", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-start-no-fallback-"));
+  const originalHome = nodeOs.homedir; nodeOs.homedir = () => root;
+  t.after(() => { nodeOs.homedir = originalHome; fs.rmSync(root, { recursive: true, force: true }); });
+  const dir = path.join(root, ".zcode/v2"); fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: "bigmodel",
+    providerFamilyConnectionSelections: { bigmodel: { kind: "start-plan" } },
+  }));
+  fs.writeFileSync(path.join(dir, "credentials.json"), "{}");
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+    paid: { kind: "anthropic", options: { apiKey: "TEST-PAID-KEY" }, models: { paid: {} } },
+  } }));
+  const f = fixture();
+  const state = f.state as unknown as { settleStartupLogin: (request: {}) => Promise<import("./desktop").ResolveResult> };
+  const resolved = await state.settleStartupLogin({});
+  assert.ok(resolved.picker.some(model => model.providerId === "paid" && model.hasKey));
+  assert.equal(resolved.ok, false);
+  assert.equal(resolved.runtime, undefined);
   f.dispose();
 });
 
@@ -1445,4 +1515,36 @@ test("a superseded foreground page still completes when its hidden replacement f
   await more;
   assert.equal(f.posted.filter(message=>message.type==="sessions").length,1,"a hidden failure or obsolete page replaced cached rows");
   assert.deepEqual(f.posted.at(-1),{type:"session_list_complete",requestId:"foreground-more"});
+});
+
+
+test("model selections serialize delayed resolution and switching in selection order", async () => {
+  const f = fixture();
+  const first = deferred(), second = deferred(), switching = deferred();
+  const resolved: string[] = [], switched: string[] = [];
+  Object.assign(f.state.client, { isGenerating: () => false, setModel: async (_provider: string, model: string) => {
+    switched.push(model);
+    if (model === "first") await switching.promise;
+  } });
+  f.state.resolveSessionModelRuntime = async model => {
+    resolved.push(model.modelId);
+    await (model.modelId === "first" ? first : second).promise;
+    return null;
+  };
+  f.state.pushModels = async () => {};
+  const select = f.state as unknown as { selectModel(provider: string, model: string): Promise<void> };
+  const a = select.selectModel("sample", "first");
+  const b = select.selectModel("sample", "second");
+  second.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(resolved, ["first"]);
+  assert.deepEqual(switched, []);
+  first.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(switched, ["first"]);
+  assert.deepEqual(resolved, ["first"]);
+  switching.resolve();
+  await Promise.all([a, b]);
+  assert.deepEqual(switched, ["first", "second"]);
+  assert.deepEqual(f.state.currentModel, { providerId: "sample", modelId: "second" });
 });

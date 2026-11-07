@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { type V2Provider, usesProjectTokens, tryPlanOAuth, fetchPlanQuota, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey } from "./credentials";
+import { type V2Provider, usesProjectTokens, tryPlanOAuth, fetchPlanQuota, readStartPlanAccess, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey, pickOrgAndProject, planAuthErrorDetails } from "./credentials";
 import { readDesktopJsonWithRetry } from "./desktopJson";
 import { mergeDesktopApiProviders, syncCliConfig, resolveProviderRequestAuth, resolveRuntime, resolveRuntimeForSession } from "./desktop";
 import { ZCodeClient } from "./zcodeClient";
@@ -367,7 +367,7 @@ for (const transient of [true, false]) {
     t.after(() => { https.get = get; });
     const request = resolveApiKey("bigmodel","TEST-TOKEN",{organizationId:"test-org",projectId:"test-project"});
     if (transient) { assert.equal(await request,"TEST-KEY.TEST-SECRET"); assert.equal(calls,3); }
-    else { await assert.rejects(request,/Failed to list API keys/); assert.equal(calls,1); }
+    else { await assert.rejects(request,/list_keys: rejected/); assert.equal(calls,1); }
   });
 }
 
@@ -378,21 +378,24 @@ function mockPlanQuotaApi(t: TestContext, issueToken?: () => unknown, listedKeys
   const originalRequest = https.request;
   const requests: Array<{ method: string; host: string; path: string; headers: Record<string, string>; body?: string }> = [];
   let holdRequest: ((method: string, requestPath: string, headers: Record<string, string>) => Promise<void>) | undefined;
+  let overrideResponse: ((requestPath: string, payload: unknown) => { payload: unknown; status?: number }) | undefined;
   const respond = (method: string, host: string, requestPath: string, headers: Record<string, string>, body: string, callback: (response: unknown) => void) => {
     requests.push({ method, host, path: requestPath, headers, ...(body ? { body } : {}) });
     let payload: unknown;
-    if (requestPath === "/api/auth/z/login") {
-      payload = { code: 200, data: { access_token: "TEST-ZAI-BIZ-TOKEN" } };
-    } else if (requestPath === "/api/biz/customer/getCustomerInfo") {
+    if (requestPath === "/api/biz/customer/getCustomerInfo") {
       payload = { code: 200, data: { organizations: [{ organizationId: "org-current", projects: [{ projectId: "project-current" }] }] } };
+    } else if (requestPath.startsWith("/api/v1/zcode-plan/billing/balance")) {
+      payload = { code: 0, data: { plans: [], balances: [] } };
+    } else if (requestPath === "/api/biz/subscription/list") {
+      payload = { code: 200, data: [{ productName: "Coding Plan", status: "VALID", inCurrentPeriod: true }] };
     } else if (requestPath.endsWith("/api_keys")) {
       const isTeam = headers["bigmodel-organization"] === "org-current";
       payload = { code: 200, data: [{ name: isTeam ? "zcode-team-api-key" : "zcode-api-key", keyType: isTeam ? 2 : 1, apiKey: isTeam ? "TEST-TEAM-KEY-ID" : "TEST-PERSONAL-KEY-ID" }] };
       if (listedKeys) payload = { code: 200, data: method === "GET" ? listedKeys : {
         ...JSON.parse(body), apiKey: "TEST-CREATED-KEY-ID",
       } };
-    } else if (requestPath.endsWith("/access_tokens") && issueToken) {
-      payload = issueToken();
+    } else if (requestPath.endsWith("/access_tokens")) {
+      payload = issueToken?.() ?? { code: 200, data: { accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600 } };
     } else if (requestPath.includes("/copy/")) {
       payload = { code: 200, data: { secretKey: "TEST-ONLY-SECRET" } };
     } else if (requestPath.startsWith("/api/monitor/usage/quota/limit")) {
@@ -403,9 +406,11 @@ function mockPlanQuotaApi(t: TestContext, issueToken?: () => unknown, listedKeys
     } else {
       throw new Error(`Unexpected simulated plan request: ${method} ${host}${requestPath}`);
     }
+    const override = overrideResponse?.(requestPath, payload);
     const response = new EventEmitter();
+    Object.assign(response, { statusCode: override?.status ?? 200, complete: true, destroy() {} });
     callback(response);
-    response.emit("data", JSON.stringify(payload));
+    response.emit("data", JSON.stringify(override?.payload ?? payload));
     response.emit("end");
   };
   https.get = ((input: string | URL, options: { headers?: Record<string, string> }, callback: (response: unknown) => void) => {
@@ -437,7 +442,8 @@ function mockPlanQuotaApi(t: TestContext, issueToken?: () => unknown, listedKeys
   };
   https.request = post as unknown as typeof https.request;
   t.after(() => { https.get = originalGet; https.request = originalRequest; });
-  return { requests, hold(next: typeof holdRequest) { holdRequest = next; } };
+  return { requests, hold(next: typeof holdRequest) { holdRequest = next; },
+    respond(next: typeof overrideResponse) { overrideResponse = next; } };
 }
 
 for (const appVersion of ["3.14.4", "3.16.2"]) {
@@ -603,21 +609,19 @@ for (const family of ["bigmodel", "zai"] as const) {
 }
 
 for (const family of ["bigmodel", "zai"] as const) {
-  test(`${family} Start Plan OAuth fallback shares exchanges but a newly stored key takes precedence`, async t => {
+  test(`${family} Start Plan never falls back to OAuth personal API key exchange`, async t => {
     const dir = fixture(t), file = path.join(dir, "credentials.json");
     const credentials = { [`oauth:${family}:access_token`]: "TEST-OAUTH" };
     fs.writeFileSync(file, JSON.stringify(credentials));
     const planApi = mockPlanQuotaApi(t); const { requests } = planApi;
     const providerId = `account:${family}-start-plan`;
     const resolve = () => resolveProviderRequestAuth(providerId, "3.16.2");
-    const [first, concurrent] = await Promise.all([resolve(), resolve()]);
-    assert.ok(first?.apiKey);
-    assert.equal(concurrent?.apiKey, first.apiKey);
-    assert.equal(requests.filter(r => r.path.endsWith("/api_keys")).length, 1);
+    assert.equal(await resolve(), null);
+    assert.equal(requests.length, 0);
     fs.writeFileSync(file, JSON.stringify({ ...credentials,
       [`account-provider:coding-plan:${providerId}:account:test:api-key`]: "TEST-STORED-KEY" }));
     assert.equal((await resolve())?.apiKey, "TEST-STORED-KEY", "cached OAuth must not hide a new desktop key");
-    assert.equal(requests.filter(r => r.path.endsWith("/api_keys")).length, 1);
+    assert.equal(requests.length, 0);
   });
 }
 
@@ -625,7 +629,8 @@ for (const family of ["bigmodel", "zai"] as const) {
   for (const kind of ["individual-coding-plan", "team-coding-plan"] as const) {
     test(`${family} ${kind} quota uses the selected OAuth account and scope`, async t => {
       const dir = fixture(t);
-      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ [`oauth:${family}:access_token`]: `TEST-${family.toUpperCase()}-OAUTH` }));
+      const storedLogin = family === "zai" ? "TEST-ZAI-DESKTOP-BUSINESS" : "TEST-BIGMODEL-OAUTH";
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ [`oauth:${family}:access_token`]: storedLogin }));
       const planApi = mockPlanQuotaApi(t); const { requests } = planApi;
       const team = kind === "team-coding-plan" ? { organizationId: "org-current", projectId: "project-current" } : undefined;
       const quota = await fetchPlanQuota({ family, kind, ...(team ? { team } : {}) });
@@ -642,7 +647,7 @@ for (const family of ["bigmodel", "zai"] as const) {
       const customerRequest = requests.find(request => request.path === "/api/biz/customer/getCustomerInfo");
       const keyListRequest = requests.find(request => request.path.endsWith("/api_keys"));
       assert.ok(keyListRequest, "selected account and project key were not resolved");
-      const businessToken = family === "zai" ? "Bearer TEST-ZAI-BIZ-TOKEN" : "TEST-BIGMODEL-OAUTH";
+      const businessToken = family === "zai" ? `Bearer ${storedLogin}` : storedLogin;
       assert.equal(keyListRequest.headers.Authorization, businessToken);
       if (kind === "team-coding-plan") {
         assert.equal(customerRequest, undefined, "team scope must use the desktop-selected project directly");
@@ -655,22 +660,238 @@ for (const family of ["bigmodel", "zai"] as const) {
         assert.equal(customerRequest.headers.Authorization, businessToken);
         assert.equal(quotaRequest.headers["bigmodel-organization"], undefined);
       }
-      if (family === "zai") {
-        const exchange = requests.find(request => request.path === "/api/auth/z/login");
-        assert.ok(exchange, "Z.ai OAuth token exchange missing");
-        assert.equal(exchange.host, "api.z.ai");
-        assert.equal(JSON.parse(exchange.body ?? "{}").token, "TEST-ZAI-OAUTH");
-      } else {
-        assert.equal(requests.some(request => request.path === "/api/auth/z/login"), false);
+      assert.equal(requests.some(request => request.path === "/api/auth/z/login"), false,
+        "Desktop credentials must never be exchanged as raw OAuth tokens");
+    });
+  }
+}
+
+for (const failure of ["no-entitlement", "expired", "pending", "other-account", "no-jwt", "http-error"] as const) {
+  test(`Start Plan ${failure} does not reuse personal keys or silently select paid API`, async t => {
+    const dir = fixture(t);
+    fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+      "oauth:active_provider": failure === "other-account" ? "zai" : "bigmodel",
+      "oauth:bigmodel:access_token": "TEST-OAUTH", ...(failure === "no-jwt" ? {} : { zcodejwttoken: "TEST-START-JWT" }),
+    }));
+    fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: "bigmodel",
+      providerFamilyConnectionSelections: { bigmodel: { kind: "start-plan" } },
+    }));
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+      "builtin:bigmodel-start-plan": { kind: "anthropic", models: { "GLM-5.3-Flash": {} } },
+      paid: { kind: "anthropic", options: { apiKey: "TEST-PAID-KEY" }, models: { paid: {} } },
+    } }));
+    const api = mockPlanQuotaApi(t);
+    api.respond((requestPath, payload) => requestPath.includes("billing/balance") ? {
+      status: failure === "http-error" ? 403 : 200,
+      payload: { code: 0, data: { server_time: 2000000000,
+        plans: failure === "no-entitlement" ? [] : [{ plan_id: "zcode-v3-start-plan", status: "active",
+          ...(failure === "expired" ? { ends_at: 1900000000 } : {}),
+          ...(failure === "pending" ? { entitlements: [{ effective_at: 2100000000 }] } : {}),
+        }], balances: [],
+      } },
+    } : { payload });
+    const resolved = await resolveRuntime({ appVersion: "3.17.2" });
+    assert.equal(resolved.ok, false);
+    assert.equal(resolved.accountPlanUnavailable, true);
+    assert.equal(api.requests.some(request => request.path.includes("api_keys") || request.path.includes("subscription/list")), false);
+    if (failure === "other-account" || failure === "no-jwt") assert.equal(api.requests.length, 0);
+  });
+}
+
+for (const selection of [undefined, "individual-coding-plan", "team-coding-plan"] as const) {
+  test(`${selection ?? "missing"} selection preserves available personal/team Coding Plan`, async t => {
+    const dir = fixture(t);
+    fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:active_provider": "bigmodel",
+      "oauth:bigmodel:access_token": "TEST-OAUTH", zcodejwttoken: "TEST-START-JWT" }));
+    fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: "bigmodel",
+      ...(selection ? { providerFamilyConnectionSelections: { bigmodel: { kind: selection,
+        ...(selection === "team-coding-plan" ? { organizationId: "org-current", projectId: "project-current" } : {}),
+      } } } : {}),
+    }));
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+      "builtin:bigmodel-coding-plan": { kind: "anthropic", models: { "GLM-5.3": {} } },
+    } }));
+    const api = mockPlanQuotaApi(t);
+    const resolved = await resolveRuntime();
+    assert.equal(resolved.ok, true);
+    assert.equal(resolved.runtime?.providerId, "builtin:bigmodel-coding-plan");
+    assert.equal(resolved.runtime?.apiKey, selection === "team-coding-plan" ? "TEST-TEAM-KEY-ID.TEST-ONLY-SECRET" : "TEST-PERSONAL-KEY-ID.TEST-ONLY-SECRET");
+    if (selection === "team-coding-plan") assert.equal(api.requests.some(request => request.path.includes("billing/balance")), false);
+  });
+}
+
+for (const family of ["bigmodel", "zai"] as const) {
+  for (const appVersion of ["3.14.4", "3.17.1"]) {
+    test(`${family} ${appVersion} keeps personal Coding Plan when the entitlement service is inconclusive`, async t => {
+      const dir = fixture(t);
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+        "oauth:active_provider": family, [`oauth:${family}:access_token`]: "TEST-DESKTOP-TOKEN",
+        zcodejwttoken: "TEST-START-JWT",
+      }));
+      fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: family,
+        providerFamilyConnectionSelections: { [family]: { kind: "individual-coding-plan" } },
+      }));
+      const providerId = `builtin:${family}-coding-plan`;
+      fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+        [providerId]: { kind: "anthropic", models: { "GLM-5.3": {} } },
+      } }));
+      const api = mockPlanQuotaApi(t);
+      for (const response of [
+        { status: 503, payload: {} },
+        { status: 200, payload: { code: 500 } },
+        { status: 200, payload: { code: 200, data: [{ productName: "Coding Plan", status: "VALID" }] } },
+      ]) {
+        api.respond((requestPath, payload) => requestPath.endsWith("/subscription/list") ? response : { payload });
+        const resolved = await resolveRuntime({ appVersion });
+        assert.equal(resolved.ok, true);
+        assert.equal(resolved.runtime?.providerId, providerId);
+        assert.ok(resolved.runtime?.apiKey && resolved.runtime.apiKey !== "TEST-START-JWT");
       }
+      assert.ok(api.requests.some(request => request.path.endsWith("/subscription/list")));
+      assert.equal(api.requests.some(request => request.path.includes("billing/balance")), false);
     });
   }
 }
 
 for (const family of ["bigmodel", "zai"] as const) {
+  for (const appVersion of ["3.14.4", "3.17.1"]) {
+    test(`${family} ${appVersion} keeps personal Coding Plan when both plans are available and no choice was saved`, async t => {
+      const dir = fixture(t);
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+        "oauth:active_provider": family, [`oauth:${family}:access_token`]: "TEST-DESKTOP-TOKEN",
+        zcodejwttoken: "TEST-START-JWT",
+      }));
+      fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: family }));
+      const providerId = `builtin:${family}-coding-plan`;
+      fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+        [providerId]: { kind: "anthropic", models: { "GLM-5.3": {} } },
+      } }));
+      const api = mockPlanQuotaApi(t);
+      api.respond((requestPath, payload) => ({ payload: requestPath.includes("billing/balance") ? {
+        code: 0, data: {
+          plans: [{ user_plan_id: "start", plan_id: "zcode-start-plan", status: "active" }],
+          balances: [{ user_plan_id: "start", capabilities: ["model:GLM-5.3"] }],
+        },
+      } : payload }));
+      const resolved = await resolveRuntime({ appVersion });
+      assert.equal(resolved.runtime?.providerId, providerId);
+      assert.equal(api.requests.some(request => request.path.includes("billing/balance")), false);
+      api.respond((requestPath, payload) => requestPath.endsWith("getCustomerInfo")
+        ? { status: 503, payload: {} } : { payload });
+      // Use a different account token to exercise a fresh exchange.
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+        "oauth:active_provider": family, [`oauth:${family}:access_token`]: "TEST-SECOND-DESKTOP-TOKEN",
+        zcodejwttoken: "TEST-START-JWT",
+      }));
+      const failed = await resolveRuntime({ appVersion });
+      assert.equal(failed.ok, false);
+      assert.equal(api.requests.some(request => request.path.includes("billing/balance")), false);
+    });
+  }
+}
+
+test("Start model names use desktop canonical IDs, deduplicate case-insensitively and preserve unknown spelling", async t => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:active_provider": "bigmodel", zcodejwttoken: "TEST-START-JWT" }));
+  const api = mockPlanQuotaApi(t);
+  api.respond(() => ({ payload: { code: 0, data: {
+    plans: [{ user_plan_id: "start", plan_id: "zcode-v3-start-plan", status: "active" }],
+    balances: [
+      { user_plan_id: "start", capabilities: ["model:glm-5.3-flash", "model:GLM-5.3-Flash", "model:gLm-4.7-fLaShX", "model:glm-Next-Preview"] },
+      { user_plan_id: "start", show_name: "GLM-5.3-FLASH" },
+      { user_plan_id: "start", capabilities: ["model:GLM-NEXT-PREVIEW", "model:CustomMODEL", "model:custommodel"] },
+      { user_plan_id: "start", show_name: "UnKnown-Display-Name" },
+    ],
+  } } }));
+  assert.deepEqual((await readStartPlanAccess("bigmodel"))?.models,
+    ["GLM-5.3-Flash", "GLM-4.7-FlashX", "glm-Next-Preview", "CustomMODEL", "UnKnown-Display-Name"]);
+});
+
+test("missing selection with no entitlements fails even when personal key exchange succeeds", async t => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
+  fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: "bigmodel" }));
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+    "builtin:bigmodel-coding-plan": { kind: "anthropic", models: { "GLM-5.3": {} } },
+    paid: { kind: "anthropic", options: { apiKey: "TEST-PAID-KEY" }, models: { paid: {} } },
+  } }));
+  const api = mockPlanQuotaApi(t);
+  api.respond((requestPath, payload) => ({ payload: requestPath.includes("subscription/list") ? { code: 200, data: [] } : payload }));
+  const resolved = await resolveRuntime();
+  assert.equal(resolved.ok, false);
+  assert.equal(resolved.accountPlanUnavailable, true);
+});
+
+for (const family of ["bigmodel", "zai"] as const) {
+  for (const selection of [undefined, "start-plan", "individual-coding-plan"] as const) {
+    test(`${family} Start-only account resolves ${selection ?? "missing"} selection to JWT and entitled models`, async t => {
+      const dir = fixture(t);
+      fs.writeFileSync(path.join(dir, "telemetry-state.json"), JSON.stringify({ deviceMid: "a383f8b6-2933-48c1-b7da-b3e7faf51a51" }));
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+        "oauth:active_provider": family, [`oauth:${family}:access_token`]: "TEST-OAUTH", zcodejwttoken: "TEST-START-JWT",
+      }));
+      fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: family,
+        ...(selection ? { providerFamilyConnectionSelections: { [family]: { kind: selection } } } : {}),
+      }));
+      fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+        [`builtin:${family}-coding-plan`]: { kind: "anthropic", models: { "GLM-5.3": {} } },
+        [`builtin:${family}-start-plan`]: { kind: "anthropic", options: { baseURL: "https://wrong.example.test" }, models: { "GLM-5.3": {} } },
+        paid: { kind: "anthropic", options: { apiKey: "TEST-PAID-KEY" }, models: { paid: {} } },
+      } }));
+      const api = mockPlanQuotaApi(t);
+      api.respond((requestPath, payload) => ({ payload: requestPath.startsWith("/api/v1/zcode-plan/billing/balance") ? {
+        code: "0", data: { server_time: 2000000000,
+          plans: [{ user_plan_id: "start", plan_id: "zcode-v3-start-plan", status: "active" }],
+          balances: [{ user_plan_id: "start", show_name: "套餐额度", capabilities: ["model:glm-5.3-flash"], total_units: 100, remaining_units: 80 }],
+        },
+      } : requestPath === "/api/biz/subscription/list" ? { code: 200, data: [] } : payload }));
+      const resolved = await resolveRuntime({ appVersion: "3.17.2" });
+      assert.equal(resolved.ok, true);
+      assert.equal(resolved.runtime?.providerId, `builtin:${family}-start-plan`);
+      assert.equal(resolved.runtime?.apiKey, "TEST-START-JWT");
+      assert.equal(resolved.runtime?.baseURL, "https://zcode.z.ai/api/v1/zcode-plan/anthropic");
+      assert.equal(resolved.runtime?.modelId, "GLM-5.3-Flash");
+      assert.deepEqual(Object.keys(resolved.runtime?.models ?? {}), ["GLM-5.3-Flash"]);
+      assert.ok(resolved.picker.some(model => model.providerId === `builtin:${family}-start-plan` && model.modelId === "GLM-5.3-Flash"));
+      const rulesDir = path.join(dir, "runtime/provider/test"); fs.mkdirSync(rulesDir, { recursive: true });
+      fs.writeFileSync(path.join(rulesDir, "zcode-builtin.json"), JSON.stringify({ config: { providerConfigRules: { providerRules:
+        ["individual-coding-plan", "start-plan"].map(kind => ({ providerId: `account:${family}-${kind}`, config: {
+          access: { type: "zhipu-account", mode: kind, accountType: family }, builtinModelIds: ["GLM-5.3"],
+        } })),
+      } } }));
+      const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", pendingLogin: Promise.resolve(resolved), onEvent: () => {} });
+      const internal = client as unknown as { syncAccountProviders: () => Promise<void>; sendRequest: (method: string, payload: unknown) => Promise<void> };
+      let sync: { states: Record<string, { entitled: boolean }>; providers: Record<string, { builtinModelIds: string[] }> } | undefined;
+      internal.sendRequest = async (_method, payload) => { sync = payload as typeof sync; };
+      await internal.syncAccountProviders(); client.dispose();
+      assert.equal(sync?.states[`account:${family}-start-plan`].entitled, true);
+      assert.equal(sync?.states[`account:${family}-individual-coding-plan`].entitled, false);
+      assert.deepEqual(sync?.providers[`account:${family}-start-plan`].builtinModelIds, ["GLM-5.3-Flash"]);
+      assert.equal((await resolveProviderRequestAuth(`account:${family}-start-plan`, "3.17.2"))?.apiKey, "TEST-START-JWT");
+      const quota = await fetchPlanQuota({ family, kind: "start-plan" }, "3.17.2");
+      assert.equal(quota[0]?.remainingPercent, 80);
+      const balanceRequest = api.requests.find(request => request.path.includes("billing/balance"));
+      assert.equal(balanceRequest?.headers.Authorization, "Bearer TEST-START-JWT");
+      assert.equal(balanceRequest?.headers["X-Device-Mid"], "a383f8b6-2933-48c1-b7da-b3e7faf51a51");
+      assert.equal(balanceRequest?.headers["X-ZCode-App-Version"], "3.17.2");
+      assert.match(balanceRequest?.path ?? "", /app_version=3.17.2/);
+      if (selection === "start-plan") assert.equal(api.requests.some(request => request.path.includes("/api_keys")), false,
+        "An explicit Start Plan selection must not exchange personal/team keys");
+      const savedPersonal = await resolveRuntime({ appVersion: "3.17.2",
+        preferredProviderId: `builtin:${family}-coding-plan`, preferredModelId: "GLM-5.3" });
+      assert.equal(savedPersonal.runtime?.providerId, `builtin:${family}-start-plan`, "stale new-session personal defaults must not hide Start Plan");
+      assert.equal(await resolveRuntimeForSession({ providerId: `builtin:${family}-coding-plan`, modelId: "GLM-5.3" }, "3.17.2"), null,
+        "resuming a personal Coding Plan session must not silently substitute Start Plan");
+      const restored = await resolveRuntimeForSession({ providerId: `account:${family}-start-plan`, modelId: "GLM-5.3-Flash" }, "3.17.2");
+      assert.ok(restored, "lowercase balance capability must allow restoring a saved canonical model");
+      assert.equal(restored.modelId, "GLM-5.3-Flash");
+      assert.equal(await resolveRuntimeForSession({ providerId: `account:${family}-start-plan`, modelId: "GLM-5.3" }, "3.17.2"), null,
+        "an existing session must not silently substitute a model absent from Start entitlements");
+    });
+  }
   test(`${family} Start Plan uses the ZCode JWT balance buckets`, async t => {
     const dir = fixture(t);
-    fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ zcodejwttoken: "TEST-ZCODE-JWT" }));
+    fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:active_provider": family, zcodejwttoken: "TEST-ZCODE-JWT" }));
     const https = require("https") as typeof import("https");
     const { EventEmitter } = require("events") as typeof import("events");
     const originalGet = https.get;
@@ -733,7 +954,8 @@ for (const family of ["bigmodel", "zai"] as const) {
   for (const teamPlan of [false, true]) {
     test(`${family} ${teamPlan ? "team" : "personal"} PAT uses endpoint-specific headers, shares refresh, and never copies secrets`, async t => {
       const dir = fixture(t);
-      const credentials = { [`oauth:${family}:access_token`]: "TEST-OAUTH" };
+      const login = family === "zai" ? "TEST-DESKTOP-BUSINESS" : "TEST-OAUTH";
+      const credentials = { [`oauth:${family}:access_token`]: login };
       fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify(credentials));
       let issued = 0;
       const { requests } = mockPlanQuotaApi(t, () => ({ code: "200", data: {
@@ -746,13 +968,13 @@ for (const family of ["bigmodel", "zai"] as const) {
       assert.deepEqual(shared, first);
       assert.equal(issued, 1);
       assert.equal((await resolve())?.apiKey, "TEST-PAT-1");
-      const login = family === "zai" ? "TEST-ZAI-BIZ-TOKEN" : "TEST-OAUTH";
       assert.equal(requests.find(r => r.path.endsWith("getCustomerInfo"))?.headers.Authorization, login);
       assert.equal(requests.find(r => r.path.endsWith("/api_keys"))?.headers.Authorization, !team && family === "zai" ? `Bearer ${login}` : login);
       const issue = requests.find(r => r.path.endsWith("/access_tokens"));
       assert.equal(issue?.headers.Authorization, `Bearer ${login}`);
       assert.deepEqual(JSON.parse(issue?.body ?? "null"), { clientType: "zcode", clientVersion: "3.16.2" });
       assert.equal(requests.some(r => r.path.includes("/copy/")), false);
+      assert.equal(requests.some(r => r.path === "/api/auth/z/login"), false);
       assert.equal(first?.apiKeyId, teamPlan ? "TEST-TEAM-KEY-ID" : "TEST-PERSONAL-KEY-ID");
 
       const originalNow = Date.now;
@@ -813,7 +1035,8 @@ for (const version of ["3.14.4", "3.15.1", "3.16.2"]) {
     assert.ok(session);
     assert.equal(session.apiKey, expected);
     assert.equal(result.runtime?.apiKeyId, version === "3.14.4" ? undefined : "TEST-PERSONAL-KEY-ID");
-    if (version === "3.14.4") assert.equal(requests.length, 0);
+    if (version === "3.14.4") assert.ok(requests.every(request => request.path === "/api/biz/subscription/list"),
+      "stored keys still require entitlement validation, without repeating key exchange");
   });
 }
 
@@ -853,6 +1076,116 @@ test("a team outside customerInfo cannot obtain a project token", async t => {
   const planApi = mockPlanQuotaApi(t); const { requests } = planApi;
   assert.equal(await tryPlanOAuth("bigmodel", { organizationId: "org-other", projectId: "project-other" }, "3.16.2"), null);
   assert.equal(requests.length, 1);
+});
+
+for (const version of ["3.14.4", "3.16.2"]) {
+  for (const team of [false, true]) {
+    for (const prefixed of [false, true]) {
+      test(`Desktop Z.ai business credentials ${version} ${team ? "team" : "personal"} ${prefixed ? "with" : "without"} Bearer skip re-exchange`, async t => {
+        const dir = fixture(t);
+        fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+          "oauth:zai:access_token": `${prefixed ? "Bearer " : ""}TEST-DESKTOP-BUSINESS`,
+        }));
+        const api = mockPlanQuotaApi(t, () => ({ code: "200", data: {
+          accessToken: "TEST-PROJECT-TOKEN", tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
+        } }));
+        api.respond((requestPath, payload) => ({ payload: {
+          ...payload as object, code: "200",
+          ...(requestPath.endsWith("getCustomerInfo") ? { data: { organizations: [
+            { organizationId: "other-org", projects: [{ projectId: "other-project", projectType: 1 }] },
+            { organizationId: "org-current", organizationName: "默认机构", projects: [
+              { projectId: "team-project", projectType: "2", projectName: "默认项目" },
+              { projectId: "other-personal", projectType: 1 },
+              { projectId: "project-current", projectType: 1, projectName: "默认项目" },
+            ] },
+          ] } } : {}),
+        } }));
+        const selectedTeam = team ? { organizationId: "org-current", projectId: "team-project" } : undefined;
+        const result = await tryPlanOAuth("zai", selectedTeam, version);
+        assert.ok(result?.apiKey);
+        const keyRequest = api.requests.find(request => request.path.endsWith("/api_keys"))!;
+        assert.ok(keyRequest.path.includes(`/organization/org-current/projects/${team ? "team-project" : "project-current"}/`));
+        assert.equal(keyRequest.headers.Authorization, version === "3.16.2" && team
+          ? "TEST-DESKTOP-BUSINESS" : "Bearer TEST-DESKTOP-BUSINESS");
+        assert.equal(api.requests.some(request => request.path.includes("/api/auth/z/login")), false);
+        assert.equal(api.requests.some(request => request.headers.Authorization?.includes("Bearer Bearer")), false);
+        assert.equal(api.requests.some(request => request.path.includes("/copy/")), version === "3.14.4");
+      });
+    }
+  }
+}
+
+for (const version of ["3.14.4", "3.16.2"]) {
+  for (const team of [false, true]) {
+    test(`Plan ${version} ${team ? "team" : "personal"} never reuses a key with the wrong name/type`, async t => {
+      const dir = fixture(t);
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:zai:access_token": "TEST-BUSINESS" }));
+      const api = mockPlanQuotaApi(t, () => ({ code: 200, data: {
+        accessToken: "TEST-PAT", tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
+      } }), [{ name: team ? "zcode-team-api-key" : "unrelated-key", apiKey: "TEST-WRONG-KEY", keyType: 1 }]);
+      assert.ok(await tryPlanOAuth("zai", team ? { organizationId: "org-current", projectId: "project-current" } : undefined, version));
+      const created = api.requests.find(request => request.method === "POST" && request.path.endsWith("/api_keys"))!;
+      assert.ok(created);
+      assert.deepEqual(JSON.parse(created.body!), { name: team ? "zcode-team-api-key" : "zcode-api-key",
+        ...(team ? { keyType: 2 } : {}), ...(version === "3.16.2" ? { usageScene: 1 } : {}) });
+      assert.equal(api.requests.some(request => request.path.includes("TEST-WRONG-KEY")), false);
+    });
+  }
+}
+
+test("personal project selection excludes team-only organizations and matches Desktop's defaults", () => {
+  const organizations = [
+    { organizationId: "team-only", organizationName: "默认机构", projects: [{ projectId: "team", projectType: " 2 " }] },
+    { organizationId: "first", projects: [{ projectId: "first-project" }] },
+    { organizationId: "personal", organizationName: "个人默认机构", projects: [
+      { projectId: "another" }, { projectId: "default", projectName: "默认项目" },
+    ] },
+  ];
+  assert.deepEqual(pickOrgAndProject({ organizations }), { organizationId: "personal", projectId: "default" });
+  assert.deepEqual(pickOrgAndProject({ organizations: organizations.slice(0, 2) }), { organizationId: "first", projectId: "first-project" });
+  assert.equal(pickOrgAndProject({ organizations: organizations.slice(0, 1) }), null);
+});
+
+for (const [failurePath, expectedStage] of [["getCustomerInfo", "customer_info"], ["/api_keys", "list_keys"], ["/copy/", "copy_secret"]]) {
+  test(`Plan HTTP failure at ${expectedStage} retains status/stage without leaking server secrets`, async t => {
+    fixture(t);
+    const api = mockPlanQuotaApi(t);
+    api.respond((requestPath, payload) => requestPath.includes(failurePath)
+      ? { status: 403, payload: { code: 403, msg: "TEST-SERVER-SECRET", data: { secretKey: "TEST-SECRET" } } }
+      : { payload });
+    await assert.rejects(resolveApiKey("zai", "Bearer TEST-PRIVATE-BUSINESS"), error => {
+      const details = planAuthErrorDetails(error);
+      assert.equal(details.stage, expectedStage);
+      assert.equal(details.status, 403);
+      assert.equal(details.category, "http");
+      assert.equal(details.code, "HTTP_STATUS");
+      assert.doesNotMatch(JSON.stringify(details) + String(error), /TEST-/);
+      return true;
+    });
+  });
+}
+
+for (const rejected of [true, false]) {
+  test(`Plan copy diagnostics distinguish ${rejected ? "business rejection" : "missing secret"}`, async t => {
+    fixture(t);
+    const api = mockPlanQuotaApi(t);
+    api.respond((requestPath, payload) => requestPath.includes("/copy/")
+      ? { payload: { code: rejected ? "401" : "200", msg: "TEST-RAW-SECRET", data: {} } } : { payload });
+    await assert.rejects(resolveApiKey("zai", "Bearer TEST-BUSINESS"), error => {
+      const details = planAuthErrorDetails(error);
+      assert.equal(details.stage, "copy_secret");
+      assert.equal(details.status, 200);
+      assert.equal(details.resultCode, rejected ? "401" : "200");
+      assert.equal(details.category, rejected ? "business" : "invalid_response");
+      assert.doesNotMatch(JSON.stringify(details) + String(error), /TEST-/);
+      return true;
+    });
+  });
+}
+
+test("Plan diagnostics never project arbitrary error messages, names or codes", () => {
+  const error = Object.assign(new Error("TEST-PRIVATE-TOKEN"), { name: "TEST-PRIVATE-KEY", code: "TEST-PRIVATE-SECRET" });
+  assert.doesNotMatch(JSON.stringify(planAuthErrorDetails(error)), /TEST-/);
 });
 
 

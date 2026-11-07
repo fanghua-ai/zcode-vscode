@@ -483,3 +483,29 @@ test("multi-request quota adapters send one protected key to each same-origin en
   assert.deepEqual(result, [{ label: "Monthly budget", remainingPercent: 37.5, usedPercent: 62.5, remainingAmount: 7.5, currency: "USD" }]);
   assert.equal(JSON.stringify(result).includes("TEST-ONLY-KEY"), false);
 });
+
+
+test("quota request deadline bounds a response that keeps delivering data", async t => {
+  const original = httpsModule.request;
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let response!: EventEmitter;
+  let destroyed = false;
+  httpsModule.request = ((_url: unknown, _options: unknown, callback: (response: unknown) => void) => {
+    const request = new EventEmitter();
+    Object.assign(request, { destroy: () => { destroyed = true; }, end: () => {
+      response = new EventEmitter();
+      Object.assign(response, { statusCode: 200, destroy: () => {} });
+      callback(response);
+    } });
+    return request;
+  }) as unknown as typeof httpsModule.request;
+  t.after(() => { httpsModule.request = original; });
+  const pending = fetchQuotaAdapter(DEEPSEEK_QUOTA_ADAPTER, "TEST-ONLY-KEY", DEEPSEEK_QUOTA_ADAPTER.providerBaseURL);
+  const rejected = assert.rejects(pending, /request-failed/);
+  for (let i = 0; i < 10; i++) {
+    response.emit("data", " ");
+    t.mock.timers.tick(1000);
+  }
+  await rejected;
+  assert.equal(destroyed, true);
+});

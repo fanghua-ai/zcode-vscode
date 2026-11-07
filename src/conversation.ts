@@ -635,7 +635,7 @@ export interface ConversationControl {
   canStop?: boolean;
   sessionEnded?: boolean;
   activeWorks?: Array<{ kind?: string; foregroundExecutionId?: string }>;
-  lastError?: { message?: string } | null;
+  lastError?: { message?: string; code?: string; source?: string; recoverable?: boolean } | null;
 }
 
 /** Apply a logical frame exactly once. Sequence bounds describe an atomic batch,

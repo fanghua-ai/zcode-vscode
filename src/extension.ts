@@ -6,7 +6,7 @@ import { prepareFileContext } from "./fileContext";
 import { decodeImage, imageMime } from "./imageAttachments";
 import { readImageAttachments, IMAGE_MAX_BYTES, type ImageAttachment } from "./attachmentTypes";
 import { createHash, randomUUID } from "crypto";
-import { desktopVersion, redactHome, issueCategory, type IssueCategory } from "./diagnostics";
+import { resolveDesktopVersion, redactHome, redactDiagnosticText, issueCategory, recentDiagnosticEvents, recordDiagnosticEvent, type IssueCategory } from "./diagnostics";
 import { errorGuidance, COMMUNITY_URL, type RecoveryAction } from "./errorGuidance";
 import { hostT as t, userFacingError } from "./hostI18n";
 import { resolveUiLanguage, LANGUAGE_SETTINGS, type LanguageSetting } from "./i18n";
@@ -36,8 +36,7 @@ import {
   syncCliConfig,
   type ResolveResult,
 } from "./desktop";
-import { disposeLog, getLog, logDebug, logError, logInfo, logWarn } from "./log";
-import { redactSecrets } from "./redact";
+import { disposeLog, getLog, logDebug, logError, logInfo, logWarn, readRedactedLog } from "./log";
 import { parseWebviewMessage } from "./webviewMessages";
 import { desktopPluginForSkill, withDesktopPluginSkillPrompts } from "./desktopPluginSkillPrompts";
 import {
@@ -113,12 +112,22 @@ export function mergeAvailablePickerModels(
   managedProviderIds: ReadonlySet<string> = new Set(),
   providerInventoryAuthoritative = false
 ): PickerModel[] {
+  // Start Plan login can expose a builtin alias while the live registry
+  // requires the account provider ID for switching.
+  const liveStartPlanAliases = new Set(available.flatMap(({ providerId, modelId }) =>
+    /^account:(?:bigmodel|zai)-start-plan$/.test(providerId) && modelId?.trim()
+      ? [`builtin:${providerId.slice("account:".length)}\0${modelId.toLowerCase()}`]
+      : []
+  ));
+  const isStartPlanAlias = (model: { providerId: string; modelId: string }) =>
+    liveStartPlanAliases.has(`${model.providerId}\0${model.modelId.toLowerCase()}`);
   const merged = configured
-    .filter(model => !disabledModelKeys.has(`${model.providerId}\0${model.modelId}`))
+    .filter(model => !isStartPlanAlias(model) && !disabledModelKeys.has(`${model.providerId}\0${model.modelId}`))
     .map(model => ({ ...model }));
   const indexes = new Map(merged.map((model, index) => [`${model.providerId}\0${model.modelId}`, index]));
   for (const model of available) {
     if (!model.providerId?.trim() || !model.modelId?.trim()) continue;
+    if (isStartPlanAlias(model)) continue;
     const isAccountOrBuiltin = model.providerId.startsWith("account:") || model.providerId.startsWith("builtin:");
     if (providerInventoryAuthoritative && !isAccountOrBuiltin && !managedProviderIds.has(model.providerId)) continue;
     const key = `${model.providerId}\0${model.modelId}`;
@@ -849,7 +858,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       format: "zcode-diagnostics-v1", generatedAt: new Date().toISOString(),
       platform: process.platform, architecture: process.arch,
       vscodeVersion: vscode.version, extensionVersion: this.context.extension?.packageJSON?.version ?? "unknown",
-      desktopVersion: desktopVersion(runtime?.binaryPath || "") ?? "unknown",
+      desktopVersion: this.desktopAppVersion ?? "unknown",
       nodeVersion: process.version, status: this.diagnosticStatus,
       workspace: {
         vscodePath: redactHome(rawWorkspace, home),
@@ -864,10 +873,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         pendingPermissions: runtime.pendingPermissions, pendingQuestions: runtime.pendingQuestions,
       } : null,
       recentIssues: this.recentIssues,
+      recentDiagnosticEvents: recentDiagnosticEvents(),
       // Deliberately omit raw errors, messages, session IDs, settings and credentials.
     };
-    await vscode.env.clipboard.writeText(redactSecrets(JSON.stringify(report, null, 2)));
-    this.post({type: "toast", text: t("诊断信息已复制（不含聊天内容或登录凭据）。")});
+    await vscode.env.clipboard.writeText(redactDiagnosticText(JSON.stringify(report, null, 2), home));
+    this.post({type: "toast", text: t("诊断信息已脱敏并复制，请自行再检查一遍。")});
   }
 
   private async runWebviewSessionAction(sessionId: string, actionRequestId: string | undefined, operation: () => Promise<void>): Promise<void> {
@@ -902,6 +912,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       case "copyDiagnostics":
         await this.copyDiagnostics();
         break;
+      case "copyLog": {
+        const text = readRedactedLog(os.homedir());
+        if (text) await vscode.env.clipboard.writeText(text);
+        this.post({ type: "toast", text: t(text ? "日志已脱敏并复制，分享前请再检查一遍。" : "当前没有可复制的日志。") });
+        break;
+      }
       case "setLanguage": {
         if (!LANGUAGE_SETTINGS.includes(msg.language as LanguageSetting)) throw new Error("Unsupported interface language");
         await vscode.workspace.getConfiguration("zcode").update("language", msg.language, vscode.ConfigurationTarget.Global);
@@ -1284,12 +1300,13 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
               entityId: msg.entityId,
             });
             if (!isCurrent()) break;
-            this.post({ type: "file_changes", turnId: msg.turnId, files });
+            this.post({ type: "file_changes", turnId: msg.turnId, requestId: msg.requestId, files });
           } catch (e) {
             if (!isCurrent()) break;
             logWarn("fileChanges failed", e);
             this.post({
               type: "file_changes",
+              requestId: msg.requestId,
               turnId: msg.turnId,
               files: [],
               error: userFacingError(e),
@@ -1639,13 +1656,19 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const diff = materializeGitDiff(disk, patches);
     const beforeUri = this.diffDocs.uri("before", filePath, diff.before);
     const afterUri = this.diffDocs.uri("after", filePath, diff.after);
-    await vscode.commands.executeCommand(
-      "vscode.diff",
-      beforeUri,
-      afterUri,
-      t("{0}（ZCode 改动）", { 0: name }),
-      { preview: true }
-    );
+    try {
+      await vscode.commands.executeCommand(
+        "vscode.diff",
+        beforeUri,
+        afterUri,
+        t("{0}（ZCode 改动）", { 0: name }),
+        { preview: true }
+      );
+    } catch (error) {
+      this.diffDocs.release(beforeUri);
+      this.diffDocs.release(afterUri);
+      throw error;
+    }
   }
 
   private async openFileDiff(change: FileChange): Promise<void> {
@@ -1663,13 +1686,19 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       abs && fs.existsSync(abs)
         ? vscode.Uri.file(abs)
         : this.diffDocs.uri("after", change.path, change.after ?? "");
-    await vscode.commands.executeCommand(
-      "vscode.diff",
-      beforeUri,
-      afterUri,
-      t("{0}（ZCode 改动）", { 0: name }),
-      { preview: true }
-    );
+    try {
+      await vscode.commands.executeCommand(
+        "vscode.diff",
+        beforeUri,
+        afterUri,
+        t("{0}（ZCode 改动）", { 0: name }),
+        { preview: true }
+      );
+    } catch (error) {
+      this.diffDocs.release(beforeUri);
+      if (afterUri.scheme === DiffDocuments.scheme) this.diffDocs.release(afterUri);
+      throw error;
+    }
   }
 
   async quickSwitchSession(): Promise<void> {
@@ -1834,12 +1863,32 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async selectModel(
+  private modelSelectionQueue: Promise<void> = Promise.resolve();
+
+  private selectModel(providerId: string, modelId: string, restart = false): Promise<void> {
+    const isCurrent = this.viewScope();
+    const operation = this.modelSelectionQueue.then(() => {
+      if (isCurrent()) return this.selectModelNow(providerId, modelId, restart);
+    });
+    this.modelSelectionQueue = operation.catch(() => {});
+    return operation;
+  }
+
+  private async selectModelNow(
     providerId: string,
     modelId: string,
     restart = false
   ): Promise<void> {
     const selectionIsCurrent = this.viewScope();
+    if (/^builtin:(?:bigmodel|zai)-start-plan$/.test(providerId)) {
+      const accountId = `account:${providerId.slice("builtin:".length)}`;
+      const live = this.modelChoices().find(model => model.providerId === accountId
+        && model.modelId.toLowerCase() === modelId.toLowerCase());
+      if (live) {
+        providerId = live.providerId;
+        modelId = live.modelId;
+      }
+    }
     if (this.disabledModelKeys.has(`${providerId}\0${modelId}`)) {
       await this.pushModels();
       if (!selectionIsCurrent()) return;
@@ -2092,7 +2141,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.beginStartupPhase("starting");
 
     const loginStarted = Date.now();
-    this.desktopAppVersion = desktopVersion(binaryPath);
+    const desktopVersion = await resolveDesktopVersion(binaryPath);
+    this.desktopAppVersion = desktopVersion.appVersion;
+    logInfo("Resolved ZCode desktop version", desktopVersion);
+    recordDiagnosticEvent("desktop_version", desktopVersion);
     const loginRequest = {
       appVersion: this.desktopAppVersion,
       modelOverride,
@@ -2158,6 +2210,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
     const client = new ZCodeClient({
       binaryPath,
+      desktopAppVersion: this.desktopAppVersion,
       nodePath: nodePath || undefined,
       workspacePath,
       env: runtimeEnv(runtime),
@@ -2213,6 +2266,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     let resolved = await resolveRuntime(request);
     if (resolved.ok && resolved.runtime) return resolved;
     logWarn("Could not reuse desktop defaults", resolved.reason);
+    if (resolved.accountPlanUnavailable) return resolved;
     const fallbackPick = resolved.picker.find(
       (p) =>
         p.hasKey &&
@@ -2252,6 +2306,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.disposeClient();
     const client = new ZCodeClient({
       binaryPath: launch.binaryPath,
+      desktopAppVersion: this.desktopAppVersion,
       nodePath: launch.nodePath || undefined,
       workspacePath: launch.workspacePath,
       ...this.desktopPluginOverlay(),
@@ -2960,8 +3015,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       }
       if (["connecting", "resolving_credentials", "running", "stopping", "completedSuccess", "completedInterrupted", "exited", "error"].includes(status)) this.diagnosticStatus = status;
     } else if (msg.type === "session_ready") this.diagnosticStatus = "connected";
-    if (msg.type === "session_error" || msg.type === "status" && ["error", "exited"].includes(String(msg.status))) {
-      this.recentIssues.push({at: new Date().toISOString(), category: issueCategory(String(msg.message || msg.status || ""))});
+    else if (msg.type === "setup") this.diagnosticStatus = "setup_required";
+    if (msg.type === "setup" || msg.type === "session_error" || msg.type === "status" && ["error", "exited"].includes(String(msg.status))) {
+      this.recentIssues.push({at: new Date().toISOString(), category: issueCategory(String(msg.reason || msg.message || msg.status || ""))});
       this.recentIssues = this.recentIssues.slice(-10);
     }
     const fields = msg.type === "toast" ? ["text"]
