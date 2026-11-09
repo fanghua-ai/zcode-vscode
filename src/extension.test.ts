@@ -317,7 +317,7 @@ test("the Start Plan picker prefers the live account provider over its login ali
   ]);
 });
 
-test("Start Plan model choices survive a stale desktop refresh and follow the loaded session registry", async () => {
+test("Start Plan choices keep entitled models omitted by the session and hide stale personal options", async () => {
   const f = fixture();
   const providerId = "account:bigmodel-start-plan";
   const personal = { providerId: "account:bigmodel-individual-coding-plan", modelId: "GLM-5.3", label: "GLM-5.3" };
@@ -325,7 +325,6 @@ test("Start Plan model choices survive a stale desktop refresh and follow the lo
   Object.assign(f.state, {
     runtime: { providerId: "builtin:bigmodel-start-plan", providerName: "Start Plan", kind: "anthropic",
       models: { "GLM-5.3": {}, "GLM-5.3-Flash": {} } },
-    startPlanModelProvider: providerId,
     picker: [{ ...personal, providerName: "Personal", kind: "anthropic", hasKey: true }],
     livePicker: { client: f.state.client, sessionId: "A", models: [
       personal, custom, { ...personal, providerId, modelId: "glm-5.3-flash" },
@@ -334,8 +333,8 @@ test("Start Plan model choices survive a stale desktop refresh and follow the lo
     ] },
   });
   assert.deepEqual(f.state.modelChoices().map(model => [model.providerId, model.modelId]), [
-    [providerId, "glm-5.3-flash"], ["custom", "GLM-5.3"],
-  ], "a plan model the session never registered cannot be offered");
+    [providerId, "GLM-5.3"], [providerId, "glm-5.3-flash"], ["custom", "GLM-5.3"],
+  ]);
 
   const switched: string[] = [];
   f.state.pushModels = async () => {};
@@ -343,11 +342,12 @@ test("Start Plan model choices survive a stale desktop refresh and follow the lo
   Object.assign(f.state.client, { isGenerating: () => false });
   await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
   await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "glm-5.3-flash" });
-  assert.deepEqual(switched, ["glm-5.3-flash"], "only the registered model reaches the backend");
+  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "UNVERIFIED" });
+  assert.deepEqual(switched, ["GLM-5.3", "glm-5.3-flash"]);
 
   Object.assign(f.state, { livePicker: null });
   assert.deepEqual(f.state.modelChoices().map(model => [model.providerId, model.modelId]), [
-    [providerId, "GLM-5.3"], [providerId, "GLM-5.3-Flash"],
+    ["builtin:bigmodel-start-plan", "GLM-5.3"], ["builtin:bigmodel-start-plan", "GLM-5.3-Flash"],
   ], "the plan list covers a catalog that has not loaded yet");
   f.dispose();
 });
@@ -364,6 +364,23 @@ function startPlanFixture() {
   return { f, providerId, flash, ids: () => f.state.modelChoices().map(model => model.modelId) };
 }
 
+test("the model menu keeps both Start Plan options when new chats return only their current model", async t => {
+  const { f, flash } = startPlanFixture();
+  t.after(f.dispose);
+  const glm = { ...flash, modelId: "GLM-5.3", label: "GLM-5.3" };
+  const expected = [glm.modelId, flash.modelId];
+  for (const model of [flash, glm]) {
+    const current = { providerId: model.providerId, modelId: model.modelId };
+    f.state.client.currentSessionId = `new-${current.modelId}`;
+    f.state.switchTicket++;
+    f.state.client.readAvailableModels = async () => ({ current, available: [model], known: true });
+    await f.state.pushModels();
+    const menu = f.posted.filter(message => message.type === "models").at(-1);
+    assert.deepEqual((menu?.available as PickerModel[]).map(model => model.modelId), expected);
+    assert.deepEqual(menu?.current, current);
+  }
+});
+
 test("an unreadable session catalog neither hides Start Plan models nor replaces the last valid one", async () => {
   const { f, providerId, flash, ids } = startPlanFixture();
   f.state.client.hasFreshSessionModel = () => true;
@@ -377,10 +394,10 @@ test("an unreadable session catalog neither hides Start Plan models nor replaces
   assert.equal(reads, 2, "an unknown catalog is read again even while the current model is fresh");
   reply = { available: [flash], known: true };
   await f.state.pushModels();
-  assert.deepEqual(ids(), ["GLM-5.3-Flash"]);
+  assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"]);
   reply = { available: [], known: false };
   await f.state.pushModels(true);
-  assert.deepEqual(ids(), ["GLM-5.3-Flash"], "a failed refresh keeps the last valid catalog");
+  assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"], "a failed refresh keeps the plan choices");
   f.dispose();
 });
 
@@ -410,8 +427,12 @@ test("desktop refreshes and failed reads make the cached session catalog read ag
   f.state.resolveSessionModelRuntime = async model => { switched.push(model.modelId); return false; };
   Object.assign(f.state.client, { isGenerating: () => false });
   await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
-  assert.deepEqual(switched, [], "the switch is checked against the re-read catalog, which dropped GLM-5.3");
-  assert.deepEqual(ids(), ["GLM-5.3-Flash"]);
+  assert.deepEqual(switched, ["GLM-5.3"], "an omitted model still reaches runtime resolution");
+  assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"]);
+  f.switchToB();
+  reply = { available: [glm], known: true };
+  await f.state.pushModels();
+  assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"], "switching to a session with the other model keeps both choices");
   f.dispose();
 });
 
@@ -428,11 +449,11 @@ test("only a Start Plan switch re-reads a missing or outdated session catalog fi
   Object.assign(f.state.client, { isGenerating: () => false });
 
   await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
-  assert.deepEqual(switched, [], "a catalog that never loaded is read before judging the switch");
+  assert.deepEqual(switched, [["GLM-5.3", 1]], "a catalog that never loaded is read before judging the switch");
   assert.equal(reads, 1);
   state.livePicker!.stale = true;
   await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3-Flash" });
-  assert.deepEqual(switched, [["GLM-5.3-Flash", 2]], "an outdated catalog is read again before judging the switch");
+  assert.deepEqual(switched.at(-1), ["GLM-5.3-Flash", 2], "an outdated catalog is read again before judging the switch");
 
   state.livePicker!.stale = true;
   await f.state.onWebviewMessage({ type: "selectModel", providerId: "custom", modelId: "custom-model" });
@@ -518,7 +539,7 @@ test("an earlier catalog read cannot overwrite a later result", async () => {
   f.dispose();
 });
 
-test("a queued Start Plan switch is checked against the current session registry", async () => {
+test("a queued Start Plan switch allows entitled models omitted by the session", async () => {
   const { f, providerId, flash } = startPlanFixture();
   const state = f.state as unknown as {
     livePicker: unknown; pendingModel: { sessionId: string; providerId: string; modelId: string } | null;
@@ -531,11 +552,11 @@ test("a queued Start Plan switch is checked against the current session registry
   f.state.pushModels = async () => {};
   f.state.resolveSessionModelRuntime = async () => null;
   state.pendingModel = { sessionId: "A", providerId, modelId: "GLM-5.3" };
-  assert.equal(await state.applyPendingModel(f.state.client), false);
+  assert.equal(await state.applyPendingModel(f.state.client), true);
   assert.equal(state.pendingModel, null);
   state.pendingModel = { sessionId: "A", providerId, modelId: "GLM-5.3-Flash" };
   assert.equal(await state.applyPendingModel(f.state.client), true);
-  assert.deepEqual(applied, [[providerId, "GLM-5.3-Flash"]], "only the registered model reaches the backend");
+  assert.deepEqual(applied, [[providerId, "GLM-5.3"], [providerId, "GLM-5.3-Flash"]]);
   f.dispose();
 });
 

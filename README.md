@@ -68,7 +68,7 @@
 
 市场有两条更新通道：
 
-- **稳定版**使用偶数次版本号，当前是 **2.2.2**。直接安装会留在稳定版，不会自动升到预览版。
+- **稳定版**使用偶数次版本号，当前是 **2.2.3**。直接安装会留在稳定版，不会自动升到预览版。
 - **预览版**使用奇数次版本号。只有在扩展页面选择 **Install Pre-Release Version**，或执行 `code --install-extension fanghua.zcode-desktop-chat --pre-release` 的用户才会安装预览版，并继续接收更高的预览版。之后若发布更高版本号的稳定版，预览版会被该稳定版替换。
 
 也可以手动安装 VSIX。文件名是 `zcode-desktop-chat-<版本>.vsix`，请选择与要安装的稳定版或预览版一致的文件：
@@ -333,7 +333,7 @@ Search for **ZCode Chat** by **fanghua** in the VS Code Extensions Marketplace, 
 
 The Marketplace has two update channels:
 
-- **Stable** releases use an even minor version. The current stable release is **2.2.2**. A normal install stays on stable and is not upgraded to a preview.
+- **Stable** releases use an even minor version. The current stable release is **2.2.3**. A normal install stays on stable and is not upgraded to a preview.
 - **Preview** releases use an odd minor version. Only users who choose **Install Pre-Release Version** on the extension page, or run `code --install-extension fanghua.zcode-desktop-chat --pre-release`, receive a preview and later higher previews. A later stable release with a higher version replaces the preview.
 
 You can also install a VSIX manually. Its name is `zcode-desktop-chat-<version>.vsix`; choose the file for the stable or preview release you want:

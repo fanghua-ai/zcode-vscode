@@ -1800,19 +1800,22 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const runtime = this.runtime;
     const family = /^(?:account|builtin):(bigmodel|zai)-start-plan$/.exec(runtime?.providerId ?? "")?.[1];
     if (runtime && family) {
-      const providerId = this.startPlanModelProvider ?? runtime.providerId;
-      const isStart = (id: string) => id === `builtin:${family}-start-plan` || id === `account:${family}-start-plan`;
+      const accountId = `account:${family}-start-plan`;
+      const isStart = (id: string) => id === `builtin:${family}-start-plan` || id === accountId;
       const isPersonal = (id: string) => id === `builtin:${family}-coding-plan` || id === `account:${family}-individual-coding-plan`;
       const modelIds = Object.keys(runtime.models);
       const verifiedIds = new Set(modelIds.map(id => id.toLowerCase()));
+      const registeredProvider = this.startPlanModelProvider ?? (live.some(model =>
+        model.providerId === accountId && verifiedIds.has(model.modelId.toLowerCase())) ? accountId : undefined);
+      const providerId = registeredProvider ?? runtime.providerId;
       configured = configured.filter(model => !isStart(model.providerId) && !isPersonal(model.providerId));
       live = live.filter(model => !isPersonal(model.providerId)
         && (!isStart(model.providerId) || (verifiedIds.has(model.modelId.toLowerCase())
-          && (!this.startPlanModelProvider || model.providerId === providerId))));
+          && (!registeredProvider || model.providerId === providerId))));
       for (const modelId of modelIds) {
         const liveId = live.find(model => model.providerId === providerId && model.modelId.toLowerCase() === modelId.toLowerCase())?.modelId;
-        // A loaded session catalog is the backend registry; the plan list only covers an unloaded one.
-        if (liveLoaded && !liveId) continue;
+        // Session snapshots can omit entitled models. Use them for spelling
+        // and explicit disablement, and let the backend validate a switch.
         configured.push({ providerId, modelId: liveId ?? modelId, providerName: runtime.providerName,
           kind: runtime.kind, label: modelId, hasKey: true });
       }
@@ -2049,8 +2052,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * A trusted session registry rejects absent Start Plan models early. An outdated or unread
-   * one cannot prove absence, so the backend's own registry check decides, as in the desktop.
+   * For Start Plan, the picker keeps entitled models even if the session only
+   * lists a subset. An outdated session catalog cannot establish disablement.
    */
   private modelUnavailable(model: { providerId: string; modelId: string }): boolean {
     if (this.disabledModelKeys.has(`${model.providerId}\0${model.modelId}`)) return true;
@@ -2794,7 +2797,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     return this.livePicker.stale ? "stale" : "fresh";
   }
 
-  /** Only Start Plan switches depend on the session registry, so other providers never wait for it. */
+  /** Refresh model spelling and disabled states before a Start Plan switch. */
   private async refreshStartPlanCatalog(providerId: string): Promise<void> {
     if (START_PLAN_PROVIDER.test(providerId) && this.client?.currentSessionId && this.liveCatalogState() !== "fresh") {
       await this.pushModels();

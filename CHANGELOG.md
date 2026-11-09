@@ -1,5 +1,13 @@
 # 更新日志 / Changelog
 
+## 2.2.3 — 2026-11-09
+
+### 中文
+- 修复新建或切换会话时，Start Plan 模型选择器可能隐藏套餐可用模型的问题。
+
+### English
+- Keep eligible Start Plan models visible when creating or switching chats.
+
 ## 2.2.2 — 2026-11-09
 
 ### 中文
