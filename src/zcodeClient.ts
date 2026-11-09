@@ -433,6 +433,9 @@ export class ZCodeClient {
   private activeTiming: StartupTiming | undefined;
   /** Same provider already has a key. A 401 makes the next align exchange a fresh one. */
   private loginStale = false;
+  private readonly rejectedAuthFingerprints = new Set<string>();
+  private readonly turnAuth = new Map<string, Map<string, string>>();
+  private readonly providersNeedingAuthRefresh = new Set<string>();
   /** session/subscribe just applied settings, so the follow-up reads can reuse them. */
   private snapshotSettingsFresh = false;
   private snapshotModelFresh = false;
@@ -525,11 +528,6 @@ export class ZCodeClient {
     this.defaultRuntime = runtime;
   }
 
-  stageSessionModel(model: { providerId: string; modelId: string } | null): void {
-    this.setSessionModel(model);
-    if (this.quotaStarted) void this.refreshPlanQuota();
-  }
-
   setTiming(timing: StartupTiming | undefined): void {
     this.activeTiming = timing;
   }
@@ -572,10 +570,28 @@ export class ZCodeClient {
       && this.historyDelivery.rows === this.conversationRows;
   }
 
+  private isRejectedAuth(apiKey: string): boolean {
+    return this.rejectedAuthFingerprints.size > 0
+      && this.rejectedAuthFingerprints.has(createHash("sha256").update(apiKey).digest("hex"));
+  }
+
+  private rejectAuth(apiKey: string): void {
+    this.rejectedAuthFingerprints.add(createHash("sha256").update(apiKey).digest("hex"));
+    invalidatePlanAuth(apiKey);
+    if ((this.sessionRuntime ?? this.defaultRuntime)?.apiKey === apiKey) this.loginStale = true;
+  }
+
+  private rememberTurnAuth(sessionId: string, turnId: string, providerId: string, apiKey: string): void {
+    const id = JSON.stringify([sessionId, turnId]);
+    let providers = this.turnAuth.get(id);
+    if (!providers) this.turnAuth.set(id, providers = new Map());
+    providers.set(providerId, apiKey);
+  }
+
   private reusableRuntime(model: { providerId: string }): ResolvedRuntime | null {
-    if (this.loginStale) return null;
+    if (this.loginStale || this.providersNeedingAuthRefresh.has(model.providerId)) return null;
     for (const runtime of [this.sessionRuntime, this.defaultRuntime]) {
-      if (runtime && sameDesktopLogin(runtime, model.providerId)) return runtime;
+      if (runtime && sameDesktopLogin(runtime, model.providerId) && !this.isRejectedAuth(runtime.apiKey)) return runtime;
     }
     return null;
   }
@@ -620,7 +636,7 @@ export class ZCodeClient {
           logWarn("Desktop disabled or removed this session model", model);
           return;
         }
-        if (resolved) {
+        if (resolved && !this.isRejectedAuth(resolved.apiKey)) {
           this.loginStale = false;
           this.sessionRuntime = { ...resolved, modelId: model.modelId };
           logInfo("Reusing desktop login for session model", {
@@ -643,17 +659,17 @@ export class ZCodeClient {
       this.activeTiming?.addCount("loginReuse");
       return;
     }
-    if (this.loginStale) {
-      // Resolving failed: never restore the cached key that caused the 401.
+    if (this.loginStale || this.providersNeedingAuthRefresh.has(model.providerId)) {
+      // Keep requiring a fresh lookup if resolving failed after a 401.
       this.sessionRuntime = null;
       logWarn("No refreshed desktop login for session model", model);
       return;
     }
-    if (this.sessionRuntime?.providerId === model.providerId) {
+    if (this.sessionRuntime?.providerId === model.providerId && !this.isRejectedAuth(this.sessionRuntime.apiKey)) {
       this.sessionRuntime = { ...this.sessionRuntime, modelId: model.modelId };
       return;
     }
-    if (this.defaultRuntime?.providerId === model.providerId) {
+    if (this.defaultRuntime?.providerId === model.providerId && !this.isRejectedAuth(this.defaultRuntime.apiKey)) {
       this.sessionRuntime = { ...this.defaultRuntime, modelId: model.modelId };
       return;
     }
@@ -1861,6 +1877,8 @@ export class ZCodeClient {
   async readAvailableModels(reuseSnapshot = false): Promise<{
     current?: { providerId: string; modelId: string };
     available: AvailableModel[];
+    /** False when the read failed or the snapshot carried no catalog; `available` is then not a registry. */
+    known: boolean;
   }> {
     const cached = this.snapshotModelCatalog;
     this.snapshotModelCatalog = undefined;
@@ -1869,7 +1887,7 @@ export class ZCodeClient {
       return { ...cached.models, current: this.confirmedModel() ?? cached.models.current };
     }
     const snapshot = await this.readSessionSnapshot();
-    if (!snapshot) return { available: [] };
+    if (!snapshot) return { available: [], known: false };
     return modelsFromSnapshot(snapshot);
   }
 
@@ -2540,7 +2558,7 @@ export class ZCodeClient {
       return;
     }
     const catalog = snapshot ? modelsFromSnapshot(snapshot) : { available: [] };
-    const cliDefault = !catalog.available.length ? (this.opts.readDefaultModel ?? (() => readConfiguredDefaultModel(this.defaultRuntime)))() : undefined;
+    const cliDefault = !catalog.available.length ? (this.opts.readDefaultModel ?? (() => readConfiguredDefaultModel(this.defaultRuntime, this.opts.binaryPath)))() : undefined;
     const tries = [
       ...(cliDefault ? [cliDefault] : []),
       ...catalog.available.filter((m) => !m.disabledReason),
@@ -2654,7 +2672,7 @@ export class ZCodeClient {
         continue;
       }
       if (result.status && result.status !== "accepted" && result.reasonCode !== "config.unchanged") {
-        const error = new Error(result.message || result.reasonCode || result.status);
+        const error = modelSwitchRejection(result);
         if (await retryModelSwitchWithTargetThought(error)) continue;
         throw error;
       }
@@ -2664,7 +2682,7 @@ export class ZCodeClient {
       if (result.reasonCode === "config.unchanged") {
         /* already on this model */
       } else {
-        throw new Error(result.message || result.reasonCode || result.status);
+        throw modelSwitchRejection(result);
       }
     }
     await this.alignAndEmitModel({ providerId, modelId });
@@ -2839,12 +2857,39 @@ export class ZCodeClient {
     }
     const isCurrent = this.sessionScope();
     const model = this.sessionModel ?? this.defaultRuntime;
-    if (!model || !this.opts.isSessionModelAvailable) return;
-    const available = await this.opts.isSessionModelAvailable(model);
-    if (!isCurrent() || !sameSessionModel(model, this.sessionModel ?? this.defaultRuntime)) {
-      throw new LocalizedError("会话已切换，请在当前会话重新发送。");
+    if (!model) return;
+    const assertCurrentModel = () => {
+      if (!isCurrent() || !sameSessionModel(model, this.sessionModel ?? this.defaultRuntime)) {
+        throw new LocalizedError("会话已切换，请在当前会话重新发送。");
+      }
+    };
+    if (this.opts.isSessionModelAvailable) {
+      const available = await this.opts.isSessionModelAvailable(model);
+      assertCurrentModel();
+      if (!available) throw new LocalizedError("该模型已不可用，请刷新模型列表后重新选择。");
     }
-    if (!available) throw new LocalizedError("该模型已不可用，请刷新模型列表后重新选择。");
+    if (!this.providersNeedingAuthRefresh.has(model.providerId)) return;
+
+    const reconnect = "模型认证需要刷新，请确认桌面端的凭据有效，点击「重新读取登录」后重试。";
+    // A registry refresh reloads configured providers. Desktop plans can also
+    // require account sync or request-time auth, so use the reconnect path.
+    if (isDesktopOauthProvider(model.providerId)) throw new LocalizedError(reconnect);
+    const runtime = await this.opts.resolveSessionRuntime?.(model);
+    assertCurrentModel();
+    if (runtime === false) throw new LocalizedError("该模型已不可用，请刷新模型列表后重新选择。");
+    if (!runtime || this.isRejectedAuth(runtime.apiKey)) throw new LocalizedError(reconnect);
+    try {
+      const result = await this.sendRequest("provider/refreshRegistry", { reason: "extension-auth-retry" }, 5000) as
+        { refreshed?: boolean } | undefined;
+      if (result?.refreshed !== true) throw new Error("Provider registry refresh was not acknowledged");
+    } catch (error) {
+      assertCurrentModel();
+      logWarn("Could not refresh provider registry after authentication failure", error);
+      throw new LocalizedError(reconnect);
+    }
+    assertCurrentModel();
+    this.sessionRuntime = { ...runtime, modelId: model.modelId };
+    this.providersNeedingAuthRefresh.delete(model.providerId);
   }
 
   private async sendMessageInner(sessionId: string, content: string): Promise<void> {
@@ -3308,17 +3353,21 @@ export class ZCodeClient {
     const timing = this.activeTiming;
     const started = performance.now();
     timing?.addCount("runtimeHeadersRequests");
-    const p = (params ?? {}) as { providerId?: string; rejectedProjectTokenFingerprint?: string; expectedAccountScope?: string };
+    const p = (params ?? {}) as {
+      providerId?: string; sessionId?: string; turnId?: string;
+      rejectedProjectTokenFingerprint?: string; expectedAccountScope?: string;
+    };
     const providerId = p.providerId?.trim() || "";
+    if (p.rejectedProjectTokenFingerprint) this.rejectedAuthFingerprints.add(p.rejectedProjectTokenFingerprint);
     try {
       await this.awaitStartupLogin();
       if (this.disposed) return;
       const cached = this.reusableRuntime({ providerId });
       const held = cached?.apiKeyId ? null : cached;
       timing?.addCount(held ? "runtimeHeadersCacheHits" : "runtimeHeadersCacheMisses");
-      const stale = this.loginStale ? [this.sessionRuntime, this.defaultRuntime].find(
-        runtime => runtime?.apiKeyId && sameDesktopLogin(runtime, providerId)
-      ) : undefined;
+      const stale = [this.sessionRuntime, this.defaultRuntime].find(
+        runtime => runtime && sameDesktopLogin(runtime, providerId) && this.isRejectedAuth(runtime.apiKey)
+      );
       const rejectedFingerprint = p.rejectedProjectTokenFingerprint ?? (stale
         ? createHash("sha256").update(stale.apiKey).digest("hex") : undefined);
       const auth: PlanAuth | null = held
@@ -3327,12 +3376,13 @@ export class ZCodeClient {
           ? await (this.opts.resolveProviderAuth ?? resolveProviderRequestAuth)(providerId, this.desktopAppVersion, rejectedFingerprint)
           : null;
       if (this.disposed) return;
-      if (!auth?.apiKey || (p.expectedAccountScope && p.expectedAccountScope !== auth.accountScope)) {
+      if (!auth?.apiKey || this.isRejectedAuth(auth.apiKey)
+        || (p.expectedAccountScope && p.expectedAccountScope !== auth.accountScope)) {
         this.write({
           id,
           result: {
             headersApplied: false,
-            errorMessage: p.expectedAccountScope && auth?.apiKey
+            errorMessage: p.expectedAccountScope && auth?.apiKey && p.expectedAccountScope !== auth.accountScope
               ? "The desktop account or plan changed during this request"
               : "No ZCode desktop login is available for this plan",
           },
@@ -3340,6 +3390,7 @@ export class ZCodeClient {
         return;
       }
       // Refresh matching caches only after obtaining a usable replacement key.
+      this.providersNeedingAuthRefresh.delete(providerId);
       for (const field of ["sessionRuntime", "defaultRuntime"] as const) {
         const runtime = this[field];
         if (runtime && sameDesktopLogin(runtime, providerId)) {
@@ -3354,6 +3405,7 @@ export class ZCodeClient {
           requestAuth: { apiKey: auth.apiKey, ...(auth.apiKeyId ? { apiKeyId: auth.apiKeyId, accountScope: auth.accountScope } : {}) },
         },
       });
+      if (p.sessionId && p.turnId) this.rememberTurnAuth(p.sessionId, p.turnId, providerId, auth.apiKey);
     } catch (e) {
       if (this.disposed) return;
       logWarn("provider runtime headers failed", e);
@@ -3605,9 +3657,9 @@ export class ZCodeClient {
         const message = `${err.error.code}: ${err.error.message}`;
         if (/\b401\b|unauthorized/i.test(message)) {
           this.loginStale = true;
-          for (const runtime of [this.sessionRuntime, this.defaultRuntime]) {
-            if (runtime?.apiKey) invalidatePlanAuth(runtime.apiKey);
-          }
+          const runtime = this.sessionRuntime ?? this.defaultRuntime;
+          if (runtime?.apiKey) this.rejectAuth(runtime.apiKey);
+          if (this.defaultRuntime && this.defaultRuntime !== runtime) invalidatePlanAuth(this.defaultRuntime.apiKey);
         }
         pending.reject(
           new Error(`ZCode error ${message}`)
@@ -3681,6 +3733,7 @@ export class ZCodeClient {
       timestamp?: number;
       seq?: number;
       sessionId?: string;
+      turnId?: string;
       type?: string;
       payload?: {
         kind?: string;
@@ -3693,10 +3746,27 @@ export class ZCodeClient {
         input?: unknown;
         status?: string;
         message?: string;
+        error?: {
+          message?: string;
+          detail?: string;
+          type?: string;
+          attribution?: { source?: string; providerId?: string; statusCode?: number };
+        };
       };
     };
 
     if (!p?.type) return;
+    if (!replay && (p.type === "turn.completed" || p.type === "turn.failed")) {
+      const id = p.sessionId && p.turnId ? JSON.stringify([p.sessionId, p.turnId]) : undefined;
+      const failure = p.payload?.error?.attribution;
+      if (p.type === "turn.failed" && failure?.source === "provider" && failure.statusCode === 401 && failure.providerId) {
+        // Without a headers exchange we cannot tell which key the backend loaded from its own config.
+        const apiKey = id ? this.turnAuth.get(id)?.get(failure.providerId) : undefined;
+        if (apiKey) this.rejectAuth(apiKey);
+        else this.providersNeedingAuthRefresh.add(failure.providerId);
+      }
+      if (id) this.turnAuth.delete(id);
+    }
     if (p.type === "model.streaming" && p.payload?.kind !== "tool_call") return;
     if (p.sessionId === this.sessionId && this.projectionPhase() && (p.type === "turn.started" || p.type === "turn.completed" || p.type === "turn.failed")) {
       if (p.type !== "turn.started") void this.resyncConversation();
@@ -3739,12 +3809,7 @@ export class ZCodeClient {
       // Reconcile the final text even when a final fragmented frame had no successor to expose a gap.
       void this.resyncConversation();
     } else if (p.type === "turn.failed") {
-      const payload = p.payload as
-        | {
-            message?: string;
-            error?: { message?: string; detail?: string; type?: string };
-          }
-        | undefined;
+      const payload = p.payload;
       const message =
         payload?.error?.message ||
         payload?.error?.detail ||
@@ -3889,6 +3954,8 @@ export class ZCodeClient {
       p.reject(new LocalizedError("ZCode 客户端已关闭"));
     }
     this.pending.clear();
+    this.turnAuth.clear();
+    this.providersNeedingAuthRefresh.clear();
     this.clearLateResumes();
     this.rl?.close();
     this.rl = null;
@@ -4189,9 +4256,21 @@ function isStopLikeError(message: string): boolean {
 }
 
 
+function modelSwitchRejection(result: { status?: string; reasonCode?: string; message?: string }): Error {
+  return Object.assign(new Error(result.message || result.reasonCode || result.status), { reasonCode: result.reasonCode });
+}
+
+/** The session registry rejected the provider or model, as opposed to a transport or auth failure. */
+export function isModelRegistryRejection(error: unknown): boolean {
+  const value = error as { reasonCode?: unknown; message?: unknown } | null;
+  return value?.reasonCode === "provider.notInRegistry"
+    || typeof value?.message === "string" && /provider\.notInRegistry|not in the workspace model registry|Provider Registry 中不存在 Model/.test(value.message);
+}
+
 function modelsFromSnapshot(snapshot: SessionSnapshot): {
   current?: { providerId: string; modelId: string };
   available: AvailableModel[];
+  known: boolean;
 } {
   const current =
     extractModel(snapshot.settings?.model?.current) ||
@@ -4209,7 +4288,8 @@ function modelsFromSnapshot(snapshot: SessionSnapshot): {
       disabledReason: row.disabledReason,
     });
   }
-  return { current, available };
+  // A cold session's empty registry is a shell, not evidence that no model exists.
+  return { current, available, known: available.length > 0 };
 }
 
 function extractModel(

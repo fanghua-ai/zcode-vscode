@@ -255,7 +255,6 @@ test("a model chosen during a reply applies on the next question", async () => {
     client: {
       currentSessionId: string;
       isGenerating: () => boolean;
-      stageSessionModel: (model: { providerId: string; modelId: string }) => void;
       setModel: (providerId: string, modelId: string) => Promise<void>;
       sendMessage: () => Promise<void>;
     };
@@ -269,7 +268,6 @@ test("a model chosen during a reply applies on the next question", async () => {
   state.client = {
     currentSessionId: "A",
     isGenerating: () => generating,
-    stageSessionModel: () => {},
     setModel: async (providerId, modelId) => { commands.push(`model:${providerId}/${modelId}`); },
     sendMessage: async () => { commands.push("send"); },
   };
@@ -279,10 +277,11 @@ test("a model chosen during a reply applies on the next question", async () => {
   assert.deepEqual(commands, []);
   assert.equal(posted.at(-1)?.current?.modelId, "next");
   state.handleZCodeEvent({ type: "model_info", data: { providerId: "p", modelId: "old" } });
-  assert.equal(state.currentModel?.modelId, "next");
+  assert.equal(state.currentModel?.modelId, "old");
   generating = false;
   await state.onWebviewMessage({ type: "send", text: "next question", sessionId: "A" });
   assert.deepEqual(commands, ["model:p/next", "send"]);
+  assert.equal(state.currentModel?.modelId, "next");
 });
 
 test("startup skips a remembered session the desktop index has archived or deleted", t => {

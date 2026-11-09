@@ -6,7 +6,7 @@ import * as path from "path";
 import {
   OrgProject,
   PlanAuth,
-  usesProjectTokens,
+  usesLegacyPlanKeys,
   PlanFamily,
   V2Config,
   V2Provider,
@@ -588,7 +588,7 @@ export async function resolveProviderRequestAuth(
     if (!plan?.team || plan.family !== family) return null;
     return tryPlanOAuth(family, plan.team, appVersion, rejectedFingerprint);
   }
-  if (!usesProjectTokens(appVersion)) {
+  if (usesLegacyPlanKeys(appVersion)) {
     const stored = readStoredPlanApiKey(providerId.startsWith("account:")
       ? providerId : `account:${family}-${kind}`);
     if (stored) return { apiKey: stored };
@@ -645,12 +645,16 @@ export function readCliDefaultModel(): { providerId: string; modelId: string } |
   } catch { return undefined; }
 }
 
-export function readConfiguredDefaultModel(runtime: ResolvedRuntime | null): { providerId: string; modelId: string } | undefined {
+export function registeredStartPlanProvider(binaryPath: string, providerId: string): string | undefined {
+  const family = /^builtin:(bigmodel|zai)-start-plan$/.exec(providerId)?.[1];
+  if (!family) return undefined;
+  const account = `account:${family}-start-plan`;
+  return loadBuiltinProviderRules(binaryPath).some(rule => rule.providerId === account && !rule.hidden) ? account : undefined;
+}
+
+export function readConfiguredDefaultModel(runtime: ResolvedRuntime | null, binaryPath = resolveBinaryPath()): { providerId: string; modelId: string } | undefined {
   if (runtime?.providerId.includes("start-plan")) {
-    const family = familyOfProvider(runtime.providerId);
-    const account = `account:${family}-start-plan`;
-    const registered = loadBuiltinProviderRules(resolveBinaryPath()).some(rule => rule.providerId === account && !rule.hidden);
-    return { providerId: registered ? account : runtime.providerId, modelId: runtime.modelId };
+    return { providerId: registeredStartPlanProvider(binaryPath, runtime.providerId) ?? runtime.providerId, modelId: runtime.modelId };
   }
   const cli = readCliDefaultModel();
   if (cli) return cli;
@@ -1247,7 +1251,7 @@ export async function resolveRuntime(opts?: {
         return true;
       }
     };
-    if (!prefer && !usesProjectTokens(opts?.appVersion)) {
+    if (!prefer && usesLegacyPlanKeys(opts?.appVersion)) {
       const stored = await readStoredPlanApiKeyWithRetry(`account:${family}-${kind}`);
       if (stored) {
         if (!(await entitled(stored))) return null;

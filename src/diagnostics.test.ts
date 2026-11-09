@@ -132,6 +132,21 @@ test("Desktop version falls back to Windows executable metadata when the manifes
   assert.deepEqual(result, { appVersion: "3.17.1", source: "windows_executable" });
 });
 
+test("Desktop version falls back to the macOS bundle version when the manifest is unreadable", async t => {
+  const contents = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "zcode-diagnostics-")), "ZCode.app", "Contents");
+  t.after(() => fs.rmSync(path.dirname(path.dirname(contents)), { recursive: true, force: true }));
+  fs.mkdirSync(path.join(contents, "Resources", "glm"), { recursive: true });
+  const binary = path.join(contents, "Resources", "glm", "zcode.cjs");
+  assert.deepEqual(await resolveDesktopVersion(binary, "darwin"), { appVersion: null, source: "macos_bundle_read_failed" });
+  fs.writeFileSync(path.join(contents, "Info.plist"), `<?xml version="1.0"?><plist><dict>
+    <key>CFBundleVersion</key><string>3.17.2.8901</string>
+    <key>CFBundleShortVersionString</key>
+    <string>3.17.2</string></dict></plist>`);
+  assert.deepEqual(await resolveDesktopVersion(binary, "darwin"), { appVersion: "3.17.2", source: "macos_bundle" });
+  fs.writeFileSync(path.join(contents, "Info.plist"), "<plist><dict></dict></plist>");
+  assert.deepEqual(await resolveDesktopVersion(binary, "darwin"), { appVersion: null, source: "macos_bundle_version_missing" });
+});
+
 test("Model failure diagnostics preserve structured fields without exporting raw messages", () => {
   const failure = modelFailureDetails({
     code: "fault.provider.denied", source: "provider", recoverable: false,

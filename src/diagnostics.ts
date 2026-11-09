@@ -92,6 +92,16 @@ export async function resolveDesktopVersion(binaryPath: string, platform = proce
       return { appVersion: null, source: "windows_executable_read_failed" };
     }
   }
+  if (binaryPath && platform === "darwin") {
+    const contents = path.dirname(path.dirname(path.dirname(binaryPath)));
+    try {
+      const plist = fs.readFileSync(path.join(contents, "Info.plist"), "utf8");
+      const appVersion = validVersion(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]*)<\/string>/.exec(plist)?.[1]?.trim());
+      return appVersion ? { appVersion, source: "macos_bundle" } : { appVersion: null, source: "macos_bundle_version_missing" };
+    } catch {
+      return { appVersion: null, source: "macos_bundle_read_failed" };
+    }
+  }
   return { appVersion: null, source: "manifest_unavailable" };
 }
 

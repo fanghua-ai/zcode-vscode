@@ -2,7 +2,7 @@
   "name": "zcode-desktop-chat",
   "displayName": "ZCode Chat",
   "description": "在 VS Code 右侧边栏里和 ZCode 智能体对话，复用桌面端的登录、模型和会话。Chat with the ZCode agent in the VS Code secondary side bar using the desktop app's account, models, and sessions.",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "publisher": "fanghua",
   "author": "fanghua",
   "license": "MIT",
@@ -91,11 +91,51 @@
       },
       {
         "command": "zcode.sendSelection",
+        "title": "%command.sendSelection.title%"
+      },
+      {
+        "command": "zcode.sendSelection.zh-CN",
         "title": "ZCode: 把选区加入对话"
       },
       {
+        "command": "zcode.sendSelection.zh-TW",
+        "title": "ZCode: 將選取內容加入對話"
+      },
+      {
+        "command": "zcode.sendSelection.en",
+        "title": "ZCode: Add Selection to Chat"
+      },
+      {
         "command": "zcode.sendCurrentFile",
+        "title": "%command.sendCurrentFile.title%"
+      },
+      {
+        "command": "zcode.sendCurrentFile.zh-CN",
         "title": "ZCode: 把当前文件加入对话"
+      },
+      {
+        "command": "zcode.sendCurrentFile.zh-TW",
+        "title": "ZCode: 將目前檔案加入對話"
+      },
+      {
+        "command": "zcode.sendCurrentFile.en",
+        "title": "ZCode: Add Current File to Chat"
+      },
+      {
+        "command": "zcode.addExplorerFiles",
+        "title": "%command.addExplorerFiles.title%"
+      },
+      {
+        "command": "zcode.addExplorerFiles.zh-CN",
+        "title": "ZCode: 把文件加入对话"
+      },
+      {
+        "command": "zcode.addExplorerFiles.zh-TW",
+        "title": "ZCode: 將檔案加入對話"
+      },
+      {
+        "command": "zcode.addExplorerFiles.en",
+        "title": "ZCode: Add to Chat"
       },
       {
         "command": "zcode.showChromeSettings",
@@ -107,15 +147,118 @@
       }
     ],
     "menus": {
+      "explorer/context": [
+        {
+          "command": "zcode.addExplorerFiles",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && config.zcode.language == auto",
+          "group": "zcode"
+        },
+        {
+          "command": "zcode.addExplorerFiles.zh-CN",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && config.zcode.language == zh-CN",
+          "group": "zcode"
+        },
+        {
+          "command": "zcode.addExplorerFiles.zh-TW",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && config.zcode.language == zh-TW",
+          "group": "zcode"
+        },
+        {
+          "command": "zcode.addExplorerFiles.en",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && config.zcode.language == en",
+          "group": "zcode"
+        }
+      ],
       "editor/context": [
         {
           "command": "zcode.sendSelection",
-          "when": "editorHasSelection",
+          "when": "editorHasSelection && config.zcode.language == auto",
+          "group": "zcode@1"
+        },
+        {
+          "command": "zcode.sendSelection.zh-CN",
+          "when": "editorHasSelection && config.zcode.language == zh-CN",
+          "group": "zcode@1"
+        },
+        {
+          "command": "zcode.sendSelection.zh-TW",
+          "when": "editorHasSelection && config.zcode.language == zh-TW",
+          "group": "zcode@1"
+        },
+        {
+          "command": "zcode.sendSelection.en",
+          "when": "editorHasSelection && config.zcode.language == en",
           "group": "zcode@1"
         },
         {
           "command": "zcode.sendCurrentFile",
-          "group": "zcode@2"
+          "group": "zcode@2",
+          "when": "config.zcode.language == auto"
+        },
+        {
+          "command": "zcode.sendCurrentFile.zh-CN",
+          "group": "zcode@2",
+          "when": "config.zcode.language == zh-CN"
+        },
+        {
+          "command": "zcode.sendCurrentFile.zh-TW",
+          "group": "zcode@2",
+          "when": "config.zcode.language == zh-TW"
+        },
+        {
+          "command": "zcode.sendCurrentFile.en",
+          "group": "zcode@2",
+          "when": "config.zcode.language == en"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "zcode.sendSelection",
+          "when": "config.zcode.language == auto"
+        },
+        {
+          "command": "zcode.sendSelection.zh-CN",
+          "when": "config.zcode.language == zh-CN"
+        },
+        {
+          "command": "zcode.sendSelection.zh-TW",
+          "when": "config.zcode.language == zh-TW"
+        },
+        {
+          "command": "zcode.sendSelection.en",
+          "when": "config.zcode.language == en"
+        },
+        {
+          "command": "zcode.sendCurrentFile",
+          "when": "config.zcode.language == auto"
+        },
+        {
+          "command": "zcode.sendCurrentFile.zh-CN",
+          "when": "config.zcode.language == zh-CN"
+        },
+        {
+          "command": "zcode.sendCurrentFile.zh-TW",
+          "when": "config.zcode.language == zh-TW"
+        },
+        {
+          "command": "zcode.sendCurrentFile.en",
+          "when": "config.zcode.language == en"
+        },
+        {
+          "command": "zcode.addExplorerFiles",
+          "when": "config.zcode.language == auto"
+        },
+        {
+          "command": "zcode.addExplorerFiles.zh-CN",
+          "when": "config.zcode.language == zh-CN"
+        },
+        {
+          "command": "zcode.addExplorerFiles.zh-TW",
+          "when": "config.zcode.language == zh-TW"
+        },
+        {
+          "command": "zcode.addExplorerFiles.en",
+          "when": "config.zcode.language == en"
         }
       ]
     },

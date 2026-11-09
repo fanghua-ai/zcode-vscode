@@ -1,5 +1,21 @@
 # 更新日志 / Changelog
 
+## 2.2.2 — 2026-11-09
+
+### 中文
+- 支持在 VS Code 文件树中选中一个或多个文件，右键加入对话。
+- Start Plan 模型菜单保留已验证的可用模型，隐藏同账号残留的个人套餐选项，并使用后端注册的提供方切换模型；所选模型已不可用时恢复原模型并提示重新选择，不再在之后每次发送时重复失败。
+- 无法读取桌面端版本时，Coding Plan 登录优先尝试短期项目凭据。缺少换证凭据、服务暂时不可用或明确不支持发放短期凭据时，个人套餐仍可使用已有的旧版密钥。macOS 也支持从应用信息读取桌面端版本。
+- 刷新 Coding Plan 凭据时遇到网络中断、限流或服务端暂时故障，继续使用尚未过期的凭据，几秒后重试。
+- 兼容范围更新为 ZCode 桌面端 3.12.3–3.17.2。
+
+### English
+- Add one or more selected files to chat from the VS Code Explorer context menu.
+- Keep verified Start Plan models in the picker, hide stale personal-plan entries for the same account, and switch models through the registered provider. If the chosen model is no longer available, the previous model is restored with a prompt to pick again, instead of every later send failing.
+- When the desktop version cannot be read, Coding Plan sign-in prefers a short-lived project token. Personal plans can still use an existing legacy key if there is no credential to exchange or token issuance is temporarily unavailable or unsupported. On macOS, the extension can also read the desktop version from the app bundle.
+- Keep using an unexpired Coding Plan credential when a refresh hits a network drop, rate limit, or temporary server error, and retry a few seconds later.
+- Update the supported range to ZCode desktop 3.12.3–3.17.2.
+
 ## 2.2.1 — 2026-11-07
 
 ### 中文

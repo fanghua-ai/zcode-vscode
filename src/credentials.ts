@@ -602,6 +602,36 @@ export function usesProjectTokens(version?: string | null): boolean {
   return major > 3 || (major === 3 && (minor > 15 || (minor === 15 && patch >= 1)));
 }
 
+/** Only a desktop known to predate 3.15.1 stores long-lived account keys. */
+export function usesLegacyPlanKeys(version?: string | null): boolean {
+  return /^\d+\.\d+\.\d+(?:[-+].*)?$/.test(version ?? "") && !usesProjectTokens(version);
+}
+
+// The issue endpoint requires a client version. An unreadable desktop
+// version is treated as the oldest release that issues project tokens.
+const PROJECT_TOKEN_FALLBACK_VERSION = "3.15.1";
+const PROJECT_TOKEN_RETRY_MS = 5_000;
+
+function isTransientPlanError(error: unknown): boolean {
+  if (error instanceof JsonRequestError) {
+    const status = error.status ?? 0;
+    return error.code === "HTTP_STATUS" && (status === 429 || (status >= 500 && status < 600));
+  }
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && ["ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ENETUNREACH", "ENOTFOUND", "ECONNREFUSED"].includes(code);
+}
+
+/** Only a missing issue endpoint shows that the service predates project tokens. */
+function projectTokensUnsupported(error: unknown): boolean {
+  const unsupported = ["404", "405", "501"];
+  if (error instanceof JsonRequestError) {
+    return (error as { stage?: unknown }).stage === "issue_project_token" &&
+      error.code === "HTTP_STATUS" && unsupported.includes(String(error.status));
+  }
+  return error instanceof PlanAuthError && error.stage === "issue_project_token" &&
+    error.reason === "rejected" && unsupported.includes(String(error.response?.code));
+}
+
 export interface PlanAuth {
   apiKey: string;
   /** Present only for short-lived project tokens; never persist these credentials. */
@@ -613,6 +643,7 @@ type CachedPlanToken = {
   scope: string;
   value?: PlanAuth;
   refreshAt?: number;
+  expiresAt?: number;
   pending?: Promise<PlanAuth>;
 };
 // Concurrent personal and team exchanges need separate slots. The scope still
@@ -737,10 +768,26 @@ async function resolveProjectToken(
       throw new Error("project_token_account_changed");
     }
     current.value = { apiKey: token.accessToken.trim(), apiKeyId, accountScope: scope };
+    current.expiresAt = expiresAt;
     current.refreshAt = expiresAt - Math.min(120_000, (expiresAt - started) / 5);
     logInfo("Plan login resolved", { family, team: !!prefer, stage: "exchange_project_token", credentialHash: authHash(token.accessToken.trim()) });
     return current.value;
-  })();
+  })().catch(async error => {
+    // Rejected (401) tokens were cleared above, so only a still-valid token survives an outage.
+    if (planTokens.get(scope) !== current || !current.value || !isTransientPlanError(error) ||
+        Date.now() >= current.expiresAt!) throw error;
+    const latest = await readCredentialsWithRetry().catch(() => null);
+    if (planTokens.get(scope) !== current ||
+        latest?.[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] !== oauth) {
+      throw new Error("project_token_account_changed");
+    }
+    if (!current.value || Date.now() >= current.expiresAt!) throw error;
+    current.refreshAt = Math.min(Date.now() + PROJECT_TOKEN_RETRY_MS, current.expiresAt!);
+    const details = { ...planAuthErrorDetails(error), family, team: !!prefer };
+    logWarn("Plan project token refresh deferred", details);
+    recordDiagnosticEvent("plan_refresh_deferred", details);
+    return current.value;
+  });
   try { return await current.pending; }
   finally { current.pending = undefined; }
 }
@@ -762,21 +809,49 @@ export async function tryPlanOAuth(
   try {
     const creds = await readCredentialsWithRetry();
     const activeProvider = creds[CRED_KEYS.activeProvider] ?? null;
-    const accessToken =
-      creds[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] ??
-      null;
+    const protocol = usesProjectTokens(appVersion) ? "project_token" : usesLegacyPlanKeys(appVersion) ? "legacy" : "unknown";
+    const storedPersonalAuth = (loaded: Record<string, string>) => {
+      if (prefer || protocol !== "unknown") return null;
+      const apiKey = readStoredPlanApiKey(`account:${family}-individual-coding-plan`, loaded);
+      if (!apiKey || crypto.createHash("sha256").update(apiKey).digest("hex") === rejectedFingerprint) return null;
+      logDebug("Using stored personal plan key for an unknown desktop version", { family });
+      return { apiKey, activeProvider: loaded[CRED_KEYS.activeProvider] ?? family };
+    };
+    const tokenKey = family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken;
+    const accessToken = creds[tokenKey];
     if (!accessToken?.trim().replace(/^Bearer\s+/i, "")) {
       logWarn("Desktop OAuth token is unavailable", { family });
-      return null;
+      return storedPersonalAuth(creds);
     }
     // This entry point reads Desktop credentials, not a CLI OAuth callback.
     logDebug("Plan desktop credential selected", { family, team: !!prefer, stage: "read_credentials",
-      credentialKind: family === "zai" ? "business" : "oauth", credentialHash: authHash(accessToken),
-      protocol: usesProjectTokens(appVersion) ? "project_token" : "legacy" });
-    if (usesProjectTokens(appVersion)) {
+      credentialKind: family === "zai" ? "business" : "oauth", credentialHash: authHash(accessToken), protocol });
+    if (protocol !== "legacy") {
       stage = "exchange_project_token";
-      const auth = await resolveProjectToken(family, accessToken, appVersion!, prefer, rejectedFingerprint);
-      return { ...auth, activeProvider: activeProvider ?? family };
+      try {
+        const auth = await resolveProjectToken(family, accessToken,
+          protocol === "project_token" ? appVersion! : PROJECT_TOKEN_FALLBACK_VERSION, prefer, rejectedFingerprint);
+        return { ...auth, activeProvider: activeProvider ?? family };
+      } catch (error) {
+        if (protocol !== "unknown") throw error;
+        const unsupported = projectTokensUnsupported(error);
+        if (!unsupported && (prefer || !isTransientPlanError(error))) throw error;
+        const details = { ...planAuthErrorDetails(error), family, team: !!prefer };
+        if (!prefer) {
+          const latest = await readCredentialsWithRetry();
+          if (latest[tokenKey] !== accessToken) throw new Error("project_token_account_changed");
+          const stored = storedPersonalAuth(latest);
+          if (stored) {
+            logWarn("Project token unavailable for an unknown desktop version; using a stored personal key", details);
+            recordDiagnosticEvent("plan_project_token_fallback", details);
+            return stored;
+          }
+        }
+        // A temporary outage permits reusing a stored key, but only an unsupported endpoint permits a legacy exchange.
+        if (!unsupported) throw error;
+        logWarn("Project token unavailable for an unknown desktop version; trying legacy plan key", details);
+        recordDiagnosticEvent("plan_project_token_fallback", details);
+      }
     }
     stage = "exchange_api_key";
     const auth = await resolveLegacyPlanKey(family, accessToken, prefer, rejectedFingerprint);
@@ -833,7 +908,7 @@ export async function fetchPlanQuota(plan: {
   // Personal Coding Plans use the desktop-stored account key when there is
   // exactly one, so a multi-org account is not assigned by display name.
   let apiKey = "";
-  if (!plan.team && !usesProjectTokens(appVersion)) {
+  if (!plan.team && usesLegacyPlanKeys(appVersion)) {
     apiKey = readStoredPlanApiKey(`account:${plan.family}-${plan.kind}`) ?? "";
   }
   if (!apiKey) {
@@ -1006,6 +1081,8 @@ export async function readStartPlanAccess(family: PlanFamily, appVersion?: strin
   }
   logDebug("Start Plan entitlement resolved", { stage: "start_plan_balance", family, code: resultCode(response.code),
     activePlanCount: activePlans.length, modelCount: models.length });
+  recordDiagnosticEvent("start_plan_catalog", { family, modelCount: models.length,
+    hasGlm53: seenModels.has("glm-5.3"), hasGlm53Flash: seenModels.has("glm-5.3-flash") });
   const quota = ownedBalances
     .map((balance): PlanQuotaLimit | null => {
       const total = finiteNonNegative(balance.total_units);

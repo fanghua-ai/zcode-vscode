@@ -1,4 +1,5 @@
 {
+  "command.addExplorerFiles.title": "ZCode: 將檔案加入對話",
   "diagnostics.exportHelp": "複製或匯出診斷資訊時會自動去識別化；完成後請自行再檢查一遍。",
   "command.showChromeSettings.title": "ZCode: 開啟顯示設定",
   "config.showSuppressedPluginSkills.description": "這些外掛關閉時，仍在 / 選單列出文件、PDF、簡報、表格和瀏覽器技能。選取後不傳送該技能。啟用會記住，之後啟動會拉起這些 MCP。",
@@ -67,5 +68,7 @@
   "config.formulaFonts.auto": "在公式回覆旁詢問",
   "config.formulaFonts.on": "下載並使用公式字型",
   "config.formulaFonts.off": "使用系統字型，不再詢問",
-  "config.allowedDesktopPlugins.description": "允許在擴充功能中啟用的外掛，仍遵循桌面端原有開關。修改會重新啟動目前對話。瀏覽器和電腦控制共用 JavaScript REPL。"
+  "config.allowedDesktopPlugins.description": "允許在擴充功能中啟用的外掛，仍遵循桌面端原有開關。修改會重新啟動目前對話。瀏覽器和電腦控制共用 JavaScript REPL。",
+  "command.sendSelection.title": "ZCode: 將選取內容加入對話",
+  "command.sendCurrentFile.title": "ZCode: 將目前檔案加入對話"
 }

@@ -20,7 +20,7 @@ export function errorGuidance(message: string): ErrorGuidance {
     category:"quota", title:"当前额度暂时无法使用", action:"retry", label:"重新读取登录",
     hint:"请在桌面端检查剩余额度和重置时间。可以稍后重试，或切换到仍有额度的项目后重新读取登录。",
   };
-  if (/401|403|unauthorized|oauth|login|credentials|api.?key|登录|凭据|鉴权|Could not reuse/i.test(message)) return {
+  if (/401|403|unauthorized|oauth|login|credentials|api.?key|登录|凭据|憑證|鉴权|Could not reuse/i.test(message)) return {
     category:"login", title:"需要重新确认 ZCode 登录", action:"retry", label:"重新读取登录",
     hint:"请打开 ZCode 桌面端，确认已登录且当前项目有可用模型，再点击重新读取登录后重试。",
   };

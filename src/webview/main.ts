@@ -580,9 +580,36 @@ input.addEventListener("paste", event => {
     for (const image of images) void addImageFile(image);
   }
 });
-input.addEventListener("dragover", event => { if (event.dataTransfer?.types.some(type => type === "Files" || type === "text/uri-list")) event.preventDefault(); });
-input.addEventListener("drop", event => {
-  const uris = (event.dataTransfer?.getData("text/uri-list") || "").split(/\r?\n/).filter(uri => /^file:/i.test(uri));
+const composerDropTarget = document.querySelector<HTMLElement>("#composer .composer-card")!;
+const vscodeUriList = "application/vnd.code.uri-list";
+const vscodeResources = "resourceurls";
+
+function droppedFileUris(transfer: DataTransfer): string[] {
+  const localUris = (values: unknown[]) => [...new Set(values.filter((value): value is string =>
+    typeof value === "string" && /^file:/i.test(value)))].slice(0, 20);
+  // VS Code's standard URI list can contain only the first of several selected files.
+  const resources = transfer.getData(vscodeResources);
+  if (resources) {
+    try {
+      const values: unknown = JSON.parse(resources);
+      const uris = Array.isArray(values) ? localUris(values) : [];
+      if (uris.length) return uris;
+    } catch { /* Fall back to the standard URI list. */ }
+  }
+  const internal = localUris(transfer.getData(vscodeUriList).split(/\r?\n/));
+  if (internal.length) return internal;
+  return localUris(transfer.getData("text/uri-list").split(/\r?\n/));
+}
+
+composerDropTarget.addEventListener("dragover", event => {
+  if (event.dataTransfer?.types.some(type => ["files", "text/uri-list", vscodeUriList, vscodeResources].includes(type.toLowerCase()))) {
+    event.preventDefault();
+  }
+});
+composerDropTarget.addEventListener("drop", event => {
+  const transfer = event.dataTransfer;
+  if (!transfer) return;
+  const uris = droppedFileUris(transfer);
   // A native drop can contain images and ordinary files together. Let the
   // host handle the entire batch so neither ordinary files nor images repeat.
   if (uris.length) {
@@ -590,7 +617,7 @@ input.addEventListener("drop", event => {
     if (attachmentInputReady()) post({ type: "attachFileUris", sessionId: draftSessionId, uris, maxImages: Math.max(0, IMAGE_MAX_COUNT - imageDrafts.length) });
     return;
   }
-  const images = Array.from(event.dataTransfer?.files ?? []).filter(file => file.type.startsWith("image/"));
+  const images = Array.from(transfer.files).filter(file => file.type.startsWith("image/"));
   if (images.length) { event.preventDefault(); for (const image of images) void addImageFile(image); }
 });
 

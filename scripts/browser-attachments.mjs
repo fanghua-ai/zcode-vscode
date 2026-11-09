@@ -182,6 +182,19 @@ try {
     const drop=new DataTransfer();drop.setData('text/uri-list','file:///project/a%20%231.ts');
     input.dispatchEvent(new DragEvent('drop',{dataTransfer:drop,bubbles:true,cancelable:true}));
     check(sent.some(m=>m.type==='attachFileUris'&&m.sessionId==='paste-A'&&m.uris[0]==='file:///project/a%20%231.ts'),'file drag lost path or owner');
+    const explorerFiles=['file:///project/a%20%231.ts','file:///project/b.ts'];
+    for(const [format,value] of [
+      ['ResourceURLs',JSON.stringify(explorerFiles)],
+      ['application/vnd.code.uri-list',explorerFiles.join('\\r\\n')],
+    ]){
+      const explorerDrop=new DataTransfer();explorerDrop.setData(format,value);
+      explorerDrop.setData('text/uri-list',explorerFiles[0]);
+      const card=input.closest('.composer-card');
+      const event=type=>new DragEvent(type,{dataTransfer:explorerDrop,bubbles:true,cancelable:true});
+      check(!card.dispatchEvent(event('dragover')),'composer card did not accept an Explorer drag');
+      check(!card.dispatchEvent(event('drop')),'Explorer drag kept the browser default');
+      check(sent.filter(m=>m.type==='attachFileUris').at(-1).uris.join('|')===explorerFiles.join('|'),'Explorer drag lost part of the selection');
+    }
     const mixedDrop=()=>{
       const transfer=new DataTransfer();
       transfer.items.add(new File([bytes],'screen.png',{type:'image/png'}));

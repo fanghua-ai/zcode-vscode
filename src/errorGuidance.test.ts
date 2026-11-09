@@ -11,6 +11,7 @@ const cases: Array<[string,string,string]> = [
   ["provider.notInRegistry","model","pickModel"],
   ["ZCode error -32031: 模型已不可用","model","pickModel"],
   ["401 Unauthorized","login","retry"],
+  ["模型驗證需要重新整理，請確認桌面端的憑證有效，點選「重新讀取登入」後重試。","login","retry"],
   ["余额不足 1113","quota","retry"],
   ["Method not found","compatibility","retry"],
   ['ZCode error -32602: Unrecognized key: "apiKey"',"compatibility","retry"],

@@ -14,7 +14,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { ZCodeClient, ZCodeEvent, SessionSummary, type AvailableModel } from "./zcodeClient";
+import { ZCodeClient, ZCodeEvent, SessionSummary, isModelRegistryRejection, type AvailableModel } from "./zcodeClient";
 import { FileChange } from "./toolFiles";
 import {
   ContextChip,
@@ -29,6 +29,7 @@ import {
   resolveBinaryPath,
   localLoginCanOverlapSpawn,
   readPickerResolution,
+  registeredStartPlanProvider,
   isSessionModelAvailable,
   resolveRuntime,
   resolveRuntimeForSession,
@@ -75,6 +76,7 @@ const LAST_BINARY_KEY = "zcode.lastBinaryPath";
 const SESSION_MODELS_KEY = "zcode.sessionModels";
 const NEW_SESSION_DEFAULTS_KEY = "newSessionDefaults";
 const DEFENDER_NOTICE_KEY = "zcode.defenderNoticeDismissed";
+const START_PLAN_PROVIDER = /^(?:account|builtin):(?:bigmodel|zai)-start-plan$/;
 
 function configuredQuotaAdapters(): QuotaAdapterConfig[] {
   const raw = vscode.workspace.getConfiguration("zcode").get<unknown>("quotaAdapters", []);
@@ -161,6 +163,17 @@ export function mergeAvailablePickerModels(
   return merged;
 }
 
+function localAttachmentUris(values: readonly string[]): vscode.Uri[] {
+  const uris: vscode.Uri[] = [];
+  for (const value of values.slice(0, 20)) {
+    try {
+      const uri = vscode.Uri.parse(value, true);
+      if (uri.scheme === "file" && !uri.authority && !uri.query && !uri.fragment) uris.push(uri);
+    } catch { /* Ignore malformed drag data. */ }
+  }
+  return uris;
+}
+
 export function activate(context: vscode.ExtensionContext) {
   getLog();
   context.subscriptions.push({ dispose: disposeLog });
@@ -186,8 +199,16 @@ export function activate(context: vscode.ExtensionContext) {
   register("zcode.switchSession", () => provider.quickSwitchSession());
   register("zcode.selectModel", () => provider.quickSelectModel());
   register("zcode.showLog", () => getLog().show(true));
-  register("zcode.sendSelection", () => provider.insertEditorContext("selection"));
-  register("zcode.sendCurrentFile", () => provider.insertEditorContext("file"));
+  const registerContextCommand = <Args extends unknown[]>(id: string, run: (...args: Args) => unknown) => {
+    // VS Code reads menu titles from the manifest. Each language entry invokes the same handler.
+    for (const command of [id, `${id}.zh-CN`, `${id}.zh-TW`, `${id}.en`]) {
+      context.subscriptions.push(vscode.commands.registerCommand(command, run));
+    }
+  };
+  registerContextCommand("zcode.sendSelection", () => provider.insertEditorContext("selection"));
+  registerContextCommand("zcode.sendCurrentFile", () => provider.insertEditorContext("file"));
+  registerContextCommand("zcode.addExplorerFiles",
+    (uri?: vscode.Uri, selection?: vscode.Uri[]) => provider.insertExplorerFiles(selection?.length ? selection : uri ? [uri] : []));
   register("zcode.showChromeSettings", () => provider.showChromeSettings());
   register("zcode.setQuotaApiKey", () => provider.setQuotaApiKey());
 
@@ -305,6 +326,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private questionIndexCache: { key: string; questions: SessionQuestion[] } | null = null;
   private readSessionQuestions: (sessionId: string) => SessionQuestion[] = listSessionQuestions;
   private runtime: ResolvedRuntime | null = null;
+  private startPlanModelProvider?: string;
+
+  private setResolvedRuntime(runtime: ResolvedRuntime): void {
+    this.runtime = runtime;
+    this.startPlanModelProvider = registeredStartPlanProvider(this.appServerPath, runtime.providerId);
+  }
   private sessions: SessionSummary[] = [];
   private picker: PickerModel[] = [];
   private disabledModelKeys = new Set<string>();
@@ -314,7 +341,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private resolveSessionModelRuntime = (model: Parameters<typeof resolveRuntimeForSession>[0]) =>
     resolveRuntimeForSession(model, this.desktopAppVersion);
   private pickerRefreshRevision = 0;
-  private livePicker: { client: ZCodeClient; sessionId: string; models: AvailableModel[] } | null = null;
+  /** `stale` keeps the last valid catalog on screen until the next successful read replaces it. */
+  private livePicker: { client: ZCodeClient; sessionId: string; models: AvailableModel[]; stale?: boolean } | null = null;
+  private liveCatalogReads = 0;
   private currentModel?: { providerId: string; modelId: string };
   /** Chosen while a reply is running. That reply keeps its model; the next question applies this one. */
   private pendingModel: { sessionId: string; providerId: string; modelId: string } | null = null;
@@ -341,7 +370,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     archived: { sessions: [], state: "unknown", loaded: false },
   };
   private recentIssues: Array<{at: string; category: IssueCategory}> = [];
-  private pendingChip?: ContextChip;
+  private pendingContextChips: ContextChip[] = [];
+  private contextViewReady = false;
 
   private resetSessionListCache(): void {
     this.sessions = [];
@@ -697,6 +727,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   resolveWebviewView(webviewView: vscode.WebviewView) {
     this.releaseViewListeners();
     this.view = webviewView;
+    this.contextViewReady = false;
     // The view is destroyed when the user closes or moves it; drop it so nothing posts into a disposed webview.
     this.viewDisposeListener = webviewView.onDidDispose?.(() => {
       if (this.view !== webviewView) return;
@@ -750,18 +781,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         const client = this.client;
         let planModeApplied = false;
         const operation = client && !!sessionId && sessionId === client.currentSessionId
-          ? (async () => {
-              if (this.pendingModelFor(client.currentSessionId)) {
-                const applied = await this.applyPendingModel(client);
-                if (!applied) {
-                  throw new Error(client === this.client && sessionId === client.currentSessionId
-                    ? t("该模型已不可用，请刷新模型列表后重新选择。")
-                    : t("会话已切换，请在当前会话重新发送。"));
-                }
-                if (client !== this.client || sessionId !== client.currentSessionId) {
-                  throw new Error(t("会话已切换，请在当前会话重新发送。"));
-                }
-              }
+          ? this.withSendModel(client, async () => {
               if (msg.planMode) {
                 await client.setMode("plan");
                 if (client !== this.client || sessionId !== client.currentSessionId) {
@@ -771,7 +791,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
               }
               const payload = buildPrompt(msg.text || "", prepareFileContext(msg.chips ?? [], this.workspacePath, vscode.workspace.textDocuments ?? []), this.sessionReferences(msg.sessionRefs));
               return client.insertQueuedMessage(payload, { immediate: !!msg.immediate, commandId: msg.queueItemId, attachments: readImageAttachments(msg.attachments) });
-            })()
+            })
           : Promise.reject(new Error(t("会话已切换，请在当前会话重新发送。")));
         void operation.then(commandId => {
           this.post({ type: "queue_admitted", commandId, sessionId });
@@ -799,15 +819,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         const operation = msg.type === "queueEdit" ? client.editQueuedMessage(msg.queueItemId, msg.text || "")
           : msg.type === "queueDelete" ? client.deleteQueuedMessage(msg.queueItemId)
           : msg.type === "queueReorder" ? client.reorderQueuedMessage(msg.queueItemId, msg.beforeQueueItemId ?? null)
-          : this.pendingModelFor(client.currentSessionId)
-            ? this.applyPendingModel(client).then(applied => {
-                if (!applied) throw new Error(t(stillOwned()
-                  ? "该模型已不可用，请刷新模型列表后重新选择。"
-                  : "会话已切换，请在当前会话重新发送。"));
-                if (!stillOwned()) throw new Error(t("会话已切换，请在当前会话重新发送。"));
-                return client.sendQueuedNow(msg.queueItemId!);
-              })
-            : client.sendQueuedNow(msg.queueItemId);
+          : this.withSendModel(client, () => client.sendQueuedNow(msg.queueItemId!));
         const editResult = (ok: boolean, error?: unknown) => {
           if (msg.type === "queueEdit") this.post({ type: "queue_edit_result", sessionId,
             queueItemId: msg.queueItemId, requestId: msg.requestId, viewGen: msg.viewGen, ok,
@@ -966,6 +978,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         // resolveWebviewView (Reload Webviews, renderer recovery) is still a
         // blank page that needs the full state again.
         this.webviewEpoch++;
+        this.contextViewReady = false;
         this.pushLanguage();
         this.pushChrome();
         this.pushDesktopPlugins();
@@ -980,10 +993,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           this.client?.refreshSubagentCatalog();
         }
         this.pushEditorContext();
-        if (this.pendingChip) {
-          this.post({ type: "addChip", chip: this.pendingChip });
-          this.pendingChip = undefined;
-        }
+        this.contextViewReady = true;
+        this.flushContextChips();
         break;
       case "fileReferenceDetails": {
         const document=(vscode.workspace.textDocuments ?? []).find(doc=>msg.path && sameWorkspacePath(doc.uri.fsPath,msg.path));
@@ -1026,12 +1037,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       case "attachFileUris": {
         const client = this.client; const owner = msg.sessionId;
         if (!client || !owner || owner !== client.currentSessionId || !Array.isArray(msg.uris)) break;
-        const uris: vscode.Uri[] = [];
-        for (const value of msg.uris.slice(0, 20)) {
-          if (typeof value !== "string") continue;
-          try { const uri = vscode.Uri.parse(value, true); if (uri.scheme === "file" && !uri.authority && !uri.query && !uri.fragment) uris.push(uri); } catch { /* Ignore malformed drag data. */ }
-        }
-        await this.attachFiles(uris, client, owner, msg.maxImages, msg.edit === true, msg.editRequestId); break;
+        await this.attachFiles(localAttachmentUris(msg.uris), client, owner, msg.maxImages, msg.edit === true, msg.editRequestId);
+        break;
       }
       case "uploadImage": {
         const client = this.client;
@@ -1070,30 +1077,25 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           if (!client || (!msg.text && !readImageAttachments(msg.attachments).length)) throw new Error(t("当前没有可发送的内容。"));
           if (msg.planMode && (!msg.sessionId || msg.sessionId !== client.currentSessionId)) throw new Error(t("会话已切换，请在当前会话重新发送。"));
           if (msg.sessionId && msg.sessionId !== client.currentSessionId) throw new Error(t("会话已切换，请在当前会话重新发送。"));
-          if (this.pendingModelFor(client.currentSessionId)) {
-            const applied = await this.applyPendingModel(client);
-            if (!applied) throw new Error(t(client === this.client && sessionId === client.currentSessionId
-              ? "该模型已不可用，请刷新模型列表后重新选择。"
-              : "会话已切换，请在当前会话重新发送。"));
-            if (client !== this.client || (msg.sessionId && msg.sessionId !== client.currentSessionId)) throw new Error(t("会话已切换，请在当前会话重新发送。"));
-          }
-          if (msg.planMode) {
-            await client.setMode("plan");
-            if (client !== this.client || !sessionId || client.currentSessionId !== sessionId) {
-              throw new Error(t("会话已切换，请在当前会话重新发送。"));
+          await this.withSendModel(client, async () => {
+            if (msg.planMode) {
+              await client.setMode("plan");
+              if (client !== this.client || !sessionId || client.currentSessionId !== sessionId) {
+                throw new Error(t("会话已切换，请在当前会话重新发送。"));
+              }
+              planModeApplied = true;
             }
-            planModeApplied = true;
-          }
-          const prompt = buildPrompt(msg.text || "", prepareFileContext(msg.chips ?? [], this.workspacePath, vscode.workspace.textDocuments ?? []), this.sessionReferences(msg.sessionRefs));
-          this.sendTiming.mark(timingId, "promptPreparedMs");
-          const sentSessionId = sessionId ?? client.currentSessionId ?? "";
-          const hadPriorUserMessage = this.sessionsWithUserMessages.has(sentSessionId);
-          await client.sendMessage(prompt, readImageAttachments(msg.attachments));
-          this.sendTiming.admitted(timingId);
-          this.flushSwitchBanner(sentSessionId, hadPriorUserMessage);
-          if (sentSessionId) this.sessionsWithUserMessages.add(sentSessionId);
-          this.post({ type: "send_admitted", commandId: msg.commandId, sessionId: sessionId ?? undefined });
-          if (isCurrent()) this.indexCurrentSession();
+            const prompt = buildPrompt(msg.text || "", prepareFileContext(msg.chips ?? [], this.workspacePath, vscode.workspace.textDocuments ?? []), this.sessionReferences(msg.sessionRefs));
+            this.sendTiming.mark(timingId, "promptPreparedMs");
+            const sentSessionId = sessionId ?? client.currentSessionId ?? "";
+            const hadPriorUserMessage = this.sessionsWithUserMessages.has(sentSessionId);
+            await client.sendMessage(prompt, readImageAttachments(msg.attachments));
+            this.sendTiming.admitted(timingId);
+            this.flushSwitchBanner(sentSessionId, hadPriorUserMessage);
+            if (sentSessionId) this.sessionsWithUserMessages.add(sentSessionId);
+            this.post({ type: "send_admitted", commandId: msg.commandId, sessionId: sessionId ?? undefined });
+            if (isCurrent()) this.indexCurrentSession();
+          });
         } catch (error) {
           this.sendTiming.end("rejected", timingId);
           logError("send message failed", error);
@@ -1189,21 +1191,18 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
             return candidate;
           };
           const retryClient = assertRetryOwner(client);
-          if (this.pendingModelFor(sessionId) && !await this.applyPendingModel(retryClient)) {
-            throw new Error(t(retryClient === this.client && retryClient.currentSessionId === sessionId
-              ? "该模型已不可用，请刷新模型列表后重新选择。"
-              : "会话已切换，请在当前会话重新发送。"));
-          }
-          const activeClient = assertRetryOwner(client);
-          if (msg.planMode) {
-            await activeClient.setMode("plan");
-            assertRetryOwner(activeClient);
-            planModeApplied = true;
-          }
-          const prompt = buildPrompt(msg.text || "", prepareFileContext(msg.chips ?? [], this.workspacePath, vscode.workspace.textDocuments ?? []));
-          await activeClient.sendMessage(prompt, attachments);
-          if (msg.commandId) this.post({ type: "send_admitted", commandId: msg.commandId, sessionId });
-          if (activeClient === this.client && activeClient.currentSessionId === sessionId && ticket === this.switchTicket) this.indexCurrentSession();
+          await this.withSendModel(retryClient, async () => {
+            const activeClient = assertRetryOwner(client);
+            if (msg.planMode) {
+              await activeClient.setMode("plan");
+              assertRetryOwner(activeClient);
+              planModeApplied = true;
+            }
+            const prompt = buildPrompt(msg.text || "", prepareFileContext(msg.chips ?? [], this.workspacePath, vscode.workspace.textDocuments ?? []));
+            await activeClient.sendMessage(prompt, attachments);
+            if (msg.commandId) this.post({ type: "send_admitted", commandId: msg.commandId, sessionId });
+            if (activeClient === this.client && activeClient.currentSessionId === sessionId && ticket === this.switchTicket) this.indexCurrentSession();
+          });
         } catch (error) {
           logError("retry last message failed", error);
           if (msg.planMode && !planModeApplied && client && client === this.client && client.currentSessionId === sessionId && ticket === this.switchTicket) {
@@ -1266,21 +1265,13 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           const sessionId = msg.sessionId;
           const isCurrent = this.viewScope();
           try {
-            if (this.pendingModelFor(sessionId)) {
-              const applied = await this.applyPendingModel(client);
-              if (!applied) throw new Error(t(client === this.client && client.currentSessionId === sessionId
-                ? "该模型已不可用，请刷新模型列表后重新选择。"
-                : "会话已切换，请在当前会话重新发送。"));
-              if (client !== this.client || client.currentSessionId !== sessionId) break;
-            }
             const editedPrompt = buildPrompt(msg.text || "", [], this.sessionReferences(msg.sessionRefs));
-            if (client !== this.client || client.currentSessionId !== sessionId) break;
-            await client.editUserQuery(
-              { rowId: msg.rowId, entityId: msg.entityId },
+            await this.withSendModel(client, () => client.editUserQuery(
+              { rowId: msg.rowId!, entityId: msg.entityId! },
               editedPrompt,
               msg.workspaceMode === "rewind" ? "rewind" : "preserve",
               readImageAttachments(msg.attachments)
-            );
+            ));
             if (!isCurrent() || client !== this.client || client.currentSessionId !== sessionId) break;
             this.post({ type: "query_rewound", text: editedPrompt, sessionId, viewGen: msg.viewGen, editRequestId: msg.editRequestId, commandId: msg.commandId, entityId: msg.entityId, attachments: readImageAttachments(msg.attachments) });
             this.indexCurrentSession();
@@ -1458,7 +1449,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.managedProviderIds = new Set(resolved.managedProviderIds ?? []);
       this.providerInventoryAuthoritative = resolved.providerInventoryAuthoritative ?? false;
       if (resolved.ok && resolved.runtime) {
-        this.runtime = resolved.runtime;
+        this.setResolvedRuntime(resolved.runtime);
         client.setDefaultRuntime(resolved.runtime);
         syncCliConfig(resolved.runtime, readV2Config(), false);
       } else if (!this.runtime) {
@@ -1506,15 +1497,15 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const limit = Number.isSafeInteger(maxImages) ? Math.max(0, Math.min(8, maxImages)) : 8;
     let warned = false;
         for (const uri of files.slice(0, 20)) {
-          if (uri.scheme !== "file") continue;
+          const stat = await this.localFileStat(uri);
+          if (!stat) continue;
           if (/\.(png|jpe?g|webp|gif)$/i.test(uri.fsPath)) {
             if (addedImages >= limit) { if (!warned) this.post({type:"toast", text:t("最多添加 8 张图片。")}); warned = true; continue; }
             addedImages++;
             const id = randomUUID();
             const routed = edit ? { edit: true, editRequestId } : {};
             try {
-              const stat = await fs.promises.stat(uri.fsPath);
-              if (!stat.isFile() || stat.size > IMAGE_MAX_BYTES) throw new Error(t("每张图片不能超过 20 MB。"));
+              if (stat.size > IMAGE_MAX_BYTES) throw new Error(t("每张图片不能超过 20 MB。"));
               const bytes = await fs.promises.readFile(uri.fsPath);
               const mime = imageMime(bytes);
               if (!mime) throw new Error(t("请选择 PNG、JPEG、WebP 或 GIF 图片。"));
@@ -1523,12 +1514,52 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
               this.post({ type: "image_ready", sessionId: owner, imageId: id, attachment, dataUrl: "data:" + mime + ";base64," + bytes.toString("base64"), ...routed });
             } catch (error) { this.post({ type: "image_failed", sessionId: owner, imageId: id, message: userFacingError(error), ...routed }); }
           } else if (!edit) {
-            const document = vscode.workspace.textDocuments.find(doc => doc.uri.fsPath === uri.fsPath);
-            const snapshot = document?.isDirty ? document.getText() : undefined;
-            if (snapshot && snapshot.length > 1024 * 1024) { this.post({type:"toast", message:t("未保存的文件过大，请选中需要引用的内容。")}); continue; }
-            this.post({ type: "file_added", sessionId: owner, chip: { path: uri.fsPath, relPath: path.relative(this.workspacePath || os.homedir(), uri.fsPath), ...(snapshot !== undefined ? {snapshot, languageId:document?.languageId} : {}) } });
+            const chip = this.readFileChip(uri);
+            if (!chip) { this.post({type:"toast", message:t("未保存的文件过大，请选中需要引用的内容。")}); continue; }
+            this.post({ type: "file_added", sessionId: owner, chip });
           }
         }
+  }
+
+  private async localFileStat(uri: vscode.Uri): Promise<fs.Stats | undefined> {
+    if (uri?.scheme !== "file" || uri.authority) return;
+    const stat = await fs.promises.stat(uri.fsPath).catch(() => undefined);
+    if (stat?.isFile()) return stat;
+  }
+
+  private readFileChip(uri: vscode.Uri): ContextChip | null {
+    const document = (vscode.workspace.textDocuments ?? []).find(doc =>
+      doc.uri.scheme === "file" && sameWorkspacePath(doc.uri.fsPath, uri.fsPath));
+    const snapshot = document?.isDirty ? document.getText() : undefined;
+    if (snapshot !== undefined && snapshot.length > 1024 * 1024) return null;
+    return { path: uri.fsPath, relPath: path.relative(this.workspacePath || os.homedir(), uri.fsPath),
+      ...(snapshot !== undefined ? { snapshot, languageId: document?.languageId } : {}) };
+  }
+
+  async insertExplorerFiles(files: readonly vscode.Uri[]): Promise<void> {
+    const candidates = files.slice(0, 20);
+    const valid = await Promise.all(candidates.map(uri => this.localFileStat(uri)));
+    const chips: ContextChip[] = [];
+    let oversized = false;
+    for (const [index, uri] of candidates.entries()) {
+      if (!valid[index]) continue;
+      const chip = this.readFileChip(uri);
+      if (chip) chips.push(chip);
+      else oversized = true;
+    }
+    if (oversized) vscode.window.showInformationMessage(t("未保存的文件过大，请选中需要引用的内容。"));
+    if (chips.length) await this.insertContextChips(chips);
+  }
+
+  private flushContextChips(): void {
+    if (!this.view || !this.contextViewReady) return;
+    for (const chip of this.pendingContextChips.splice(0)) this.post({ type: "addChip", chip });
+  }
+
+  private async insertContextChips(chips: ContextChip[]): Promise<void> {
+    this.pendingContextChips.push(...chips);
+    await vscode.commands.executeCommand("workbench.view.extension.zcode-sidebar");
+    this.flushContextChips();
   }
 
   private readEditorChip(implicit: boolean): ContextChip | null {
@@ -1583,9 +1614,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         chip.snapshot = snapshot;
       }
     }
-    await vscode.commands.executeCommand("workbench.view.extension.zcode-sidebar");
-    if (this.view) this.post({ type: "addChip", chip });
-    else this.pendingChip = chip;
+    await this.insertContextChips([chip]);
   }
 
   private workspaceRoots(): string[] {
@@ -1765,11 +1794,36 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private modelChoices(): PickerModel[] {
     const client = this.client;
     const sessionId = client?.currentSessionId;
-    const live = this.livePicker?.client === client && this.livePicker.sessionId === sessionId
-      ? this.livePicker.models
-      : [];
+    const liveLoaded = !!client && !!this.livePicker && this.livePicker.client === client && this.livePicker.sessionId === sessionId;
+    let live = liveLoaded ? this.livePicker!.models : [];
+    let configured = this.picker;
+    const runtime = this.runtime;
+    const family = /^(?:account|builtin):(bigmodel|zai)-start-plan$/.exec(runtime?.providerId ?? "")?.[1];
+    if (runtime && family) {
+      const providerId = this.startPlanModelProvider ?? runtime.providerId;
+      const isStart = (id: string) => id === `builtin:${family}-start-plan` || id === `account:${family}-start-plan`;
+      const isPersonal = (id: string) => id === `builtin:${family}-coding-plan` || id === `account:${family}-individual-coding-plan`;
+      const modelIds = Object.keys(runtime.models);
+      const verifiedIds = new Set(modelIds.map(id => id.toLowerCase()));
+      configured = configured.filter(model => !isStart(model.providerId) && !isPersonal(model.providerId));
+      live = live.filter(model => !isPersonal(model.providerId)
+        && (!isStart(model.providerId) || (verifiedIds.has(model.modelId.toLowerCase())
+          && (!this.startPlanModelProvider || model.providerId === providerId))));
+      for (const modelId of modelIds) {
+        const liveId = live.find(model => model.providerId === providerId && model.modelId.toLowerCase() === modelId.toLowerCase())?.modelId;
+        // A loaded session catalog is the backend registry; the plan list only covers an unloaded one.
+        if (liveLoaded && !liveId) continue;
+        configured.push({ providerId, modelId: liveId ?? modelId, providerName: runtime.providerName,
+          kind: runtime.kind, label: modelId, hasKey: true });
+      }
+    } else if (!runtime && this.starting) {
+      const unverifiedPlan = (model: { providerId: string }) =>
+        /^(?:account|builtin):(?:bigmodel|zai)-(?:individual-|team-)?(?:coding|start)-plan$/.test(model.providerId);
+      configured = configured.filter(model => !unverifiedPlan(model));
+      live = live.filter(model => !unverifiedPlan(model));
+    }
     return mergeAvailablePickerModels(
-      this.picker,
+      configured,
       live,
       this.disabledModelKeys,
       this.managedProviderIds,
@@ -1786,6 +1840,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.disabledModelKeys = new Set(resolution.disabledModelKeys);
       this.managedProviderIds = new Set(resolution.managedProviderIds);
       this.providerInventoryAuthoritative = resolution.providerInventoryAuthoritative;
+      this.markLiveCatalogStale();
       await this.pushModels();
     } catch (error) {
       logWarn("Could not refresh desktop model shortcuts", error);
@@ -1863,15 +1918,39 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private modelSelectionQueue: Promise<void> = Promise.resolve();
+  private modelSelectionQueue?: { tail: Promise<void>; isCurrent: () => boolean };
+
+  private inModelOrder<T>(run: () => Promise<T>): Promise<T> {
+    const previous = this.modelSelectionQueue;
+    const isCurrent = this.viewScope();
+    const operation = previous?.isCurrent() ? previous.tail.then(run) : run();
+    const clear = () => {
+      if (this.modelSelectionQueue === queue) this.modelSelectionQueue = undefined;
+    };
+    const queue = { tail: operation.then(clear, clear), isCurrent };
+    this.modelSelectionQueue = queue;
+    return operation;
+  }
 
   private selectModel(providerId: string, modelId: string, restart = false): Promise<void> {
     const isCurrent = this.viewScope();
-    const operation = this.modelSelectionQueue.then(() => {
-      if (isCurrent()) return this.selectModelNow(providerId, modelId, restart);
+    return this.inModelOrder(async () => {
+      if (isCurrent()) await this.selectModelNow(providerId, modelId, restart);
     });
-    this.modelSelectionQueue = operation.catch(() => {});
-    return operation;
+  }
+
+  /** Keep the model stable from applying a queued selection through admitting its message. */
+  private withSendModel<T>(client: ZCodeClient, send: () => Promise<T>): Promise<T> {
+    const isCurrent = this.viewScope();
+    return this.inModelOrder(async () => {
+      if (!isCurrent()) throw new Error(t("会话已切换，请在当前会话重新发送。"));
+      if (this.pendingModelFor(client.currentSessionId)) {
+        const applied = await this.applyPendingModel(client);
+        if (!isCurrent()) throw new Error(t("会话已切换，请在当前会话重新发送。"));
+        if (!applied) throw new Error(t("该模型已不可用，请刷新模型列表后重新选择。"));
+      }
+      return send();
+    });
   }
 
   private async selectModelNow(
@@ -1880,6 +1959,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     restart = false
   ): Promise<void> {
     const selectionIsCurrent = this.viewScope();
+    await this.refreshStartPlanCatalog(providerId);
+    if (!selectionIsCurrent()) return;
     if (/^builtin:(?:bigmodel|zai)-start-plan$/.test(providerId)) {
       const accountId = `account:${providerId.slice("builtin:".length)}`;
       const live = this.modelChoices().find(model => model.providerId === accountId
@@ -1895,7 +1976,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       vscode.window.showWarningMessage(t("该模型已在 ZCode 桌面端禁用，请先启用后再选择。"));
       return;
     }
-    if (this.providerInventoryAuthoritative && !this.modelChoices().some(model => model.providerId === providerId && model.modelId === modelId)) {
+    if (this.modelUnavailable({ providerId, modelId })) {
       await this.pushModels();
       if (!selectionIsCurrent()) return;
       vscode.window.showWarningMessage(t("该模型已不可用，请刷新模型列表后重新选择。"));
@@ -1917,11 +1998,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const isCurrent = () => client === this.client && sessionId === client.currentSessionId && ticket === this.switchTicket;
     if (sessionId && client.isGenerating()) {
       this.pendingModel = { sessionId, providerId, modelId };
-      this.currentModel = { providerId, modelId };
-      client.stageSessionModel(this.currentModel);
       this.post({
         type: "models",
-        current: this.currentModel,
+        current: { providerId, modelId },
         available: this.modelChoices(),
       });
       return;
@@ -1953,9 +2032,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (!isCurrent()) return;
       logError("setModel failed", e);
       this.currentModel = client.confirmedModel();
+      const rejected = isModelRegistryRejection(e);
+      if (rejected) this.markLiveCatalogStale();
       await this.pushModels(true);
       if (!isCurrent()) return;
-      vscode.window.showErrorMessage(t("切换模型失败：{0}", { 0: userFacingError(e) }));
+      if (rejected) vscode.window.showWarningMessage(t("该模型已不可用，请刷新模型列表后重新选择。"));
+      else vscode.window.showErrorMessage(t("切换模型失败：{0}", { 0: userFacingError(e) }));
     }
   }
 
@@ -1966,19 +2048,34 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     return { providerId: this.pendingModel.providerId, modelId: this.pendingModel.modelId };
   }
 
+  /**
+   * A trusted session registry rejects absent Start Plan models early. An outdated or unread
+   * one cannot prove absence, so the backend's own registry check decides, as in the desktop.
+   */
+  private modelUnavailable(model: { providerId: string; modelId: string }): boolean {
+    if (this.disabledModelKeys.has(`${model.providerId}\0${model.modelId}`)) return true;
+    const isStartPlan = START_PLAN_PROVIDER.test(model.providerId);
+    if (isStartPlan ? this.liveCatalogState() !== "fresh" : !this.providerInventoryAuthoritative) return false;
+    const choices = this.modelChoices();
+    return !choices.some(choice => choice.providerId === model.providerId && (isStartPlan
+      ? choice.modelId.toLowerCase() === model.modelId.toLowerCase()
+      : choice.modelId === model.modelId));
+  }
+
   private async applyPendingModel(client: ZCodeClient): Promise<boolean> {
-    const pending = this.pendingModelFor(client.currentSessionId);
-    if (!pending) return true;
-    if (!client.currentSessionId) return false;
     const sessionId = client.currentSessionId;
+    const pending = this.pendingModel;
+    if (!pending || pending.sessionId !== sessionId) return true;
+    const isCurrent = this.viewScope();
+    const model = { providerId: pending.providerId, modelId: pending.modelId };
     const previous = this.currentModel ? { ...this.currentModel } : undefined;
-    const runtime = await this.resolveSessionModelRuntime(pending);
-    if (client !== this.client || client.currentSessionId !== sessionId) return false;
-    if (runtime === false || (this.providerInventoryAuthoritative && !this.modelChoices().some(model => model.providerId === pending.providerId && model.modelId === pending.modelId))) {
-      this.pendingModel = null;
-      if (this.currentModel?.providerId === pending.providerId && this.currentModel.modelId === pending.modelId) {
-        this.currentModel = undefined;
-      }
+    const runtime = await this.resolveSessionModelRuntime(model);
+    if (!isCurrent()) return false;
+    await this.refreshStartPlanCatalog(pending.providerId);
+    if (!isCurrent()) return false;
+    if (runtime === false || this.modelUnavailable(model)) {
+      if (this.pendingModel === pending) this.pendingModel = null;
+      this.currentModel = client.confirmedModel() ?? this.currentModel;
       vscode.window.showWarningMessage(t("该模型已不可用，请刷新模型列表后重新选择。"));
       await this.pushModels();
       return false;
@@ -1987,12 +2084,23 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       client.setSessionRuntime(runtime);
       syncCliConfig(runtime, readV2Config(), false);
     }
-    await client.setModel(pending.providerId, pending.modelId);
-    if (client !== this.client || client.currentSessionId !== sessionId) return false;
-    this.pendingModel = null;
-    this.currentModel = pending;
-    this.rememberSessionModel(sessionId, pending);
-    this.noteSwitchBanner(previous, pending);
+    try {
+      await client.setModel(pending.providerId, pending.modelId);
+    } catch (error) {
+      if (!isModelRegistryRejection(error) || !isCurrent()) throw error;
+      logError("Queued model switch rejected by the session registry", error);
+      if (this.pendingModel === pending) this.pendingModel = null;
+      this.currentModel = client.confirmedModel() ?? this.currentModel;
+      this.markLiveCatalogStale();
+      vscode.window.showWarningMessage(t("该模型已不可用，请刷新模型列表后重新选择。"));
+      await this.pushModels(true);
+      return false;
+    }
+    if (!isCurrent()) return false;
+    if (this.pendingModel === pending) this.pendingModel = null;
+    this.currentModel = model;
+    this.rememberSessionModel(sessionId, model);
+    this.noteSwitchBanner(previous, model);
     return true;
   }
 
@@ -2189,7 +2297,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
     const runtime = resolved.runtime;
     if (!runtime) return;
-    this.runtime = runtime;
+    this.setResolvedRuntime(runtime);
     if (resolved.warning) {
       vscode.window.showWarningMessage(`ZCode: ${resolved.warning}`);
     }
@@ -2344,7 +2452,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       this.managedProviderIds = new Set(resolved.managedProviderIds ?? []);
       this.providerInventoryAuthoritative = resolved.providerInventoryAuthoritative ?? false;
       if (!resolved.ok || !resolved.runtime) return false;
-      this.runtime = resolved.runtime;
+      this.setResolvedRuntime(resolved.runtime);
       if (resolved.warning) vscode.window.showWarningMessage(`ZCode: ${resolved.warning}`);
       this.syncStartupConfig(resolved.runtime, timing);
       client.setDefaultRuntime(resolved.runtime);
@@ -2674,26 +2782,56 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private markLiveCatalogStale(client = this.client, sessionId = client?.currentSessionId): void {
+    if (client && this.livePicker?.client === client && this.livePicker.sessionId === sessionId) this.livePicker.stale = true;
+  }
+
+  private liveCatalogState(): "fresh" | "stale" | "missing" {
+    const client = this.client;
+    if (!client?.currentSessionId || this.livePicker?.client !== client || this.livePicker.sessionId !== client.currentSessionId) {
+      return "missing";
+    }
+    return this.livePicker.stale ? "stale" : "fresh";
+  }
+
+  /** Only Start Plan switches depend on the session registry, so other providers never wait for it. */
+  private async refreshStartPlanCatalog(providerId: string): Promise<void> {
+    if (START_PLAN_PROVIDER.test(providerId) && this.client?.currentSessionId && this.liveCatalogState() !== "fresh") {
+      await this.pushModels();
+    }
+  }
+
   private async pushModels(forceRead = false): Promise<void> {
     const client = this.client;
     const sessionId = client?.currentSessionId;
     const ticket = this.switchTicket;
     const pendingModel = this.pendingModelFor(sessionId);
     const hasFreshCurrent = !forceRead && !!client && client.hasFreshSessionModel() && !!(pendingModel || this.currentModel);
-    const hasLiveCatalog = !!client && this.livePicker?.client === client && this.livePicker.sessionId === sessionId;
+    const sameSession = !!client && this.livePicker?.client === client && this.livePicker.sessionId === sessionId;
+    const staleCatalog = sameSession && !!this.livePicker!.stale;
+    const hasLiveCatalog = sameSession && !staleCatalog;
     if (client && sessionId && (!hasLiveCatalog || !hasFreshCurrent)) {
+      const read = ++this.liveCatalogReads;
+      let known = false;
       try {
-        const live = await client.readAvailableModels(!forceRead);
+        const live = await client.readAvailableModels(!forceRead && !staleCatalog);
         if (client !== this.client || sessionId !== client.currentSessionId || ticket !== this.switchTicket) return;
-        this.livePicker = {
-          client,
-          sessionId,
-          models: live.available,
-        };
-        if (live.current && !pendingModel && !hasFreshCurrent) this.currentModel = live.current;
+        if (read === this.liveCatalogReads) {
+          known = live.known;
+          if (live.known) {
+            this.livePicker = {
+              client,
+              sessionId,
+              models: live.available,
+            };
+          }
+          if (live.current && !pendingModel && !hasFreshCurrent) this.currentModel = live.current;
+        }
       } catch (e) {
         logWarn("Could not read live session model", e);
       }
+      // A later read owns the catalog. An unknown one keeps the last valid list and is read again.
+      if (read === this.liveCatalogReads && !known) this.markLiveCatalogStale(client, sessionId);
     }
     const pending = this.pendingModelFor(this.client?.currentSessionId);
     this.post({
@@ -2783,7 +2921,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     if (event.type === "model_info") {
       const model = event.data as { providerId: string; modelId: string };
       this.rememberSessionModel(this.client?.currentSessionId, model);
-      if (!this.pendingModelFor(this.client?.currentSessionId)) this.currentModel = model;
+      this.currentModel = model;
     }
     if (!this.view) return;
     switch (event.type) {
@@ -2883,11 +3021,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       }
       case "model_info": {
         const pending = this.pendingModelFor(this.client?.currentSessionId);
-        const model = pending ?? (event.data as { providerId: string; modelId: string });
-        if (!pending) this.currentModel = model;
         this.post({
           type: "models",
-          current: model,
+          current: pending ?? this.currentModel,
           available: this.modelChoices(),
         });
         break;

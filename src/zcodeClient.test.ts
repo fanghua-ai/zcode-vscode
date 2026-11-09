@@ -3,7 +3,7 @@ import { ChildProcess } from "child_process";
 import test, { type TestContext } from "node:test";
 import * as fs from "fs";
 import * as path from "path";
-import { ZCodeClient, type ZCodeEvent, type HistoryItem, type PermissionRequest, type UserInputRequest, type SessionControls } from "./zcodeClient";
+import { ZCodeClient, isModelRegistryRejection, type ZCodeEvent, type HistoryItem, type PermissionRequest, type UserInputRequest, type SessionControls } from "./zcodeClient";
 import type { ResolvedRuntime } from "./desktop";
 import { ConversationReplica } from "./conversation";
 import { handoffScenario } from "./testSupport/handoffScenario";
@@ -1768,6 +1768,21 @@ test("startup consumes an explicit model catalog once and never reuses it across
   } finally { client.dispose(); }
 });
 
+test("a failed, catalog-less, or cold-session read is not reported as an empty model registry", async () => {
+  const { client, state } = fixture();
+  let reply: () => unknown = () => { throw new Error("session/read timed out"); };
+  state.sendRequest = async () => reply();
+  try {
+    assert.deepEqual(await client.readAvailableModels(), { available: [], known: false });
+    reply = () => ({ settings: { mode: { current: "build" } } });
+    assert.equal((await client.readAvailableModels()).known, false);
+    reply = () => ({ settings: { model: { available: [] } } });
+    assert.equal((await client.readAvailableModels()).known, false, "a cold session advertises an empty shell");
+    reply = () => ({ settings: { model: { available: [{ providerId: "sample", modelId: "m" }] } } });
+    assert.equal((await client.readAvailableModels()).known, true);
+  } finally { client.dispose(); }
+});
+
 test("initial quota refresh starts only after conversation subscription completes", async () => {
   const { client, state } = fixture();
   const subscribed = deferred<void>();
@@ -2757,6 +2772,100 @@ for (const failed of [false,true]) {
   });
 }
 
+for (const scenario of ["unattributed", "headers", "rotated", "other-provider"] as const) {
+  test(`provider 401 after send admission invalidates only the failed turn's credential (${scenario})`, async t => {
+    const providerId = "account:bigmodel-individual-coding-plan";
+    const runtime: ResolvedRuntime = {
+      providerId, providerName: "Test", modelId: "m", kind: "anthropic", baseURL: "http://localhost",
+      apiKey: "old-test-key", models: {}, source: "desktop-personal-oauth",
+      ...(scenario === "headers" ? { apiKey: "startup-test-key", apiKeyId: "project-key-id" } : {}),
+    };
+    let authReads = 0;
+    const client = new ZCodeClient({
+      binaryPath: "/unused", workspacePath: "/test", runtime, onEvent: () => {},
+      resolveProviderAuth: async () => {
+        authReads++;
+        return { apiKey: scenario === "unattributed" ? "new-test-key" : "old-test-key" };
+      },
+    });
+    t.after(() => client.dispose());
+    const state = client as unknown as Internals & {
+      loginStale: boolean;
+      projectionPhase: () => string;
+      resyncConversation: () => Promise<void>;
+      handleLine: (line: string) => void;
+      handleProviderRuntimeHeaders: (id: number, params: unknown) => Promise<void>;
+      isRejectedAuth: (apiKey: string) => boolean;
+    };
+    state.sessionId = "A";
+    state.sessionModel = { providerId, modelId: "m" };
+    state.projectionPhase = () => "running";
+    state.resyncConversation = async () => {};
+    const replies: Array<{ result: { headersApplied: boolean; requestAuth?: { apiKey: string } } }> = [];
+    state.write = reply => replies.push(reply as typeof replies[number]);
+    const event = (type: string, payload?: unknown) => state.handleLine(JSON.stringify({
+      method: "session/event", params: { sessionId: "A", turnId: "turn-A", type, payload },
+    }));
+    if (scenario === "unattributed") client.setSessionRuntime({ ...runtime, apiKey: "new-test-key" });
+    event("turn.started");
+    if (scenario !== "unattributed") {
+      await state.handleProviderRuntimeHeaders(1, { providerId, sessionId: "A", turnId: "turn-A" });
+      assert.equal(replies.at(-1)?.result.requestAuth?.apiKey, "old-test-key");
+    }
+    if (scenario === "rotated") client.setSessionRuntime({ ...runtime, apiKey: "new-test-key" });
+    event("turn.failed", {
+      error: { attribution: {
+        source: "provider", statusCode: 401, providerId: scenario === "other-provider" ? "different" : providerId,
+      } },
+    });
+    assert.equal(state.isRejectedAuth("old-test-key"), scenario === "headers" || scenario === "rotated");
+    assert.equal(state.isRejectedAuth("new-test-key"), false);
+    assert.equal(state.isRejectedAuth("startup-test-key"), false);
+    const readsBeforeRetry = authReads;
+    await state.handleProviderRuntimeHeaders(2, { providerId });
+    assert.equal(authReads - readsBeforeRetry, scenario === "unattributed" || scenario === "headers" ? 1 : 0);
+    assert.equal(state.loginStale, scenario === "headers");
+    assert.equal(replies.at(-1)?.result.requestAuth?.apiKey,
+      scenario === "rotated" || scenario === "unattributed" ? "new-test-key" : scenario === "other-provider" ? "old-test-key" : undefined);
+  });
+}
+
+for (const scenario of ["refresh", "unsupported", "desktop-plan"] as const) {
+  test(`send after an unattributed provider 401 requires backend refresh or reconnection (${scenario})`, async t => {
+    const providerId = scenario === "desktop-plan" ? "account:bigmodel-individual-coding-plan" : "custom";
+    const model = { providerId, modelId: "test" };
+    let credentialReads = 0;
+    const { client, state } = fixture(undefined, async () => {
+      credentialReads++;
+      return { ...model, providerName: "Test", kind: "anthropic", baseURL: "http://localhost",
+        apiKey: "new-test-key", models: {}, source: "desktop-apikey" };
+    });
+    t.after(() => client.dispose());
+    state.sessionModel = model;
+    state.liveModelReady = true;
+    const calls: string[] = [];
+    state.sendRequest = async method => {
+      calls.push(method);
+      if (method !== "provider/refreshRegistry") return {};
+      if (scenario === "unsupported") throw new Error("-32601: Method not found");
+      return { refreshed: true };
+    };
+    state.handleSessionEvent({ sessionId: "A", turnId: "turn-A", type: "turn.failed",
+      payload: { error: { attribution: { source: "provider", statusCode: 401, providerId } } } });
+
+    if (scenario === "refresh") {
+      await client.sendMessage("first retry");
+      await client.sendMessage("next message");
+      assert.deepEqual(calls, ["provider/refreshRegistry", "session/send", "session/send"]);
+      assert.equal((state.sessionRuntime as ResolvedRuntime).apiKey, "new-test-key");
+    } else {
+      await assert.rejects(client.sendMessage("retry"), /重新读取登录|Reload desktop login/);
+      assert.deepEqual(calls, scenario === "unsupported" ? ["provider/refreshRegistry"] : []);
+    }
+    assert.equal(credentialReads, scenario === "desktop-plan" ? 0 : 1);
+  });
+}
+
 test("settled startup login cannot reinstall its old key after invalidation", async () => {
   const runtime:ResolvedRuntime={providerId:"prov",providerName:"Test",modelId:"m",kind:"openai",baseURL:"http://localhost",apiKey:"old-test-key",models:{},source:"desktop-apikey"};
   const client=new ZCodeClient({binaryPath:"/unused",workspacePath:"/test",onEvent:()=>{},pendingLogin:Promise.resolve({ok:true,runtime,picker:[]})});
@@ -3039,6 +3148,19 @@ test("staged model credentials do not replace the confirmed model after a reject
   assert.deepEqual(state.sessionModel, previous);
   assert.deepEqual(client.confirmedModel(), previous);
   assert.ok(!events.some(event => event.type === "model_info"));
+  client.dispose();
+});
+
+test("a model switch rejected by the session registry is distinguishable from other failures", async () => {
+  const {client, state} = fixture();
+  state.sendRequest = async () => ({status:"rejected",reasonCode:"provider.notInRegistry",
+    message:'provider "account:bigmodel-start-plan" is not in the workspace model registry'});
+  const rejected = await client.setModel("account:bigmodel-start-plan","GLM-5.3").then(() => null, (error: unknown) => error);
+  assert.ok(isModelRegistryRejection(rejected));
+  assert.ok(isModelRegistryRejection(new Error("Provider Registry 中不存在 Model: account:bigmodel-start-plan/GLM-5.3")));
+  state.sendRequest = async () => ({status:"rejected",reasonCode:"auth.unauthorized",message:"401 Unauthorized"});
+  assert.ok(!isModelRegistryRejection(await client.setModel("sample","x").then(() => null, (error: unknown) => error)));
+  assert.ok(!isModelRegistryRejection(new Error("ECONNRESET")));
   client.dispose();
 });
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { type V2Provider, usesProjectTokens, tryPlanOAuth, fetchPlanQuota, readStartPlanAccess, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey, pickOrgAndProject, planAuthErrorDetails } from "./credentials";
+import { type V2Provider, usesProjectTokens, usesLegacyPlanKeys, tryPlanOAuth, fetchPlanQuota, readStartPlanAccess, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey, pickOrgAndProject, planAuthErrorDetails } from "./credentials";
 import { readDesktopJsonWithRetry } from "./desktopJson";
 import { mergeDesktopApiProviders, syncCliConfig, resolveProviderRequestAuth, resolveRuntime, resolveRuntimeForSession } from "./desktop";
 import { ZCodeClient } from "./zcodeClient";
@@ -633,7 +633,7 @@ for (const family of ["bigmodel", "zai"] as const) {
       fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ [`oauth:${family}:access_token`]: storedLogin }));
       const planApi = mockPlanQuotaApi(t); const { requests } = planApi;
       const team = kind === "team-coding-plan" ? { organizationId: "org-current", projectId: "project-current" } : undefined;
-      const quota = await fetchPlanQuota({ family, kind, ...(team ? { team } : {}) });
+      const quota = await fetchPlanQuota({ family, kind, ...(team ? { team } : {}) }, "3.14.4");
 
       assert.deepEqual(quota.map(row => [row.label, row.remainingPercent, row.remainingCount]), [
         ["5 小时", 75, 75000], ["每周", 60, 60000],
@@ -712,7 +712,7 @@ for (const selection of [undefined, "individual-coding-plan", "team-coding-plan"
       "builtin:bigmodel-coding-plan": { kind: "anthropic", models: { "GLM-5.3": {} } },
     } }));
     const api = mockPlanQuotaApi(t);
-    const resolved = await resolveRuntime();
+    const resolved = await resolveRuntime({ appVersion: "3.14.4" });
     assert.equal(resolved.ok, true);
     assert.equal(resolved.runtime?.providerId, "builtin:bigmodel-coding-plan");
     assert.equal(resolved.runtime?.apiKey, selection === "team-coding-plan" ? "TEST-TEAM-KEY-ID.TEST-ONLY-SECRET" : "TEST-PERSONAL-KEY-ID.TEST-ONLY-SECRET");
@@ -948,6 +948,228 @@ test("Coding Plan authentication preserves legacy desktops and recognizes PAT re
   for (const version of ["3.15.1", "3.16.2", "4.0.0"]) {
     assert.equal(usesProjectTokens(version), true);
   }
+  for (const version of ["3.12.3", "3.14.4", "3.15.0"]) assert.equal(usesLegacyPlanKeys(version), true);
+  for (const version of [null, "", "invalid", "3.15.1", "3.17.2"]) assert.equal(usesLegacyPlanKeys(version), false);
+});
+
+for (const family of ["bigmodel", "zai"] as const) {
+  test(`${family} unknown desktop version can reuse a stored personal key when project tokens cannot be issued`, async t => {
+    const dir = fixture(t);
+    const providerId = `account:${family}-individual-coding-plan`;
+    const key = "TEST-STORED-LEGACY-KEY";
+    const stored = { [`account-provider:coding-plan:${providerId}:account:old:api-key`]: key };
+    const file = path.join(dir, "credentials.json");
+    fs.writeFileSync(file, JSON.stringify(stored));
+    fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: family,
+      providerFamilyConnectionSelections: { [family]: { kind: "individual-coding-plan" } },
+    }));
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+      [`builtin:${family}-coding-plan`]: { kind: "anthropic", models: { "GLM-5.3": {} } },
+    } }));
+    const api = mockPlanQuotaApi(t);
+    const quota = { family, kind: "individual-coding-plan" } as const;
+    assert.equal((await resolveProviderRequestAuth(providerId, null))?.apiKey, key);
+    assert.equal((await resolveRuntime({ appVersion: null })).runtime?.apiKey, key);
+    assert.equal((await fetchPlanQuota(quota, null)).length, 2);
+    assert.ok(api.requests.some(request => request.path === "/api/biz/subscription/list" && request.headers.Authorization === key));
+    assert.ok(api.requests.some(request => request.path === "/api/monitor/usage/quota/limit" && request.headers.Authorization === key));
+    assert.equal(await resolveProviderRequestAuth(providerId, "3.17.2"), null);
+    const rejected = crypto.createHash("sha256").update(key).digest("hex");
+    assert.equal(await resolveProviderRequestAuth(providerId, null, rejected), null);
+    assert.equal(await tryPlanOAuth(family, { organizationId: "org-current", projectId: "project-current" }, null), null);
+
+    fs.writeFileSync(file, JSON.stringify({ ...stored, [`oauth:${family}:access_token`]: "TEST-LOGIN" }));
+    let status = 503;
+    api.respond((requestPath, payload) => requestPath.endsWith("/access_tokens")
+      ? { status, payload: { code: status } } : { payload });
+    for (const transient of [503, 429]) {
+      status = transient;
+      assert.equal((await resolveRuntime({ appVersion: null })).runtime?.apiKey, key);
+      assert.equal((await resolveProviderRequestAuth(providerId, null))?.apiKey, key);
+      assert.equal(await resolveProviderRequestAuth(providerId, null, rejected), null);
+      assert.equal(await resolveProviderRequestAuth(providerId, "3.17.2"), null);
+      assert.equal(await tryPlanOAuth(family, { organizationId: "org-current", projectId: "project-current" }, null), null);
+    }
+    for (const rejectedStatus of [401, 403]) {
+      status = rejectedStatus;
+      assert.equal(await resolveProviderRequestAuth(providerId, null), null);
+    }
+    status = 404;
+    assert.equal((await resolveProviderRequestAuth(providerId, null))?.apiKey, key);
+    api.respond((requestPath, payload) => {
+      if (!requestPath.endsWith("/access_tokens")) return { payload };
+      fs.writeFileSync(file, JSON.stringify({ ...stored, [`oauth:${family}:access_token`]: "OTHER-LOGIN" }));
+      return { status: 503, payload: { code: 503 } };
+    });
+    assert.equal(await resolveProviderRequestAuth(providerId, null), null, "an account switch during issuance prevents fallback");
+    assert.equal(api.requests.some(request => request.path.includes("/copy/")), false);
+    assert.equal(api.requests.some(request => request.path.includes("/api/auth/z/login")), false);
+  });
+
+  test(`${family} unknown desktop version issues a project token before any legacy key`, async t => {
+    const dir = fixture(t);
+    fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+      [`oauth:${family}:access_token`]: "TEST-LOGIN",
+      [`account-provider:coding-plan:account:${family}-individual-coding-plan:account:old:api-key`]: "TEST-OLD-KEY",
+    }));
+    const { requests } = mockPlanQuotaApi(t);
+    assert.equal((await resolveProviderRequestAuth(`account:${family}-individual-coding-plan`, null))?.apiKey, "TEST-PAT");
+    const issue = requests.find(r => r.path.endsWith("/access_tokens"));
+    assert.deepEqual(JSON.parse(issue?.body ?? "null"), { clientType: "zcode", clientVersion: "3.15.1" });
+    assert.equal(requests.some(r => r.path.includes("/copy/")), false);
+  });
+
+  test(`${family} unknown desktop version uses the legacy key only when project tokens are unsupported`, async t => {
+    const dir = fixture(t);
+    fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ [`oauth:${family}:access_token`]: "TEST-LOGIN" }));
+    const api = mockPlanQuotaApi(t);
+    let failure: { status: number; code: number } = { status: 200, code: 404 };
+    api.respond((requestPath, payload) => requestPath.endsWith("/access_tokens")
+      ? { status: failure.status, payload: { code: failure.code } } : { payload });
+    for (const next of [{ status: 503, code: 503 }, { status: 429, code: 429 }, { status: 403, code: 403 }, { status: 401, code: 401 }]) {
+      failure = next;
+      assert.equal(await tryPlanOAuth(family, undefined, null), null, `HTTP ${next.status} keeps the project-token error`);
+    }
+    assert.equal(api.requests.some(r => r.path.includes("/copy/") || r.method === "POST" && r.path.endsWith("/api_keys")), false);
+    for (const next of [{ status: 200, code: 404 }, { status: 404, code: 404 }]) {
+      failure = next;
+      api.requests.length = 0;
+      assert.equal((await tryPlanOAuth(family, undefined, null))?.apiKey, "TEST-PERSONAL-KEY-ID.TEST-ONLY-SECRET");
+      assert.ok(api.requests.some(r => r.path.endsWith("/access_tokens")), "the project token is always tried first");
+    }
+    assert.ok(api.requests.length > 0);
+    failure = { status: 404, code: 404 };
+    api.requests.length = 0;
+    assert.equal(await tryPlanOAuth(family, undefined, "3.17.2"), null, "a known PAT desktop never copies legacy secrets");
+    assert.equal(api.requests.some(r => r.path.includes("/copy/")), false);
+  });
+}
+
+test("a 401 prevents both runtime refresh paths from reinstalling a stored personal key", async t => {
+  const dir = fixture(t);
+  const file = path.join(dir, "credentials.json");
+  const providerId = "account:bigmodel-individual-coding-plan";
+  const model = { providerId, modelId: "test" };
+  const saveKey = (apiKey: string) => fs.writeFileSync(file, JSON.stringify({
+    [`account-provider:coding-plan:${providerId}:account:old:api-key`]: apiKey,
+  }));
+  saveKey("TEST-OLD-STORED-KEY");
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+    [providerId]: { kind: "anthropic", models: { test: {} } },
+  } }));
+  mockPlanQuotaApi(t);
+  const initial = await resolveRuntime({ preferredProviderId: providerId, preferredModelId: "test", appVersion: null });
+  assert.ok(initial.ok && initial.runtime);
+  const client = new ZCodeClient({
+    binaryPath: "/unused", workspacePath: "/test", desktopAppVersion: null, runtime: initial.runtime,
+    resolveSessionRuntime: candidate => resolveRuntimeForSession(candidate, null), onEvent: () => {},
+  });
+  t.after(() => client.dispose());
+  const state = client as unknown as {
+    loginStale: boolean; sessionRuntime: { apiKey: string } | null; sessionId: string;
+    pending: Map<number, unknown>; write: (reply: unknown) => void; handleLine: (line: string) => void;
+    handleProviderRuntimeHeaders: (id: number, params: unknown) => Promise<void>;
+    alignSessionRuntime: (candidate: typeof model) => Promise<void>;
+  };
+  const replies: Array<{ result: { headersApplied: boolean; requestAuth?: { apiKey: string } } }> = [];
+  state.write = reply => replies.push(reply as typeof replies[number]);
+  state.sessionId = "A";
+  state.pending.set(1, { reject() {} });
+  state.handleLine(JSON.stringify({ id: 1, error: { code: 401, message: "Unauthorized" } }));
+
+  await state.handleProviderRuntimeHeaders(2, { providerId });
+  assert.equal(replies.at(-1)?.result.headersApplied, false);
+  await state.alignSessionRuntime(model);
+  assert.equal(state.sessionRuntime?.apiKey, undefined);
+  assert.equal(state.loginStale, true);
+
+  saveKey("TEST-NEW-STORED-KEY");
+  await state.alignSessionRuntime(model);
+  assert.equal(state.sessionRuntime?.apiKey, "TEST-NEW-STORED-KEY");
+  await state.handleProviderRuntimeHeaders(3, { providerId });
+  assert.equal(replies.at(-1)?.result.requestAuth?.apiKey, "TEST-NEW-STORED-KEY");
+  assert.equal(state.loginStale, false);
+});
+
+test("PAT refresh keeps a still-valid token through temporary outages only", async t => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-LOGIN" }));
+  let issued = 0;
+  let status = 200;
+  const api = mockPlanQuotaApi(t, () => ({ code: 200, data: {
+    accessToken: `TEST-PAT-${status === 200 ? ++issued : "UNUSED"}`, tokenType: "Bearer", expiresIn: 600, expiresAt: Date.now() / 1000 + 600,
+  } }));
+  api.respond((requestPath, payload) => requestPath.endsWith("/access_tokens") && status !== 200
+    ? { status, payload: { code: status } } : { payload });
+  const issues = () => api.requests.filter(r => r.path.endsWith("/access_tokens")).length;
+  const resolve = (rejected?: string) => tryPlanOAuth("bigmodel", undefined, "3.17.2", rejected);
+  assert.equal((await resolve())?.apiKey, "TEST-PAT-1");
+
+  const originalNow = Date.now;
+  t.after(() => { Date.now = originalNow; });
+  Date.now = () => originalNow() + 500_000;
+  status = 503;
+  const [deferred, shared] = await Promise.all([resolve(), resolve()]);
+  assert.equal(deferred?.apiKey, "TEST-PAT-1");
+  assert.equal(shared?.apiKey, "TEST-PAT-1");
+  assert.equal(issues(), 2);
+  assert.equal((await resolve())?.apiKey, "TEST-PAT-1", "retries wait for the short backoff");
+  assert.equal(issues(), 2);
+
+  status = 401;
+  Date.now = () => originalNow() + 510_000;
+  assert.equal(await resolve(), null, "authentication failures never reuse the old token");
+  status = 200;
+  assert.equal((await resolve())?.apiKey, "TEST-PAT-2");
+
+  status = 503;
+  Date.now = () => originalNow() + 1_010_000;
+  const fingerprint = crypto.createHash("sha256").update("TEST-PAT-2").digest("hex");
+  assert.equal(await resolve(fingerprint), null, "a rejected token is not kept");
+  status = 200;
+  assert.equal((await resolve())?.apiKey, "TEST-PAT-3");
+  status = 503;
+  Date.now = () => originalNow() + 2_000_000;
+  assert.equal(await resolve(), null, "an expired token is not kept");
+});
+
+test("PAT refresh never reuses the previous account's token after an outage", async t => {
+  const dir = fixture(t);
+  const file = path.join(dir, "credentials.json");
+  fs.writeFileSync(file, JSON.stringify({ "oauth:bigmodel:access_token": "TEST-LOGIN-A" }));
+  let status = 200;
+  const api = mockPlanQuotaApi(t);
+  api.respond((requestPath, payload) => requestPath.endsWith("/access_tokens") && status !== 200
+    ? { status, payload: { code: status } } : { payload });
+  const resolve = () => tryPlanOAuth("bigmodel", undefined, "3.17.2");
+  assert.equal((await resolve())?.apiKey, "TEST-PAT");
+
+  const originalNow = Date.now;
+  t.after(() => { Date.now = originalNow; });
+  Date.now = () => originalNow() + 500_000;
+  status = 503;
+  api.hold(async (_method, requestPath) => {
+    if (requestPath.endsWith("/access_tokens")) fs.writeFileSync(file, JSON.stringify({ "oauth:bigmodel:access_token": "TEST-LOGIN-B" }));
+  });
+  assert.equal(await resolve(), null);
+  api.hold(undefined);
+  fs.writeFileSync(file, JSON.stringify({ "oauth:bigmodel:access_token": "TEST-LOGIN-A" }));
+  assert.equal((await resolve())?.apiKey, "TEST-PAT", "the same account still survives the outage");
+
+  Date.now = () => originalNow() + 595_000;
+  const read = writableFs.readFileSync;
+  t.after(() => { writableFs.readFileSync = read; });
+  api.hold(async (_method, requestPath) => {
+    if (!requestPath.endsWith("/access_tokens")) return;
+    writableFs.readFileSync = ((name: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(name).endsWith("credentials.json")) {
+        Date.now = () => originalNow() + 700_000;
+        writableFs.readFileSync = read;
+      }
+      return (read as (...values: unknown[]) => unknown)(name, ...args);
+    }) as typeof fs.readFileSync;
+  });
+  assert.equal(await resolve(), null, "a token that expires while credentials are re-read is not returned");
 });
 
 for (const family of ["bigmodel", "zai"] as const) {

@@ -10,7 +10,7 @@ import type { PickerModel, ResolvedRuntime } from "./desktop";
 import { ZCodeClient } from "./zcodeClient";
 import { StartupTiming } from "./startupTiming";
 import type { AvailableModel } from "./zcodeClient";
-import { setTestLanguage, setTestFiles, workspace, window as testWindow, commands, recoveryCalls, recoveryNotices, setInformationChoice, configUpdates, resetConfigValues } from "./testSupport/vscode";
+import { Uri, setTestLanguage, setTestFiles, workspace, window as testWindow, commands, recoveryCalls, recoveryNotices, setInformationChoice, configUpdates, resetConfigValues } from "./testSupport/vscode";
 import { DiffDocuments } from "./diffDocuments";
 
 function deferred() {
@@ -31,8 +31,7 @@ function fixture() {
   const response = deferred();
   const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", extensionPath: "/unused", subscriptions: [], workspaceState: { get: () => undefined } } as unknown as vscode.ExtensionContext);
   const state = provider as unknown as {
-    client: { currentSessionId: string; currentMode: () => string; confirmedModel: () => {providerId: string; modelId: string} | undefined; confirmedControls: () => Partial<import("./zcodeClient").SessionControls>; setViewVisible: (visible: boolean) => void; pollBackgroundRuns: () => void; dispose: () => void; editUserQuery: () => Promise<unknown>; insertQueuedMessage: (text?: unknown) => Promise<unknown>; conversationFileChanges: () => Promise<unknown>; sendMessage: (...args: unknown[]) => Promise<unknown>; setMode: (mode: string) => Promise<void>; setModel: (...args: unknown[]) => Promise<unknown>; hasFreshSessionModel: () => boolean; readAvailableModels: () => Promise<{ current?: { providerId: string; modelId: string }; available: AvailableModel[] }>;
-      stageSessionModel: (model: { providerId: string; modelId: string } | null) => void;
+    client: { currentSessionId: string; currentMode: () => string; confirmedModel: () => {providerId: string; modelId: string} | undefined; confirmedControls: () => Partial<import("./zcodeClient").SessionControls>; setViewVisible: (visible: boolean) => void; pollBackgroundRuns: () => void; dispose: () => void; editUserQuery: () => Promise<unknown>; insertQueuedMessage: (text?: unknown) => Promise<unknown>; conversationFileChanges: () => Promise<unknown>; sendMessage: (...args: unknown[]) => Promise<unknown>; setMode: (mode: string) => Promise<void>; setModel: (...args: unknown[]) => Promise<unknown>; hasFreshSessionModel: () => boolean; readAvailableModels: () => Promise<{ current?: { providerId: string; modelId: string }; available: AvailableModel[]; known: boolean }>;
       activitySince: () => number | undefined; noteHistoryDelivered: () => void; queuedMessages: () => unknown[] };
     switchTicket: number;
     webviewEpoch: number;
@@ -48,12 +47,11 @@ function fixture() {
     disabledModelKeys: Set<string>;
     currentModel?: { providerId: string; modelId: string };
     pendingModel: { sessionId: string; providerId: string; modelId: string } | null;
-    pushModels: () => Promise<void>;
+    pushModels: (forceRead?: boolean) => Promise<void>;
     modelChoices: () => PickerModel[];
     resolveSessionModelRuntime: (model: { providerId: string; modelId: string }) => Promise<import("./desktop").ResolvedRuntime | null | false>;
   };
-  let stagedSessionModel: { providerId: string; modelId: string } | null | undefined;
-  const activeClient = { currentSessionId: "A", currentMode: () => "build", confirmedModel: () => state.currentModel, confirmedControls: () => ({mode:"build"}), setViewVisible: (visible: boolean) => { visibility.push(visible); }, pollBackgroundRuns: () => { backgroundPolls++; }, dispose: () => {}, editUserQuery: () => response.promise, insertQueuedMessage: () => response.promise, conversationFileChanges: () => response.promise, sendMessage: () => response.promise, setMode: async () => {}, setModel: async () => {}, hasFreshSessionModel: () => false, readAvailableModels: async () => ({ available: [] }), stageSessionModel: (model: { providerId: string; modelId: string } | null) => { stagedSessionModel = model; },
+  const activeClient = { currentSessionId: "A", currentMode: () => "build", confirmedModel: () => state.currentModel, confirmedControls: () => ({mode:"build"}), setViewVisible: (visible: boolean) => { visibility.push(visible); }, pollBackgroundRuns: () => { backgroundPolls++; }, dispose: () => {}, editUserQuery: () => response.promise, insertQueuedMessage: () => response.promise, conversationFileChanges: () => response.promise, sendMessage: () => response.promise, setMode: async () => {}, setModel: async () => {}, hasFreshSessionModel: () => false, readAvailableModels: async () => ({ available: [], known: true }),
     activitySince: () => undefined, noteHistoryDelivered: () => {}, queuedMessages: () => [] };
   Object.assign(activeClient, {
     listSessionsPage: async (includeArchived = false) => ({
@@ -87,9 +85,38 @@ function fixture() {
   };
   const setVisible = (visible: boolean) => { view.visible = visible; onVisibilityChange(); };
   const disposeView = () => onViewDispose();
-  const stagedModels = () => stagedSessionModel;
-  return { state, posted, response, handler, switchToB, setVisible, disposeView, releasedListeners, provider, view, visibility, pollState, backgroundPolls: () => backgroundPolls, stagedModels, dispose };
+  return { state, posted, response, handler, switchToB, setVisible, disposeView, releasedListeners, provider, view, visibility, pollState, backgroundPolls: () => backgroundPolls, dispose };
 }
+
+test("Explorer files wait for the composer and preserve unsaved text in a multi-selection", async t => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-explorer-files-"));
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
+  const a = path.join(folder, "a.ts");
+  const b = path.join(folder, "b.ts");
+  fs.writeFileSync(a, "saved");
+  fs.writeFileSync(b, "saved");
+  const file = (value: string) => Uri.file(value) as unknown as vscode.Uri;
+  const f = fixture();
+  t.after(f.dispose);
+  Object.assign(f.provider, { workspacePath: folder });
+  Object.assign(f.state.client, { refreshSkillCatalog() {}, refreshSubagentCatalog() {} });
+  f.state.pushSessionState = async () => {};
+  const docs = Object.getOwnPropertyDescriptor(workspace, "textDocuments");
+  Object.defineProperty(workspace, "textDocuments", { configurable: true,
+    value: [{ uri: file(b), isDirty: true, getText: () => "", languageId: "typescript" }] });
+  t.after(() => {
+    if (docs) Object.defineProperty(workspace, "textDocuments", docs);
+    else Reflect.deleteProperty(workspace, "textDocuments");
+  });
+  await f.provider.insertExplorerFiles([file(a), file(folder), file(b)]);
+  assert.equal(f.posted.some(msg => msg.type === "addChip"), false);
+  assert.equal(recoveryCalls.at(-1)?.command, "workbench.view.extension.zcode-sidebar");
+  await f.state.onWebviewMessage({ type: "ready" });
+  assert.deepEqual(f.posted.filter(msg => msg.type === "addChip").map(msg => msg.chip), [
+    { path: a, relPath: "a.ts" },
+    { path: b, relPath: "b.ts", snapshot: "", languageId: "typescript" },
+  ]);
+});
 
 test("Markdown file links open workspace images and reject stale or escaping paths", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-markdown-link-"));
@@ -201,12 +228,12 @@ test("model picker includes enabled backend shortcuts, excludes desktop-disabled
   }];
   f.state.currentModel = { providerId: "account:team", modelId: "current-model" };
   f.state.client.hasFreshSessionModel = () => true;
-  let finishA!: (value: { available: AvailableModel[] }) => void;
+  let finishA!: (value: { available: AvailableModel[]; known: boolean }) => void;
   f.state.client.readAvailableModels = () => new Promise(resolve => { finishA = resolve; });
 
   const staleRead = f.state.pushModels();
   f.switchToB();
-  finishA({ available: [deepseek] });
+  finishA({ available: [deepseek], known: true });
   await staleRead;
   assert.deepEqual(f.state.modelChoices().map(model => model.providerId), ["configured-provider"],
     "a delayed catalog from session A leaked into session B");
@@ -221,7 +248,7 @@ test("model picker includes enabled backend shortcuts, excludes desktop-disabled
     modelId: "k3",
     label: "k3",
     providerLabel: "Kimi",
-  }] });
+  }], known: true });
   await f.state.pushModels();
   const posted = f.posted.filter(message => message.type === "models").at(-1);
   const available = posted?.available as PickerModel[];
@@ -288,6 +315,228 @@ test("the Start Plan picker prefers the live account provider over its login ali
     [account.providerId, account.modelId],
     [custom.providerId, custom.modelId],
   ]);
+});
+
+test("Start Plan model choices survive a stale desktop refresh and follow the loaded session registry", async () => {
+  const f = fixture();
+  const providerId = "account:bigmodel-start-plan";
+  const personal = { providerId: "account:bigmodel-individual-coding-plan", modelId: "GLM-5.3", label: "GLM-5.3" };
+  const custom = { ...personal, providerId: "custom" };
+  Object.assign(f.state, {
+    runtime: { providerId: "builtin:bigmodel-start-plan", providerName: "Start Plan", kind: "anthropic",
+      models: { "GLM-5.3": {}, "GLM-5.3-Flash": {} } },
+    startPlanModelProvider: providerId,
+    picker: [{ ...personal, providerName: "Personal", kind: "anthropic", hasKey: true }],
+    livePicker: { client: f.state.client, sessionId: "A", models: [
+      personal, custom, { ...personal, providerId, modelId: "glm-5.3-flash" },
+      { ...personal, providerId: "builtin:bigmodel-start-plan" },
+      { ...personal, providerId, modelId: "UNVERIFIED" },
+    ] },
+  });
+  assert.deepEqual(f.state.modelChoices().map(model => [model.providerId, model.modelId]), [
+    [providerId, "glm-5.3-flash"], ["custom", "GLM-5.3"],
+  ], "a plan model the session never registered cannot be offered");
+
+  const switched: string[] = [];
+  f.state.pushModels = async () => {};
+  f.state.resolveSessionModelRuntime = async model => { switched.push(model.modelId); return false; };
+  Object.assign(f.state.client, { isGenerating: () => false });
+  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "glm-5.3-flash" });
+  assert.deepEqual(switched, ["glm-5.3-flash"], "only the registered model reaches the backend");
+
+  Object.assign(f.state, { livePicker: null });
+  assert.deepEqual(f.state.modelChoices().map(model => [model.providerId, model.modelId]), [
+    [providerId, "GLM-5.3"], [providerId, "GLM-5.3-Flash"],
+  ], "the plan list covers a catalog that has not loaded yet");
+  f.dispose();
+});
+
+function startPlanFixture() {
+  const f = fixture();
+  const providerId = "account:bigmodel-start-plan";
+  Object.assign(f.state, {
+    runtime: { providerId, providerName: "Start Plan", kind: "anthropic", models: { "GLM-5.3": {}, "GLM-5.3-Flash": {} } },
+    startPlanModelProvider: providerId,
+    picker: [],
+  });
+  const flash: AvailableModel = { providerId, modelId: "GLM-5.3-Flash", label: "GLM-5.3-Flash" };
+  return { f, providerId, flash, ids: () => f.state.modelChoices().map(model => model.modelId) };
+}
+
+test("an unreadable session catalog neither hides Start Plan models nor replaces the last valid one", async () => {
+  const { f, providerId, flash, ids } = startPlanFixture();
+  f.state.client.hasFreshSessionModel = () => true;
+  f.state.currentModel = { providerId, modelId: "GLM-5.3" };
+  let reads = 0;
+  let reply: { available: AvailableModel[]; known: boolean } = { available: [], known: false };
+  f.state.client.readAvailableModels = async () => { reads++; return reply; };
+  await f.state.pushModels();
+  assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"], "an unknown catalog falls back to the plan list");
+  await f.state.pushModels();
+  assert.equal(reads, 2, "an unknown catalog is read again even while the current model is fresh");
+  reply = { available: [flash], known: true };
+  await f.state.pushModels();
+  assert.deepEqual(ids(), ["GLM-5.3-Flash"]);
+  reply = { available: [], known: false };
+  await f.state.pushModels(true);
+  assert.deepEqual(ids(), ["GLM-5.3-Flash"], "a failed refresh keeps the last valid catalog");
+  f.dispose();
+});
+
+test("desktop refreshes and failed reads make the cached session catalog read again before switching", async () => {
+  const { f, providerId, flash, ids } = startPlanFixture();
+  const glm: AvailableModel = { ...flash, modelId: "GLM-5.3", label: "GLM-5.3" };
+  const state = f.state as unknown as { refreshDesktopModels: () => Promise<void> };
+  f.state.client.hasFreshSessionModel = () => true;
+  f.state.currentModel = { providerId, modelId: "GLM-5.3-Flash" };
+  let reads = 0;
+  let reply: { available: AvailableModel[]; known: boolean } = { available: [flash], known: true };
+  f.state.client.readAvailableModels = async () => { reads++; return reply; };
+  await f.state.pushModels();
+  await f.state.pushModels();
+  assert.equal(reads, 1, "a fresh catalog is reused");
+
+  reply = { available: [flash, glm], known: true };
+  await state.refreshDesktopModels();
+  assert.equal(reads, 2, "a desktop change reads the backend catalog again");
+  assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"]);
+
+  reply = { available: [], known: false };
+  await f.state.pushModels(true);
+  assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"], "a failed read keeps the last valid list on screen");
+  reply = { available: [flash], known: true };
+  const switched: string[] = [];
+  f.state.resolveSessionModelRuntime = async model => { switched.push(model.modelId); return false; };
+  Object.assign(f.state.client, { isGenerating: () => false });
+  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  assert.deepEqual(switched, [], "the switch is checked against the re-read catalog, which dropped GLM-5.3");
+  assert.deepEqual(ids(), ["GLM-5.3-Flash"]);
+  f.dispose();
+});
+
+test("only a Start Plan switch re-reads a missing or outdated session catalog first", async () => {
+  const { f, providerId, flash } = startPlanFixture();
+  const state = f.state as unknown as { livePicker: { stale?: boolean } | null; refreshDesktopModels: () => Promise<void> };
+  state.refreshDesktopModels = async () => {};
+  f.state.client.hasFreshSessionModel = () => true;
+  f.state.currentModel = { providerId, modelId: "GLM-5.3-Flash" };
+  let reads = 0;
+  f.state.client.readAvailableModels = async () => { reads++; return { available: [flash], known: true }; };
+  const switched: Array<[string, number]> = [];
+  f.state.resolveSessionModelRuntime = async model => { switched.push([model.modelId, reads]); return false; };
+  Object.assign(f.state.client, { isGenerating: () => false });
+
+  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  assert.deepEqual(switched, [], "a catalog that never loaded is read before judging the switch");
+  assert.equal(reads, 1);
+  state.livePicker!.stale = true;
+  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3-Flash" });
+  assert.deepEqual(switched, [["GLM-5.3-Flash", 2]], "an outdated catalog is read again before judging the switch");
+
+  state.livePicker!.stale = true;
+  await f.state.onWebviewMessage({ type: "selectModel", providerId: "custom", modelId: "custom-model" });
+  assert.deepEqual(switched.at(-1), ["custom-model", 2], "another provider's switch does not wait for the session catalog");
+  f.dispose();
+});
+
+test("an unreadable catalog leaves Start Plan switches to the backend, whose registry rejection is handled", async t => {
+  const { f, providerId, flash } = startPlanFixture();
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  t.mock.method(testWindow, "showWarningMessage", async (message: string) => { warnings.push(message); return undefined; });
+  t.mock.method(testWindow, "showErrorMessage", async (message: string) => { errors.push(message); return undefined; });
+  const state = f.state as unknown as {
+    livePicker: { client: unknown; sessionId: string; models: AvailableModel[]; stale?: boolean } | null;
+    pendingModel: { sessionId: string; providerId: string; modelId: string } | null;
+    applyPendingModel: (client: unknown) => Promise<boolean>;
+  };
+  const confirmed = { providerId, modelId: "GLM-5.3-Flash" };
+  state.livePicker = { client: f.state.client, sessionId: "A", models: [flash], stale: true };
+  Object.assign(f.state, { providerInventoryAuthoritative: true });
+  f.state.currentModel = confirmed;
+  f.state.client.readAvailableModels = async () => ({ available: [], known: false });
+  f.state.resolveSessionModelRuntime = async () => null;
+  const attempted: unknown[][] = [];
+  let failure: Error = Object.assign(new Error('provider "account:bigmodel-start-plan" is not in the workspace model registry'),
+    { reasonCode: "provider.notInRegistry" });
+  Object.assign(f.state.client, {
+    isGenerating: () => false,
+    confirmedModel: () => confirmed,
+    setModel: async (...args: unknown[]) => { attempted.push(args); throw failure; },
+  });
+
+  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  assert.deepEqual(attempted, [[providerId, "GLM-5.3"]], "an outdated list cannot prove the model is gone");
+  assert.deepEqual(f.state.currentModel, confirmed);
+  assert.match(warnings.at(-1) ?? "", /该模型已不可用|no longer available/);
+  assert.deepEqual(errors, [], "a registry rejection is explained, not shown as a raw failure");
+  assert.equal(state.livePicker?.stale, true);
+
+  state.pendingModel = { sessionId: "A", providerId, modelId: "GLM-5.3" };
+  f.state.currentModel = { providerId, modelId: "GLM-5.3" };
+  assert.equal(await state.applyPendingModel(f.state.client), false);
+  assert.equal(state.pendingModel, null, "a rejected queued choice is not retried on every send");
+  assert.deepEqual(f.state.currentModel, confirmed);
+
+  failure = new Error("ECONNRESET");
+  state.pendingModel = { sessionId: "A", providerId, modelId: "GLM-5.3" };
+  await assert.rejects(state.applyPendingModel(f.state.client), /ECONNRESET/);
+  assert.equal(state.pendingModel?.modelId, "GLM-5.3", "a transport failure keeps the queued choice for a retry");
+
+  f.state.disabledModelKeys.add(`${providerId}\0GLM-5.3`);
+  attempted.length = 0;
+  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  assert.equal(await state.applyPendingModel(f.state.client), false);
+  assert.equal(state.pendingModel, null);
+  assert.deepEqual(attempted, [], "an explicit disable still blocks direct and queued switches");
+  f.dispose();
+});
+
+test("an earlier catalog read cannot overwrite a later result", async () => {
+  const { f, flash, ids } = startPlanFixture();
+  const glm: AvailableModel = { ...flash, modelId: "GLM-5.3", label: "GLM-5.3" };
+  const replies: Array<(value: { available: AvailableModel[]; known: boolean }) => void> = [];
+  f.state.client.readAvailableModels = () => new Promise(resolve => { replies.push(resolve); });
+  const older = f.state.pushModels(true);
+  const newer = f.state.pushModels(true);
+  replies[1]({ available: [flash, glm], known: true });
+  await newer;
+  replies[0]({ available: [flash], known: true });
+  await older;
+  assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"], "the later catalog wins");
+
+  const state = f.state as unknown as { livePicker: { stale?: boolean } | null };
+  const olderSuccess = f.state.pushModels(true);
+  const newerFailure = f.state.pushModels(true);
+  replies[3]({ available: [], known: false });
+  await newerFailure;
+  replies[2]({ available: [flash], known: true });
+  await olderSuccess;
+  assert.equal(state.livePicker?.stale, true, "an earlier success cannot clear a later failure");
+  assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"]);
+  f.dispose();
+});
+
+test("a queued Start Plan switch is checked against the current session registry", async () => {
+  const { f, providerId, flash } = startPlanFixture();
+  const state = f.state as unknown as {
+    livePicker: unknown; pendingModel: { sessionId: string; providerId: string; modelId: string } | null;
+    applyPendingModel: (client: unknown) => Promise<boolean>; context: { workspaceState: { update?: unknown } };
+  };
+  state.livePicker = { client: f.state.client, sessionId: "A", models: [flash] };
+  state.context.workspaceState.update = async () => {};
+  const applied: unknown[][] = [];
+  f.state.client.setModel = async (...args: unknown[]) => { applied.push(args); };
+  f.state.pushModels = async () => {};
+  f.state.resolveSessionModelRuntime = async () => null;
+  state.pendingModel = { sessionId: "A", providerId, modelId: "GLM-5.3" };
+  assert.equal(await state.applyPendingModel(f.state.client), false);
+  assert.equal(state.pendingModel, null);
+  state.pendingModel = { sessionId: "A", providerId, modelId: "GLM-5.3-Flash" };
+  assert.equal(await state.applyPendingModel(f.state.client), true);
+  assert.deepEqual(applied, [[providerId, "GLM-5.3-Flash"]], "only the registered model reaches the backend");
+  f.dispose();
 });
 
 test("authoritative desktop provider inventory rejects deleted providers from the live catalog", () => {
@@ -892,18 +1141,25 @@ test("account plan login failure does not silently start an available paid provi
   f.dispose();
 });
 
-test("queue send-now stops after a pending model change loses session ownership", async () => {
+for (const reopen of [false, true]) test(`queue send-now stops after a pending model change loses session ownership (reopen=${reopen})`, async () => {
   const f = fixture();
   let resolveRuntime!: (runtime: null) => void;
   f.state.pendingModel = { sessionId: "A", providerId: "provider", modelId: "new-model" };
   f.state.resolveSessionModelRuntime = () => new Promise(resolve => { resolveRuntime = resolve; });
   let sends = 0;
+  let switches = 0;
+  f.state.client.setModel = async () => { switches++; };
   (f.state.client as typeof f.state.client & { sendQueuedNow: () => Promise<void> }).sendQueuedNow = async () => { sends++; };
   f.handler({ type: "queueSendNow", sessionId: "A", queueItemId: "q-A" });
   f.switchToB();
+  if (reopen) {
+    f.state.client.currentSessionId = "A";
+    f.state.switchTicket++;
+  }
   resolveRuntime(null);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(sends, 0, "queued item was sent in the newly selected session");
+  assert.equal(switches, 0, "the old model change reached the newly selected session");
   f.dispose();
 });
 
@@ -1412,19 +1668,137 @@ for (const phase of ["resolve", "switch"]) test(`model ${phase} failure restores
   f.dispose();
 });
 
-test("choosing a model while generating stages it for quota display", async () => {
-  const f = fixture();
-  Object.assign(f.state.client, { isGenerating: () => true });
-
-  await (f.state as unknown as {selectModel:(provider: string, model: string) => Promise<void>}).selectModel("deepseek", "deepseek-chat");
-
-  assert.deepEqual(f.state.pendingModel, { sessionId: "A", providerId: "deepseek", modelId: "deepseek-chat" });
-  assert.deepEqual(f.stagedModels(), { providerId: "deepseek", modelId: "deepseek-chat" });
-  assert.deepEqual(f.posted.find(message => message.type === "models")?.current, {
-    providerId: "deepseek",
-    modelId: "deepseek-chat",
+test("a queued model remains provisional if the registry rejects it and the catalog cannot be read", async () => {
+  const { f, providerId } = startPlanFixture();
+  const confirmed = { providerId, modelId: "GLM-5.3-Flash" };
+  const target = { providerId, modelId: "GLM-5.3" };
+  const client = new ZCodeClient({
+    binaryPath: "/unused", desktopAppVersion: null, workspacePath: "/unused", onEvent: () => {},
   });
+  let generating = true;
+  const attempts: string[] = [];
+  Object.assign(client, {
+    sessionId: "A",
+    sessionReadable: true,
+    sessionModel: confirmed,
+    isGenerating: () => generating,
+    sendRequest: async (method: string) => {
+      attempts.push(method);
+      if (method === "v4/command") return { status: "rejected", reasonCode: "provider.notInRegistry" };
+      throw new Error("Session catalog unavailable");
+    },
+  });
+  Object.assign(f.state, { client, currentModel: confirmed });
+  f.state.resolveSessionModelRuntime = async () => null;
+
+  await f.state.onWebviewMessage({ type: "selectModel", ...target });
+  assert.deepEqual(f.state.pendingModel, { sessionId: "A", ...target });
+  assert.deepEqual(f.posted.filter(message => message.type === "models").at(-1)?.current, target);
+  assert.deepEqual(client.confirmedModel(), confirmed);
+  assert.deepEqual(f.state.currentModel, confirmed);
+
+  generating = false;
+  attempts.length = 0;
+  const state = f.state as unknown as { applyPendingModel: (client: ZCodeClient) => Promise<boolean> };
+  assert.equal(await state.applyPendingModel(client), false);
+  assert.ok(attempts.includes("v4/command"));
+  assert.equal(attempts.at(-1), "session/read");
+  assert.equal(f.state.pendingModel, null);
+  assert.deepEqual(f.posted.filter(message => message.type === "models").at(-1)?.current, confirmed);
+  assert.deepEqual(client.confirmedModel(), confirmed);
   f.dispose();
+});
+
+for (const outcome of ["accepted", "rejected"]) test(`a queued model switch ${outcome} by the server preserves a newer choice`, async () => {
+  const { f, providerId } = startPlanFixture();
+  const state = f.state as unknown as {
+    applyPendingModel: (client: unknown) => Promise<boolean>;
+    context: { workspaceState: { update?: unknown } };
+  };
+  state.context.workspaceState.update = async () => {};
+  const confirmed = { providerId, modelId: "GLM-5.3-Flash" };
+  const first = { providerId, modelId: "GLM-5.3" };
+  const latest = { providerId: "another-provider", modelId: "another-model" };
+  const started = deferred();
+  const response = deferred();
+  const attempted: unknown[][] = [];
+  Object.assign(f.state.client, {
+    confirmedModel: () => confirmed,
+    isGenerating: () => true,
+    readAvailableModels: async () => ({ available: [], known: false }),
+    setModel: async (...args: unknown[]) => {
+      attempted.push(args);
+      if (attempted.length !== 1) return;
+      started.resolve();
+      await response.promise;
+    },
+  });
+  f.state.currentModel = confirmed;
+  f.state.resolveSessionModelRuntime = async () => null;
+  await f.state.onWebviewMessage({ type: "selectModel", ...first });
+  const applying = state.applyPendingModel(f.state.client);
+  await started.promise;
+  await f.state.onWebviewMessage({ type: "selectModel", ...latest });
+  if (outcome === "accepted") response.resolve();
+  else response.reject(Object.assign(new Error("registry rejection"), { reasonCode: "provider.notInRegistry" }));
+  assert.equal(await applying, outcome === "accepted");
+  assert.deepEqual(f.state.pendingModel, { sessionId: "A", ...latest });
+  assert.deepEqual(f.state.currentModel, outcome === "accepted" ? first : confirmed);
+  assert.equal(await state.applyPendingModel(f.state.client), true);
+  assert.equal(f.state.pendingModel, null);
+  assert.deepEqual(attempted, [[first.providerId, first.modelId], [latest.providerId, latest.modelId]]);
+});
+
+test("send admits the message before a later direct model selection can apply", async () => {
+  const { f, providerId } = startPlanFixture();
+  const first = { providerId, modelId: "GLM-5.3" };
+  const latest = { providerId: "another-provider", modelId: "another-model" };
+  const checking = deferred();
+  const resume = deferred();
+  const admitting = deferred();
+  const admit = deferred();
+  const operations: string[] = [];
+  let generating = true;
+  let actual = { providerId, modelId: "GLM-5.3-Flash" };
+  Object.assign(f.state.client, {
+    isGenerating: () => generating,
+    confirmedModel: () => actual,
+    readAvailableModels: async () => ({ available: [], known: false }),
+    setModel: async (providerId: string, modelId: string) => {
+      actual = { providerId, modelId };
+      operations.push(`switch:${modelId}`);
+    },
+    sendMessage: async () => {
+      operations.push(`send:${actual.modelId}`);
+      admitting.resolve();
+      await admit.promise;
+    },
+  });
+  f.state.currentModel = actual;
+  const state = f.state as unknown as { context: { workspaceState: { update?: unknown } } };
+  state.context.workspaceState.update = async () => {};
+  f.state.resolveSessionModelRuntime = async model => {
+    if (model.modelId === first.modelId) {
+      checking.resolve();
+      await resume.promise;
+    }
+    return null;
+  };
+
+  await f.state.onWebviewMessage({ type: "selectModel", ...first });
+  generating = false;
+  const send = f.state.onWebviewMessage({ type: "send", sessionId: "A", text: "test message" });
+  await checking.promise;
+  const nextPick = f.state.onWebviewMessage({ type: "selectModel", ...latest });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(operations, []);
+  resume.resolve();
+  await admitting.promise;
+  assert.deepEqual(operations, [`switch:${first.modelId}`, `send:${first.modelId}`]);
+  admit.resolve();
+  await Promise.all([send, nextPick]);
+  assert.deepEqual(operations, [`switch:${first.modelId}`, `send:${first.modelId}`, `switch:${latest.modelId}`]);
+  assert.deepEqual(f.state.currentModel, latest);
 });
 
 test("loading older session pages exposes active sessions hidden behind archived records", async () => {

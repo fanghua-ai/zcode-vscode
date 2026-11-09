@@ -43,7 +43,7 @@
 
 **Linux** 已测试，目前使用基本正常；**Windows** 已由作者实际测试，但仍发现过会话互不可见的适配问题；**macOS ARM64 和 Intel** 已通过 GitHub CI 的类型检查、完整单元测试、构建和打包检查，以及 VS Code 最低支持版 1.106.0 与当前稳定版中的 SQLite 扩展宿主回归。macOS 的真实账号登录、端到端聊天和界面体验仍待验证。[完整验证记录](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917427) · [SQLite 宿主验证记录](https://github.com/fanghua-ai/zcode-vscode/actions/runs/41789711444)
 
-常规兼容范围为 **ZCode 桌面端 3.12.3–3.16.3**。已验证 3.12.3、3.14.4 和 3.16.3；3.14.4 已完成真实会话切换与停止回归，3.16.2 起适配了会话列表协议变化。另已在 Windows 上验证 **3.17.1** 的 BigModel 免费 Start Plan 登录、模型选择和发送消息。
+常规兼容范围为 **ZCode 桌面端 3.12.3–3.17.2**。已验证 3.12.3、3.14.4 和 3.16.3；3.14.4 已完成真实会话切换与停止回归，3.16.2 起适配了会话列表协议变化。另已在 Windows 上验证 **3.17.1** 的 BigModel 免费 Start Plan 登录、模型选择和发送消息；3.17.2 的 Coding Plan 登录协议已与官方开源源码对照，尚未用真实账号验证。
 
 2.0.2 进一步适配桌面端 **3.16.2** 的 Coding Plan 鉴权和自定义 API 配置。3.16.2 已通过隔离配置下的真实运行时会话切换、停止和附件回归；Z.AI 个人套餐仍需真实账号验证；macOS 的 CI 验证不包含桌面端真实账号聊天。
 
@@ -58,7 +58,7 @@
 | # | 条件 | 如何确认 |
 |---|------|----------|
 | 1 | VS Code **1.106 或更高**，已安装本扩展并 **Reload Window** | 帮助 → 关于 |
-| 2 | 已安装 **ZCode 桌面端 3.12.3–3.16.3**，且能找到 `zcode.cjs` | 见下方[探测路径](#zcodecjs-探测顺序) |
+| 2 | 已安装 **ZCode 桌面端 3.12.3–3.17.2**，且能找到 `zcode.cjs` | 见下方[探测路径](#zcodecjs-探测顺序) |
 | 3 | 桌面端 **已经登录过** | 存在 `~/.zcode/v2/setting.json` 和 `~/.zcode/v2/credentials.json` |
 | 4 | 当前桌面选择里有 **还能用的模型凭据**（个人或团队项目，且有额度） | 桌面端能正常开一个新对话 |
 
@@ -68,7 +68,7 @@
 
 市场有两条更新通道：
 
-- **稳定版**使用偶数次版本号，当前是 **2.2.1**。直接安装会留在稳定版，不会自动升到预览版。
+- **稳定版**使用偶数次版本号，当前是 **2.2.2**。直接安装会留在稳定版，不会自动升到预览版。
 - **预览版**使用奇数次版本号。只有在扩展页面选择 **Install Pre-Release Version**，或执行 `code --install-extension fanghua.zcode-desktop-chat --pre-release` 的用户才会安装预览版，并继续接收更高的预览版。之后若发布更高版本号的稳定版，预览版会被该稳定版替换。
 
 也可以手动安装 VSIX。文件名是 `zcode-desktop-chat-<版本>.vsix`，请选择与要安装的稳定版或预览版一致的文件：
@@ -112,7 +112,7 @@ code --install-extension zcode-desktop-chat-<版本>.vsix --force
 
 在输入框输入 `@` 可搜索当前会话工作区的文件和会话，文件排在前面、会话排在后面；继续输入文件名、路径或会话标题筛选。用上下键选择、Enter／Tab 添加引用，Escape 关闭。文件引用显示在输入框上方；会话引用显示为独立标签，并随草稿和发送失败恢复保留。文件搜索包括 `.vscode` 等隐藏配置文件，跳过 `.git`、依赖和构建目录；支持模糊匹配并优先显示最近打开的文件；输入查询后直接在整个工作区进行定向搜索，不再依赖最初列出的文件。最多展示 40 条文件结果，同一查询缓存约 15 秒；每种搜索模式最多取 5,000 个候选，空查询列出最多 1,000 个文件。失败时可点击重试或按 Enter。含空格的文件名可用 `@"文件 名"` 搜索。技能和子智能体不在此 @ 菜单中；请用 / 搜索。
 
-从 VS Code 文件树拖入文件也可加入引用。跨工作区文件使用相对实际会话根目录的路径；未保存的文件会携带当前内容，过大的未保存文件请选中所需片段。
+在 VS Code 文件树选中一个或多个文件，右键选择 **ZCode: 把文件加入对话**。跨工作区文件使用相对实际会话根目录的路径；未保存的文件会携带当前内容，过大的未保存文件请选中所需片段。
 
 智能体修改文件后，可在对应工具卡片中打开文件或查看 diff。
 
@@ -231,7 +231,7 @@ macOS 可再查 `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`。Win
 | `Provider … has no usable API key` | 选中的供应商在当前登录里没有密钥 | 桌面端切回有密钥的项目，或换模型 |
 | `ZCode startup failed` / `ZCode process exited` | 子进程立刻退出 | 日志 stderr；确认 `binaryPath` 指向 `.cjs`，`cmd` 是 VS Code 的运行时 |
 | `无法定位 CLI ZCode Built-in Provider Config` | 桌面更新后 app-server 找不到内置模型配置 | 确认桌面已打开过一次；扩展会带上 `ZCODE_BUILTIN_PROVIDER_*` 环境变量。若仍失败，检查 `/opt/ZCode/resources/config/provider/zcode-builtin.json`（macOS 在 `ZCode.app/Contents/Resources/config/provider/`） |
-| `Unrecognized key` / `Method not found` / `-32602` | 桌面端升级后 app-server 协议发生变化 | 确认桌面端在 3.12.3–3.16.3 内，并安装匹配的扩展版本后重新连接 |
+| `Unrecognized key` / `Method not found` / `-32602` | 桌面端升级后 app-server 协议发生变化 | 确认桌面端在 3.12.3–3.17.2 内，并安装匹配的扩展版本后重新连接 |
 | `余额不足` / 类似额度错误 | 当前桌面选择的套餐没额度 | 桌面端换有额度的项目，再「重新读取登录」 |
 | `当前 VS Code 运行环境不支持原生 SQLite` | 扩展宿主缺少所需的 `node:sqlite` 模块 | 更新 VS Code 后重试；数据库读取和写入都需要原生 SQLite |
 | 历史里归档会话跑到「活动」 | 读不了桌面的 `tasks-index.sqlite`（少见） | 看日志里 sqlite / archive；VS Code 过旧时能力会降级，一般仍能聊 |
@@ -308,7 +308,7 @@ For development and contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). This 
 
 **Linux** has been tested and is currently working well. **Windows** has been tested by the author, but session visibility issues have still been found. **macOS ARM64 and Intel** have passed type checks, the full unit suite, builds and package checks in GitHub CI, plus SQLite regression tests inside real VS Code extension hosts on the minimum supported version 1.106.0 and the current stable version. Real-account sign-in, end-to-end chat and the UI experience on macOS still need verification. [Full verification](https://github.com/fanghua-ai/zcode-vscode/actions/runs/40190917427) · [SQLite host verification](https://github.com/fanghua-ai/zcode-vscode/actions/runs/41789711444)
 
-The general compatibility range is **ZCode desktop 3.12.3–3.16.3**. Versions 3.12.3, 3.14.4, and 3.16.3 have been verified. Session switching and stopping were tested on 3.14.4, and the extension handles the session-list protocol change introduced in 3.16.2. Sign-in, model selection, and messaging with a free BigModel Start Plan were also verified on **3.17.1** on Windows.
+The general compatibility range is **ZCode desktop 3.12.3–3.17.2**. Versions 3.12.3, 3.14.4, and 3.16.3 have been verified. Session switching and stopping were tested on 3.14.4, and the extension handles the session-list protocol change introduced in 3.16.2. Sign-in, model selection, and messaging with a free BigModel Start Plan were also verified on **3.17.1** on Windows. Coding Plan sign-in for 3.17.2 has been checked against the official open-source code but not yet with a real account.
 
 Version 2.0.2 also adapts Coding Plan authentication and custom API configuration for desktop **3.16.2**. Its actual runtime has passed session-switching, stop, and attachment regressions with isolated fixtures. Z.AI personal plans still need real-account validation; macOS CI does not cover real-account desktop chat.
 
@@ -323,7 +323,7 @@ Before starting a chat, check the following:
 | # | Requirement | How to check |
 |---|-------------|--------------|
 | 1 | VS Code **1.106 or newer**, with this extension installed and the window reloaded | Help → About |
-| 2 | **ZCode desktop 3.12.3-3.16.3**, with `zcode.cjs` found | See [discovery order](#zcodecjs-discovery-order) below |
+| 2 | **ZCode desktop 3.12.3-3.17.2**, with `zcode.cjs` found | See [discovery order](#zcodecjs-discovery-order) below |
 | 3 | You have **signed in to the desktop app at least once** | `~/.zcode/v2/setting.json` and `~/.zcode/v2/credentials.json` exist |
 | 4 | The current desktop selection has **usable model credentials** (an individual or team project that still has quota) | The desktop app can start a new chat |
 
@@ -333,7 +333,7 @@ Search for **ZCode Chat** by **fanghua** in the VS Code Extensions Marketplace, 
 
 The Marketplace has two update channels:
 
-- **Stable** releases use an even minor version. The current stable release is **2.2.1**. A normal install stays on stable and is not upgraded to a preview.
+- **Stable** releases use an even minor version. The current stable release is **2.2.2**. A normal install stays on stable and is not upgraded to a preview.
 - **Preview** releases use an odd minor version. Only users who choose **Install Pre-Release Version** on the extension page, or run `code --install-extension fanghua.zcode-desktop-chat --pre-release`, receive a preview and later higher previews. A later stable release with a higher version replaces the preview.
 
 You can also install a VSIX manually. Its name is `zcode-desktop-chat-<version>.vsix`; choose the file for the stable or preview release you want:
@@ -367,7 +367,7 @@ Editor context menu:
 - **把选区加入对话** — pin the selection
 - **把当前文件加入对话** — pin the file
 
-Files dragged from the VS Code file tree can also be referenced. Paths are relative to the actual session workspace, including other workspace roots. Unsaved files include the current editor content; select the needed passage if an unsaved file is too large.
+Select one or more files in VS Code Explorer, then choose **ZCode: Add to Chat** from the context menu. Paths are relative to the actual session workspace, including other workspace roots. Unsaved files include the current editor content; select the needed passage if an unsaved file is too large.
 
 After the agent changes a file, the tool card can open the file or show a diff.
 
@@ -487,7 +487,7 @@ Error cards provide recovery steps and direct actions for models, connections an
 | `Provider … has no usable API key` | The selected provider has no key in the current sign-in | Switch back to a project that has a key, or change the model |
 | `ZCode startup failed` / `ZCode process exited` | The child process exited immediately | Read stderr in the log; confirm `binaryPath` points at the `.cjs` file and `cmd` is the VS Code runtime |
 | `无法定位 CLI ZCode Built-in Provider Config` | After a desktop update, app-server cannot find the built-in model config | Open the desktop app once; the extension sets `ZCODE_BUILTIN_PROVIDER_*`. If it still fails, check `/opt/ZCode/resources/config/provider/zcode-builtin.json` (on macOS, `ZCode.app/Contents/Resources/config/provider/`) |
-| `Unrecognized key` / `Method not found` / `-32602` | A desktop update changed the app-server protocol | Use desktop 3.12.3-3.16.3, install the matching extension, and reconnect |
+| `Unrecognized key` / `Method not found` / `-32602` | A desktop update changed the app-server protocol | Use desktop 3.12.3-3.17.2, install the matching extension, and reconnect |
 | `余额不足` or a similar quota error | The plan selected in the desktop app has no quota | Switch to a project that has quota, then “重新读取登录” |
 | `当前 VS Code 运行环境不支持原生 SQLite` | This VS Code runtime does not support native SQLite | Update VS Code and retry |
 | An archived session shows under “活动” (Active) in history | The desktop `tasks-index.sqlite` could not be read (uncommon) | Check sqlite / archive in the log; a very old VS Code degrades this, and chat usually still works |

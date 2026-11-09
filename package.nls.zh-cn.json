@@ -1,4 +1,5 @@
 {
+  "command.addExplorerFiles.title": "ZCode: 把文件加入对话",
   "diagnostics.exportHelp": "复制或导出诊断信息时会自动脱敏；完成后请自行再检查一遍。",
   "command.showChromeSettings.title": "ZCode: 打开显示设置",
   "config.showSuppressedPluginSkills.description": "这些插件关闭时，仍在 / 菜单列出文档、PDF、演示文稿、表格和浏览器技能。选中后不发送该技能。启用会记住，之后启动会拉起这些 MCP。",
@@ -67,5 +68,7 @@
   "config.formulaFonts.auto": "在公式回复旁询问",
   "config.formulaFonts.on": "下载并使用公式字体",
   "config.formulaFonts.off": "使用系统字体，不再询问",
-  "config.allowedDesktopPlugins.description": "允许在扩展中启用的插件，仍遵循桌面端原有开关。修改会重启当前会话。浏览器和电脑控制共用 JavaScript REPL。"
+  "config.allowedDesktopPlugins.description": "允许在扩展中启用的插件，仍遵循桌面端原有开关。修改会重启当前会话。浏览器和电脑控制共用 JavaScript REPL。",
+  "command.sendSelection.title": "ZCode: 把选区加入对话",
+  "command.sendCurrentFile.title": "ZCode: 把当前文件加入对话"
 }

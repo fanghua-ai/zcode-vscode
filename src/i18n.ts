@@ -442,6 +442,7 @@ export const messages: Record<string, string> = {
   "新会话默认模型当前不可用，已沿用 ZCode 默认模型。": "The selected default model is unavailable. The ZCode default model will be used for this chat.",
   "新会话默认模型未能应用，已沿用 ZCode 默认模型。": "The selected default model could not be applied. The ZCode default model will be used for this chat.",
   "会话权限尚未恢复完成，请重新连接或明确选择权限后重试。": "Session permissions have not finished restoring. Reconnect or explicitly choose a permission mode before retrying.",
+  "模型认证需要刷新，请确认桌面端的凭据有效，点击「重新读取登录」后重试。": "Model authentication needs to be refreshed. Confirm that your credentials are valid in the desktop app, then select Reload desktop login and try again.",
   "权限已更新，但未能保存；请重试，否则重启后可能恢复旧权限。": "The permission was updated but could not be saved. Retry, or restarting may restore the previous permission.",
   "新会话权限默认值未能应用，已沿用 ZCode 默认设置。": "The selected permission default could not be applied. ZCode defaults will be used for this chat.",
   "所选模型不支持该推理强度，已使用模型默认值。": "The selected model does not support this reasoning effort. Its default will be used.",

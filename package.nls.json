@@ -1,4 +1,5 @@
 {
+  "command.addExplorerFiles.title": "ZCode: Add to Chat",
   "diagnostics.exportHelp": "Copied or exported diagnostics are automatically redacted. Please review them again before sharing.",
   "command.showChromeSettings.title": "ZCode: Open display settings",
   "config.showSuppressedPluginSkills.description": "While those plugins are off, still list the document, PDF, presentation, spreadsheet, and browser skills in /. Choosing one does not send the skill. Enabling is remembered and later startups launch their MCP processes.",
@@ -67,5 +68,7 @@
   "config.formulaFonts.auto": "Ask beside a formula reply",
   "config.formulaFonts.on": "Download and use formula fonts",
   "config.formulaFonts.off": "Use system fonts without asking",
-  "config.allowedDesktopPlugins.description": "Plugins allowed in the extension. Desktop enablement still applies. Changes restart the current chat. Browser and computer use share the JavaScript REPL."
+  "config.allowedDesktopPlugins.description": "Plugins allowed in the extension. Desktop enablement still applies. Changes restart the current chat. Browser and computer use share the JavaScript REPL.",
+  "command.sendSelection.title": "ZCode: Add Selection to Chat",
+  "command.sendCurrentFile.title": "ZCode: Add Current File to Chat"
 }
