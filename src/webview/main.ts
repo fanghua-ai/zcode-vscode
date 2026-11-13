@@ -12,6 +12,7 @@ import { renderMarkdown } from "./markdown";
 import { localMarkdownFileLink } from "../markdownFileLink";
 import { QuestionAnswers } from "../userInput";
 import type { FileChange } from "../toolFiles";
+import type { SubagentActivity, SubagentTimelineEntry, SubagentTool } from "../zcodeClient";
 import { sameSessionModel, type NewSessionDefaults, type SessionModelChoice } from "../newSessionDefaults";
 import { prettifyToolIo, splitZaiBuiltin, formatImageAnalysisOutput } from "../zaiBuiltin";
 import {
@@ -4193,6 +4194,7 @@ function addToolCall(data: {
   inputText?: string;
   outputText?: string;
   fileChange?: FileChange;
+  subagents?: SubagentActivity[];
 }): void {
   const key = data.toolCallId || data.rowId;
   const id = key != null && String(key).length > 0 ? `tool-${key}` : "";
@@ -4345,6 +4347,7 @@ function fillToolCallEl(
     inputText?: string;
     outputText?: string;
     fileChange?: FileChange;
+    subagents?: SubagentActivity[];
   }
 ): void {
   el.classList.add("tool-call");
@@ -4352,6 +4355,7 @@ function fillToolCallEl(
   const prevInput = el.querySelector(".tool-io:not(.out)")?.textContent ?? "";
   const prevOutput = el.querySelector(".tool-io.out")?.textContent ?? "";
   const userToggle = el.dataset.userToggle;
+  if (data.subagents !== undefined) el.dataset.subagents = JSON.stringify(data.subagents);
   const toolName = data.toolName || prevName || "tool";
   el.dataset.toolName = toolName;
   const prevStatus = el.dataset.toolStatus ?? "";
@@ -4454,12 +4458,16 @@ function fillToolCallEl(
     const nextBody = template.content.querySelector<HTMLElement>(".tool-body")!;
     // Match sections independently: adding output must not detach the input or
     // reset a selection/scroll position in an existing output node.
-    const sections = Array.from(body.children);
+    // The subagent list is rendered from live state below. Keep its DOM in
+    // place while reconciling the parent's input/output sections so expanded
+    // child cards do not collapse on every Agent progress update.
+    const subagentList = body.querySelector<HTMLElement>(":scope > .subagent-list");
+    const sections = Array.from(body.children).filter(section => section !== subagentList);
     for (const next of Array.from(nextBody.children)) {
       const current = sections.find(section => section.className === next.className
         && (section.className !== "tool-section-label" || section.getAttribute("data-i18n-key") === next.getAttribute("data-i18n-key")));
       if (!current) {
-        body.insertBefore(next, sections[0] ?? null);
+        body.insertBefore(next, sections[0] ?? subagentList ?? null);
         continue;
       }
       sections.splice(sections.indexOf(current), 1);
@@ -4501,6 +4509,230 @@ function fillToolCallEl(
     ev.stopPropagation();
     if (change) post({ type: "openDiff", fileChange: change });
   });
+  const subagents = data.subagents ?? readSubagentActivities(el.dataset.subagents);
+  renderSubagents(el, subagents);
+}
+
+function readSubagentActivities(raw?: string): SubagentActivity[] {
+  if (!raw) return [];
+  try {
+    const value = JSON.parse(raw);
+    return Array.isArray(value) ? value.filter(item => typeof item?.childSessionId === "string"
+      && typeof item?.parentToolCallId === "string" && typeof item?.status === "string") : [];
+  } catch { return []; }
+}
+
+function subagentStatusLabel(status: string): string {
+  return ({ running: "进行中", completed: "已完成", failed: "失败", cancelled: "已取消" } as Record<string, string>)[status]
+    ?? "进行中";
+}
+
+function renderSubagents(toolEl: HTMLElement, activities: SubagentActivity[]): void {
+  const body = toolEl.querySelector<HTMLElement>(":scope > .tool-body");
+  if (!body) return;
+  let list = body.querySelector<HTMLElement>(":scope > .subagent-list");
+  if (!activities.length) { list?.remove(); return; }
+  if (!list) {
+    list = document.createElement("div");
+    list.className = "subagent-list";
+    body.appendChild(list);
+  }
+  const keep = new Set(activities.map(activity => activity.childSessionId));
+  for (const existing of [...list.querySelectorAll<HTMLElement>(":scope > .subagent-activity")]) {
+    if (!keep.has(existing.dataset.childSessionId ?? "")) existing.remove();
+  }
+  for (const activity of activities) {
+    let card = [...list.querySelectorAll<HTMLElement>(":scope > .subagent-activity")]
+      .find(item => item.dataset.childSessionId === activity.childSessionId);
+    if (!card) {
+      card = document.createElement("section");
+      card.className = "subagent-activity";
+      card.dataset.childSessionId = activity.childSessionId;
+      const head = document.createElement("button");
+      head.type = "button";
+      head.className = "subagent-head process-head";
+      const details = document.createElement("div");
+      details.className = "subagent-body";
+      details.hidden = true;
+      head.addEventListener("click", () => {
+        const open = card!.dataset.userToggle !== "open";
+        card!.dataset.userToggle = open ? "open" : "closed";
+        details.hidden = !open;
+        head.setAttribute("aria-expanded", String(open));
+        if (open && (card!.dataset.detailsState === "idle" || card!.dataset.detailsState === "unavailable")) {
+          post({
+            type: "loadSubagentDetails",
+            sessionId: currentSessionId,
+            parentToolCallId: card!.dataset.parentToolCallId,
+            childSessionId: card!.dataset.childSessionId,
+          });
+          card!.dataset.detailsState = "loading";
+        }
+      });
+      card.append(head, details);
+      list.appendChild(card);
+    }
+    card.dataset.parentToolCallId = activity.parentToolCallId;
+    card.dataset.detailsState = activity.detailsState ?? "idle";
+    const head = card.querySelector<HTMLButtonElement>(":scope > .subagent-head")!;
+    const details = card.querySelector<HTMLElement>(":scope > .subagent-body")!;
+    const expanded = card.dataset.userToggle === "open";
+    head.setAttribute("aria-expanded", String(expanded));
+    head.innerHTML = `${AGENT_ICON}<span class="subagent-name">${escapeText(activity.agentType || activity.title || t("子智能体"))}</span><span class="subagent-status ${escapeText(activity.status)}" ${uiLabelAttributes(subagentStatusLabel(activity.status))}>${escapeText(t(subagentStatusLabel(activity.status)))}</span><svg class="process-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`;
+    details.hidden = !expanded;
+    renderSubagentBody(details, activity);
+  }
+}
+
+function renderSubagentTimelineEntries(
+  timeline: HTMLElement,
+  childSessionId: string,
+  entries: SubagentTimelineEntry[],
+  streaming: boolean,
+): void {
+  const keep = new Set(entries.map(entry => entry.id));
+  for (const existing of [...timeline.querySelectorAll<HTMLElement>(":scope > [data-subagent-timeline-id]")]) {
+    if (!keep.has(existing.dataset.subagentTimelineId ?? "")) existing.remove();
+  }
+  for (const entry of entries) {
+    let row = [...timeline.querySelectorAll<HTMLElement>(":scope > [data-subagent-timeline-id]")]
+      .find(item => item.dataset.subagentTimelineId === entry.id);
+    if (entry.kind === "tool") {
+      if (!row) {
+        row = document.createElement("div");
+        row.className = "subagent-tool tool-call";
+        row.dataset.subagentTimelineId = entry.id;
+      }
+      row.dataset.subagentToolId = entry.toolCallId || entry.id;
+      if (entry.toolCallId) row.id = `subagent-tool:${encodeURIComponent(childSessionId)}:${encodeURIComponent(entry.toolCallId)}`;
+      fillToolCallEl(row, {
+        toolName: entry.toolName,
+        status: entry.status,
+        inputText: entry.inputText,
+        outputText: entry.outputText,
+      });
+    } else {
+      if (!row) {
+        row = document.createElement("div");
+        row.className = `subagent-timeline-entry subagent-${entry.kind}`;
+        row.dataset.subagentTimelineId = entry.id;
+        const content = document.createElement("div");
+        content.className = entry.kind === "text" ? "md subagent-answer" : "subagent-timeline-text";
+        row.append(content);
+      }
+      const content = row.querySelector<HTMLElement>(entry.kind === "text" ? ".subagent-answer" : ".subagent-timeline-text")!;
+      if (entry.kind === "text") content.innerHTML = renderMarkdown(entry.text, streaming);
+      else content.textContent = entry.text;
+    }
+    timeline.appendChild(row);
+  }
+}
+
+function renderSubagentBody(body: HTMLElement, activity: SubagentActivity): void {
+  let prompt = body.querySelector<HTMLElement>(":scope > .subagent-prompt");
+  let timeline = body.querySelector<HTMLElement>(":scope > .subagent-timeline");
+  let thinking = body.querySelector<HTMLElement>(":scope > .subagent-thinking");
+  let summary = body.querySelector<HTMLElement>(":scope > .subagent-summary");
+  let notice = body.querySelector<HTMLElement>(":scope > .subagent-notice");
+  let tools = body.querySelector<HTMLElement>(":scope > .subagent-tools");
+  if (activity.prompt) {
+    if (!prompt) {
+      prompt = document.createElement("div"); prompt.className = "subagent-prompt";
+      const label = document.createElement("div"); label.className = "subagent-label"; setUiLabel(label, "提示");
+      const content = document.createElement("div"); content.className = "subagent-prompt-text";
+      prompt.append(label, content);
+    }
+    prompt.querySelector<HTMLElement>(".subagent-prompt-text")!.textContent = activity.prompt;
+  } else {
+    prompt?.remove();
+    prompt = null;
+  }
+  if (activity.timeline !== undefined) {
+    if (!timeline) { timeline = document.createElement("div"); timeline.className = "subagent-timeline"; }
+    renderSubagentTimelineEntries(timeline, activity.childSessionId, activity.timeline, activity.status === "running");
+    thinking?.remove();
+    thinking = null;
+    tools?.remove();
+    tools = null;
+  } else {
+    timeline?.remove();
+    timeline = null;
+  }
+  if (activity.timeline === undefined && activity.thinking) {
+    if (!thinking) {
+      thinking = document.createElement("div"); thinking.className = "subagent-thinking";
+      const content = document.createElement("div"); content.className = "subagent-thinking-text";
+      thinking.append(content);
+    }
+    thinking.querySelector<HTMLElement>(".subagent-thinking-text")!.textContent = activity.thinking;
+  } else if (activity.timeline === undefined) {
+    thinking?.remove();
+    thinking = null;
+  }
+  if (activity.summary) {
+    if (!summary) {
+      summary = document.createElement("div"); summary.className = "subagent-summary";
+      const label = document.createElement("div"); label.className = "subagent-label"; setUiLabel(label, "任务摘要");
+      const content = document.createElement("div"); content.className = "subagent-summary-text";
+      summary.append(label, content);
+    }
+    summary.querySelector<HTMLElement>(".subagent-summary-text")!.textContent = activity.summary;
+    body.appendChild(summary);
+  } else {
+    summary?.remove();
+    summary = null;
+  }
+  if (activity.detailsState === "loading") {
+    if (!notice) { notice = document.createElement("div"); notice.className = "subagent-notice"; }
+    notice.textContent = t("正在读取子智能体记录…");
+    body.appendChild(notice);
+  } else if (activity.detailsState === "unavailable") {
+    if (!notice) { notice = document.createElement("div"); notice.className = "subagent-notice"; }
+    notice.textContent = activity.summary
+      ? t("无法读取子智能体命令详情，任务摘要仍可查看。")
+      : t("无法读取子智能体命令详情。可能是旧会话或当前桌面端不支持。");
+    body.appendChild(notice);
+  } else {
+    notice?.remove();
+    notice = null;
+  }
+  if (activity.timeline === undefined && activity.tools?.length) {
+    if (!tools) {
+      tools = document.createElement("div"); tools.className = "subagent-tools";
+      const label = document.createElement("div"); label.className = "subagent-label"; setUiLabel(label, "工具调用");
+      tools.appendChild(label);
+      body.appendChild(tools);
+    }
+    const ids = new Set(activity.tools.map((tool, index) => tool.toolCallId || `snapshot:${index}`));
+    for (const existing of [...tools.querySelectorAll<HTMLElement>(":scope > .subagent-tool")]) {
+      if (!ids.has(existing.dataset.subagentToolId ?? "")) existing.remove();
+    }
+    activity.tools.forEach((tool: SubagentTool, index) => {
+      const toolId = tool.toolCallId || `snapshot:${index}`;
+      let row = [...tools!.querySelectorAll<HTMLElement>(":scope > .subagent-tool")]
+        .find(item => item.dataset.subagentToolId === toolId);
+      if (!row) {
+        row = document.createElement("div");
+        row.className = "subagent-tool tool-call";
+        row.dataset.subagentToolId = toolId;
+        if (tool.toolCallId) row.id = `subagent-tool:${encodeURIComponent(activity.childSessionId)}:${encodeURIComponent(tool.toolCallId)}`;
+        tools!.appendChild(row);
+      }
+      fillToolCallEl(row, {
+        toolName: tool.toolName,
+        status: tool.status,
+        inputText: tool.inputText,
+        outputText: tool.outputText,
+      });
+    });
+  } else if (activity.timeline === undefined) {
+    tools?.remove();
+    tools = null;
+  }
+  for (const section of [prompt, timeline, thinking, tools, summary, notice]) {
+    if (section) body.appendChild(section);
+  }
+  wireCopyButtons(body);
 }
 
 // Presentation grouping only: tool nodes and their IDs remain independent.
@@ -5061,9 +5293,16 @@ async function copyMessage(el: HTMLElement, btn: HTMLButtonElement): Promise<voi
 
 function wireCopyButtons(root: HTMLElement): void {
   root.querySelectorAll<HTMLButtonElement>(".copy-btn").forEach((btn) => {
-    btn.textContent = t("Copy");
+    btn.classList.add("msg-copy");
+    const setCopyLabel = () => {
+      const label = t(btn.dataset.copied === "1" ? "已复制" : "复制");
+      btn.title = label;
+      btn.setAttribute("aria-label", label);
+    };
+    setCopyLabel();
     if (btn.dataset.bound) return;
     btn.dataset.bound = "1";
+    btn.innerHTML = COPY_ICON;
     btn.addEventListener("click", async () => {
       const block = btn.closest(".code-block");
       const code = block?.querySelector("code")?.textContent ?? "";
@@ -5072,10 +5311,15 @@ function wireCopyButtons(root: HTMLElement): void {
       } catch {
         post({ type: "copy", text: code });
       }
-      btn.textContent = t("Copied");
+      btn.dataset.copied = "1";
+      btn.innerHTML = CHECK_ICON;
+      setCopyLabel();
       showToast(t("Copied to clipboard"));
       setTimeout(() => {
-        btn.textContent = t("Copy");
+        if (!btn.isConnected) return;
+        delete btn.dataset.copied;
+        btn.innerHTML = COPY_ICON;
+        setCopyLabel();
       }, 1200);
     });
   });
@@ -5531,14 +5775,17 @@ type HistoryViewItem = {
         inputText?: string;
         outputText?: string;
         fileChange?: FileChange;
+        subagents?: SubagentActivity[];
       }
   >;
   tools?: Array<{
+    toolCallId?: string;
     toolName: string;
     status: string;
     inputText?: string;
     outputText?: string;
     fileChange?: FileChange;
+    subagents?: SubagentActivity[];
   }>;
 };
 
@@ -6149,6 +6396,9 @@ function renderHistory(
     toggle: fold.dataset.userToggle,
     nextQuestion: nextWorkQuestion(fold),
   }]));
+  const subagentChoices = new Map([...messagesEl.querySelectorAll<HTMLElement>(".subagent-activity")]
+    .filter(card => card.dataset.childSessionId)
+    .map(card => [card.dataset.childSessionId!, card.dataset.userToggle]));
   const toolChoices = new Map([...toolChoiceKeys()].map(([key, tool]) => [key, {
     toggle: tool.dataset.userToggle, groupToggle: tool.dataset.groupToggle,
   }]));
@@ -6209,6 +6459,16 @@ function renderHistory(
     tool.dataset.userToggle = toggle;
     tool.classList.toggle("collapsed", toggle !== "open");
     tool.querySelector(".tool-head")?.setAttribute("aria-expanded", String(toggle === "open"));
+  }
+  for (const card of messagesEl.querySelectorAll<HTMLElement>(".subagent-activity")) {
+    const toggle = subagentChoices.get(card.dataset.childSessionId ?? "");
+    if (!toggle) continue;
+    card.dataset.userToggle = toggle;
+    const open = toggle === "open";
+    const head = card.querySelector<HTMLElement>(":scope > .subagent-head");
+    const body = card.querySelector<HTMLElement>(":scope > .subagent-body");
+    if (head) head.setAttribute("aria-expanded", String(open));
+    if (body) body.hidden = !open;
   }
   for (const [key, header] of reasoningChoiceKeys()) {
     const hidden = reasoningChoices.get(key);
@@ -6300,6 +6560,11 @@ function syncQueuedMessages(): void {
 }
 
 function prependHistory(items: HistoryViewItem[], more: boolean): void {
+  const currentEpoch = loadedHistory.find(item => item.logEpoch)?.logEpoch;
+  if (currentEpoch && items.some(item => item.logEpoch && item.logEpoch !== currentEpoch)) {
+    ensureHistoryMore(historyTruncated);
+    return;
+  }
   if (!items.length) {
     historyTruncated = more;
     ensureHistoryMore(more);
@@ -7741,6 +8006,19 @@ window.addEventListener("message", (event) => {
       renderSlashMenu(selected);
       }
       break;
+    case "subagent_details": {
+      if (msg.sessionId !== currentSessionId || typeof msg.parentToolCallId !== "string") break;
+      const activity = msg.activity as SubagentActivity | undefined;
+      if (!activity || typeof activity.childSessionId !== "string" || typeof activity.status !== "string") break;
+      const tool = document.getElementById(`tool-${msg.parentToolCallId}`);
+      if (!tool) break;
+      const activities = readSubagentActivities(tool.dataset.subagents);
+      const index = activities.findIndex(item => item.childSessionId === activity.childSessionId);
+      if (index < 0) break;
+      activities[index] = activity;
+      fillToolCallEl(tool, { subagents: activities });
+      break;
+    }
     case "goal_state": {
       if (holdStreams) break;
       if (msg.sessionId && currentSessionId && msg.sessionId !== currentSessionId) break;

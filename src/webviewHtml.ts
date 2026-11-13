@@ -728,6 +728,25 @@ export function getWebviewHtml(
   .tool-preview { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .tool-body { padding-left: 24px; }
   .tool-status { flex-shrink: 0; }
+  .subagent-list { margin: 6px 0 4px; padding-left: 10px; border-left: 1px solid var(--vscode-panel-border, #444); }
+  .subagent-activity { margin: 4px 0; }
+  .subagent-head { width: 100%; color: var(--z-muted); }
+  .subagent-head:hover { color: var(--vscode-foreground); }
+  .subagent-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .subagent-status { margin-left: auto; flex: 0 0 auto; font-size: 11px; }
+  .subagent-status.running { color: var(--z-accent); }
+  .subagent-status.failed, .subagent-status.cancelled { color: var(--z-danger-text); }
+  .subagent-body { margin: 2px 0 8px 20px; padding: 4px 8px; border-left: 1px solid var(--vscode-panel-border, #444); }
+  .subagent-body[hidden] { display: none; }
+  .subagent-label { margin-top: 6px; color: var(--z-muted); font-size: 11px; font-weight: 600; }
+  .subagent-prompt-text, .subagent-thinking-text, .subagent-summary-text { margin-top: 3px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .subagent-prompt-text { max-height: 180px; overflow: auto; }
+  .subagent-thinking-text, .subagent-reasoning .subagent-timeline-text { max-height: 360px; overflow: auto; }
+  .subagent-answer { line-height: 1.65; overflow-wrap: anywhere; }
+  .subagent-timeline-entry { margin: 6px 0; }
+  .subagent-notice { margin-top: 6px; color: var(--z-muted); }
+  .subagent-tools { margin-top: 6px; }
+  .subagent-tool { margin: 4px 0 !important; }
   .tool-status.completed, .tool-status.success { display: none; }
   .process-head { display: flex; align-items: center; gap: 8px; min-height: 24px; background: none; border: 0; padding: 0; text-align: left; font: inherit; font-size: 12px; line-height: 18px; color: var(--z-muted); cursor: pointer; }
   /* Share the label's line-box center across platform fonts and display scales. */

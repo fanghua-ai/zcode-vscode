@@ -22,7 +22,7 @@ type Kind = "string" | "longString" | "path" | "dataUrl" | "number" | "boolean" 
 export const KNOWN_WEBVIEW_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   "archiveSession", "attachFileUris", "copy", "copyDiagnostics", "copyLog", "deleteSession", "editLast",
   "fileReferenceDetails", "historyRenderTiming", "insert", "installMathFonts", "listSessions", "loadFileChanges",
-  "loadOlder", "loadPreviewFiles", "loadThrough", "newSession", "openCommunity", "openDiff",
+  "loadOlder", "loadPreviewFiles", "loadSubagentDetails", "loadThrough", "newSession", "openCommunity", "openDiff",
   "openFile", "openGitDiff", "openMarkdownFile", "openRecoverySettings", "permissionAnswer",
   "promptDesktopPluginSkill",
   "pickAttachments", "previewImage", "queueDelete", "queueEdit", "queueReorder", "queueSendNow",
@@ -41,7 +41,7 @@ const FIELD_KINDS = {
   attachments: "attachments", imageId: "string", maxImages: "number", attachmentIndex: "number",
   dataUrl: "dataUrl", uris: "fileUris", fileName: "string", language: "string", chrome: "settingsObject",
   defaults: "settingsObject", chromeKey: "string", enabled: "boolean", text: "longString",
-  sessionId: "string", providerId: "string", modelId: "string", restart: "boolean",
+  sessionId: "string", parentToolCallId: "string", childSessionId: "string", providerId: "string", modelId: "string", restart: "boolean",
   includeArchived: "boolean", listVisible: "boolean", loadMore: "boolean", requestId: "string", actionRequestId: "string", optionId: "string",
   mode: "string", planMode: "boolean", recoveryText: "longString", thoughtLevel: "string",
   viewGen: "number", title: "string", commit: "boolean", action: "string", content: "formAnswer",
@@ -171,6 +171,7 @@ const REQUIRED_FIELDS: Readonly<Record<string, readonly (keyof WebviewIn)[]>> = 
   openDiff: ["fileChange"],
   attachFileUris: ["uris", "sessionId"],
   uploadImage: ["dataUrl", "sessionId", "imageId"],
+  loadSubagentDetails: ["sessionId", "parentToolCallId", "childSessionId"],
 };
 
 export type WebviewMessageRejection = { reason: "not-object" | "unknown-type" | "bad-field" | "missing-field"; field?: string };

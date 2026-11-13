@@ -173,6 +173,50 @@ export function listSessionQuestions(sessionId: string): SessionQuestion[] {
   }
 }
 
+/** Read a completed child transcript from the local session store without resuming it. */
+export function loadSubagentMessages(parentSessionId: string, childSessionId: string, limit = 200): unknown[] | undefined {
+  const dbPath = sessionDbPath();
+  if (!parentSessionId || !childSessionId || !fs.existsSync(dbPath)) return undefined;
+  const boundedLimit = Math.max(1, Math.min(200, Math.trunc(limit) || 200));
+  return withDb(dbPath, db => {
+    const child = db.get(
+      "SELECT 1 AS found FROM session WHERE id=? AND parent_id=? AND task_type='subagent_child'",
+      [childSessionId, parentSessionId]
+    ) as { found?: number } | null;
+    if (!child) return undefined;
+    const rows = db.all(
+      `SELECT m.id, m.data AS messageData, m.time_created AS createdAt, p.data AS partData
+       FROM (
+         SELECT id, data, time_created, sequence FROM message WHERE session_id=?
+         ORDER BY COALESCE(sequence,0) DESC, time_created DESC LIMIT ?
+       ) m
+       LEFT JOIN part p ON p.message_id=m.id
+       ORDER BY COALESCE(m.sequence,0), m.time_created, COALESCE(p.sequence,0)`,
+      [childSessionId, boundedLimit]
+    ) as Array<{ id?: unknown; messageData?: unknown; createdAt?: unknown; partData?: unknown }>;
+    const messages = new Map<string, { info: Record<string, unknown>; parts: unknown[] }>();
+    for (const row of rows) {
+      const id = String(row.id ?? "");
+      if (!id) continue;
+      let message = messages.get(id);
+      if (!message) {
+        let info: Record<string, unknown> = {};
+        try {
+          const parsed = JSON.parse(String(row.messageData ?? "{}"));
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) info = parsed as Record<string, unknown>;
+        } catch { continue; }
+        message = { info: { ...info, id, time: info.time ?? { created: row.createdAt } }, parts: [] };
+        messages.set(id, message);
+      }
+      if (typeof row.partData === "string") {
+        try { message.parts.push(JSON.parse(row.partData)); }
+        catch { /* Skip a malformed stored part; keep the rest of this transcript. */ }
+      }
+    }
+    return [...messages.values()];
+  });
+}
+
 function bindArgs(values?: unknown[]): unknown[] {
   return Array.isArray(values) ? values : [];
 }

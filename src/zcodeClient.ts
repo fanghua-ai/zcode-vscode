@@ -9,7 +9,7 @@ import { ChildProcess, spawn } from "child_process";
 import * as fs from "fs";
 import * as readline from "readline";
 import { sameWorkspacePath } from "./workspacePath";
-import { listWorkspacePathVariants, sessionsFinishedSince, persistEmptySessionMode, loadSessionExecutionState, saveSessionRestoreIntent } from "./taskIndex";
+import { listWorkspacePathVariants, sessionsFinishedSince, loadSubagentMessages, persistEmptySessionMode, loadSessionExecutionState, saveSessionRestoreIntent } from "./taskIndex";
 import { logDebug, logError, logInfo, logWarn } from "./log";
 import {
   ResolvedRuntime,
@@ -99,6 +99,35 @@ export interface HistoryWork {
   interrupted?: boolean;
 }
 
+export interface SubagentTool {
+  toolCallId?: string;
+  toolName: string;
+  status: string;
+  inputText?: string;
+  outputText?: string;
+}
+
+export type SubagentTimelineEntry =
+  | { id: string; kind: "reasoning" | "text"; text: string }
+  | ({ id: string; kind: "tool" } & SubagentTool);
+
+export interface SubagentActivity {
+  agentId?: string;
+  childSessionId: string;
+  parentToolCallId: string;
+  agentType?: string;
+  title?: string;
+  status: string;
+  summary?: string;
+  startedAt?: number;
+  endedAt?: number;
+  detailsState?: "idle" | "loading" | "loaded" | "unavailable";
+  prompt?: string;
+  thinking?: string;
+  tools?: SubagentTool[];
+  timeline?: SubagentTimelineEntry[];
+}
+
 export type HistoryStep =
   | { kind: "reasoning"; text: string; partId?: string }
   | { kind: "text"; text: string; partId?: string }
@@ -117,6 +146,7 @@ export type HistoryStep =
       inputText?: string;
       outputText?: string;
       fileChange?: FileChange;
+      subagents?: SubagentActivity[];
     };
 
 export interface HistoryItem {
@@ -142,6 +172,7 @@ export interface HistoryItem {
     inputText?: string;
     outputText?: string;
     fileChange?: FileChange;
+    subagents?: SubagentActivity[];
   }>;
 }
 
@@ -260,6 +291,7 @@ export interface ZCodeEvent {
     | "session_ready"
     | "skill_catalog"
     | "subagent_catalog"
+    | "subagent_details"
     | "session_error"
     | "sync_status"
     | "assistant_text"
@@ -325,6 +357,23 @@ interface HistoryDelivery {
   rows: readonly ConvRow[];
 }
 
+interface SubagentDetailsState extends SubagentActivity {
+  tools: SubagentTool[];
+  timeline: SubagentTimelineEntry[];
+  publishTimer: ReturnType<typeof setTimeout> | null;
+  parentSessionId: string;
+  generation: number;
+  liveToolIds: Set<string>;
+  streamSources: Map<string, "model" | "part">;
+  subscribed: boolean;
+}
+
+interface KnownSubagentRow {
+  activity: SubagentActivity;
+  parentSessionId: string;
+  generation: number;
+}
+
 interface Pending {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
@@ -371,6 +420,11 @@ export class ZCodeClient {
   /** Resume ids whose client deadline passed; the server keeps running them. */
   private lateResumes = new Map<string | number, NodeJS.Timeout>();
   private historyCache: { sessionId: string; items: HistoryItem[] } | null = null;
+  private readonly subagentDetails = new Map<string, SubagentDetailsState>();
+  private readonly knownSubagents = new Map<string, KnownSubagentRow>();
+  private readonly subagentToolOwners = new Map<string, { childSessionId: string; generation: number }>();
+  /** Keep child event streams from being reported as independent background sessions. */
+  private readonly subagentSessionOwners = new Map<string, string>();
   private static readonly historyPage = 200;
   private static readonly startupResumeTimeoutMs = 90_000;
   private static readonly sessionListTimeoutMs = 20_000;
@@ -462,6 +516,7 @@ export class ZCodeClient {
   private replica: ConversationReplica | null = null;
   private pendingConversationFrames: unknown[] | null = null;
   private resyncGeneration: number | null = null;
+  private terminalResyncGeneration: number | null = null;
   private resyncFailures = 0;
   private resyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private projectionTruncated = false;
@@ -1091,6 +1146,10 @@ export class ZCodeClient {
     this.releaseStopWait();
     this.runtimeNeedsRevalidation = true;
     this.sessionGeneration++;
+    for (const state of this.subagentDetails.values()) if (state.publishTimer) clearTimeout(state.publishTimer);
+    this.subagentDetails.clear();
+    this.knownSubagents.clear();
+    this.subagentToolOwners.clear();
     this.snapshotSettingsFresh = false;
     this.snapshotModelFresh = false;
     this.snapshotModelCatalog = undefined;
@@ -1148,6 +1207,10 @@ export class ZCodeClient {
     this.releaseStopWait();
     this.runtimeNeedsRevalidation = true;
     this.sessionGeneration++;
+    for (const state of this.subagentDetails.values()) if (state.publishTimer) clearTimeout(state.publishTimer);
+    this.subagentDetails.clear();
+    this.knownSubagents.clear();
+    this.subagentToolOwners.clear();
     this.snapshotSettingsFresh = false;
     this.snapshotModelFresh = false;
     this.snapshotModelCatalog = undefined;
@@ -1301,6 +1364,8 @@ export class ZCodeClient {
       && !!resumedSnapshot.settings;
     const isCurrent = this.sessionScope();
     let attachedSnapshot: SessionSnapshot | undefined;
+    let reportedModel: { providerId: string; modelId: string } | undefined;
+    let preferredModel: { providerId: string; modelId: string } | undefined;
     try {
       const subscribeStarted = Date.now();
       const sub = ((await this.sendRequest("session/subscribe", {
@@ -1340,23 +1405,45 @@ export class ZCodeClient {
       this.applySnapshotSettings(sub?.snapshot);
       if (sub?.snapshot) this.noteSnapshotCompleteness(sub.snapshot);
       this.noteRevision(sub?.snapshot?.runtime?.stateRevision);
-      const snapModel = extractModel(
+      reportedModel = extractModel(
         sub?.snapshot?.session?.model ||
           sub?.snapshot?.settings?.model?.current ||
           sub?.session?.model
       );
-      const matchesStart = !requestedRuntime?.providerId.includes("start-plan") || (snapModel &&
-        sameDesktopLogin(requestedRuntime, snapModel.providerId) && Object.hasOwn(requestedRuntime.models, snapModel.modelId));
-      if (snapModel && matchesStart) {
-        await this.alignAndEmitModel(snapModel);
+      const startPlanRuntime = requestedRuntime?.providerId.includes("start-plan") ? requestedRuntime : null;
+      const matchesStart = !startPlanRuntime || (reportedModel &&
+        sameDesktopLogin(startPlanRuntime, reportedModel.providerId) && Object.hasOwn(startPlanRuntime.models, reportedModel.modelId));
+      if (reportedModel && requestedRuntime && !startPlanRuntime) {
+        preferredModel = this.newSessionModelPreference(requestedRuntime, reportedModel, attachedSnapshot);
+      }
+      if (reportedModel && matchesStart && !preferredModel) {
+        await this.alignAndEmitModel(reportedModel);
+        if (!isCurrent()) return;
         this.liveModelReady = true;
       }
     } catch (e) {
       logWarn("session/subscribe failed", e);
     }
 
+    const announceTitle = () => this.opts.onEvent({
+      type: "session_title", data: { title: this.lastTitle || "新会话", sessionId: this.sessionId },
+    });
     try {
-      if (kind === "created" && !requestedRuntime?.providerId.includes("start-plan") && !this.liveModelReady && attachedSnapshot?.settings?.model?.available?.length === 0) {
+      if (preferredModel && reportedModel) {
+        // The backend may report its built-in default before loading the
+        // workspace registry. Index the new identity before selecting a model.
+        announceTitle();
+        const runtime = await this.opts.resolveSessionRuntime?.(preferredModel);
+        if (!isCurrent()) return;
+        if (runtime) {
+          this.setSessionRuntime(runtime);
+          await this.setModel(preferredModel.providerId, preferredModel.modelId);
+        } else {
+          await this.alignAndEmitModel(reportedModel);
+          if (!isCurrent()) return;
+          this.liveModelReady = true;
+        }
+      } else if (kind === "created" && !requestedRuntime?.providerId.includes("start-plan") && !this.liveModelReady && attachedSnapshot?.settings?.model?.available?.length === 0) {
         // Announce the created identity first: the host persists its workspace
         // metadata on session_ready. Configuring a shell before that can make
         // even valid providers appear absent from the workspace registry.
@@ -1386,10 +1473,7 @@ export class ZCodeClient {
     if (hasNewDefaults) {
       // Index the identity before applying explicit defaults. Cold workspaces
       // can populate their model registry only after the host persists it.
-      this.opts.onEvent({
-        type: "session_title",
-        data: { title: this.lastTitle, sessionId: this.sessionId },
-      });
+      if (!preferredModel) announceTitle();
       if (!this.liveModelReady) {
         try { await this.ensureSessionModel(); }
         catch (error) {
@@ -1406,10 +1490,7 @@ export class ZCodeClient {
       data: { sessionId: this.sessionId, kind, title: this.lastTitle, slashCommands: this.slashCommands },
     });
     if (!hasNewDefaults) {
-      this.opts.onEvent({
-        type: "session_title",
-        data: { title: this.lastTitle, sessionId: this.sessionId },
-      });
+      if (!preferredModel) announceTitle();
       if (kind === "created" && !this.liveModelReady) {
         // session_title has now let the host index this identity. Resolve the
         // advertised/CLI default here so reasoning controls are ready on return.
@@ -1426,6 +1507,29 @@ export class ZCodeClient {
     this.startPlanQuota();
     this.refreshSkillCatalog();
     this.refreshSubagentCatalog();
+  }
+
+  private newSessionModelPreference(
+    runtime: ResolvedRuntime,
+    reported: { providerId: string; modelId: string },
+    snapshot?: SessionSnapshot,
+  ): { providerId: string; modelId: string } | undefined {
+    if (!this.opts.resolveSessionRuntime || !Array.isArray(snapshot?.settings?.model?.available)) return;
+    if (reported.modelId === runtime.modelId && sameDesktopLogin(runtime, reported.providerId)) return;
+    const { available } = modelsFromSnapshot(snapshot);
+    const requested = available.find(model => !model.disabledReason &&
+      model.modelId === runtime.modelId && sameDesktopLogin(runtime, model.providerId));
+    if (requested) return requested;
+    // A cold snapshot can contain only the built-in account placeholder,
+    // even when the workspace accepts a configured API model after indexing.
+    if (runtime.source.endsWith("-oauth") || (available.length && !isDesktopOauthProvider(reported.providerId))) return;
+    const configured = !isDesktopOauthProvider(runtime.providerId) && Object.hasOwn(runtime.models, runtime.modelId)
+      ? { providerId: runtime.providerId, modelId: runtime.modelId }
+      : (this.opts.readDefaultModel ?? (() => readConfiguredDefaultModel(runtime, this.opts.binaryPath)))();
+    if (configured && !isDesktopOauthProvider(configured.providerId) && !sameSessionModel(configured, reported) &&
+        !available.some(model => model.disabledReason && sameSessionModel(model, configured))) {
+      return configured;
+    }
   }
 
   private async applyNewSessionDefaults(defaults: NewSessionDefaults): Promise<void> {
@@ -1670,9 +1774,11 @@ export class ZCodeClient {
     const sessionId = this.sessionId;
     const generation = this.sessionGeneration;
     if (!sessionId) return { items: [], more: false };
-    const beforeRowId = this.historyRowIds.get(oldestId);
-    if (beforeRowId !== undefined && this.replica) {
-      const epoch = this.replica.logEpoch;
+    const replica = this.replica;
+    if (replica && replica.seq !== null && replica.topic === `conversation/${sessionId}`) {
+      const epoch = replica.logEpoch;
+      const beforeRowId = this.historyRowIds.get(oldestId);
+      if (beforeRowId === undefined) throw new LocalizedError("会话历史已更新，请重新加载更早的消息。");
       let before = beforeRowId;
       let more = false;
       let items: HistoryItem[] = [];
@@ -1680,7 +1786,10 @@ export class ZCodeClient {
         const result = await this.sendRequest("v4/conversation/rowsRange", {
           sessionId, clientMode: "desktop-continuous", beforeRowId: before, limit: 200,
         }) as { rows: unknown[]; hasMore: boolean; atLogEpoch: string };
-        if (this.sessionId !== sessionId || this.sessionGeneration !== generation || result.atLogEpoch !== epoch) return { items: [], more: false };
+        if (this.sessionId !== sessionId || this.sessionGeneration !== generation) return { items: [], more: false };
+        if (this.replica !== replica || replica.logEpoch !== epoch || result.atLogEpoch !== epoch) {
+          throw new LocalizedError("会话历史已更新，请重新加载更早的消息。");
+        }
         const rows = result.rows.map(slimRow).filter((row): row is ConvRow => row !== null);
         items = [...this.projectionHistory(rows), ...items];
         more = result.hasMore;
@@ -1708,6 +1817,189 @@ export class ZCodeClient {
       if (at >= 0 && at < end) start = at;
     }
     return { items: all.slice(start, end), more: start > 0 };
+  }
+
+  async loadSubagentDetails(parentToolCallId: string, childSessionId: string): Promise<void> {
+    const parentSessionId = this.sessionId;
+    if (!parentSessionId || !parentToolCallId || !childSessionId) return;
+    const generation = this.sessionGeneration;
+    const known = this.knownSubagents.get(childSessionId);
+    if (!known || known.parentSessionId !== parentSessionId || known.generation !== generation
+        || known.activity.parentToolCallId !== parentToolCallId) return;
+
+    const existing = this.subagentDetails.get(childSessionId);
+    if (existing?.parentSessionId === parentSessionId && existing.generation === generation) {
+      if (existing.detailsState === "loading" || existing.detailsState === "loaded") {
+        this.publishSubagentDetails(existing);
+        return;
+      }
+    }
+    if (existing?.publishTimer) clearTimeout(existing.publishTimer);
+    const state: SubagentDetailsState = {
+      ...known.activity,
+      parentSessionId,
+      generation,
+      detailsState: "loading",
+      tools: existing?.tools ?? [],
+      thinking: existing?.thinking,
+      timeline: existing?.timeline ?? [],
+      publishTimer: null,
+      liveToolIds: existing?.liveToolIds ?? new Set(),
+      streamSources: existing?.streamSources ?? new Map(),
+      subscribed: existing?.subscribed ?? false,
+    };
+    this.subagentDetails.set(childSessionId, state);
+    this.subagentSessionOwners.set(childSessionId, parentSessionId);
+    this.publishSubagentDetails(state);
+
+    const isCurrent = () => !this.disposed && this.sessionId === parentSessionId
+      && this.sessionGeneration === generation && this.subagentDetails.get(childSessionId) === state;
+    try {
+      // Child sessions are already active while their Agent call is running.
+      // Subscribe before reading the transcript so later tool updates are not missed.
+      if (state.status === "running" && !state.subscribed) {
+        try {
+          await this.sendRequest("session/subscribe", {
+            sessionId: childSessionId,
+            deliveryKind: "desktop-continuous",
+            includeSnapshot: false,
+          }, 10000);
+          state.subscribed = true;
+        } catch (error) {
+          logDebug("Could not subscribe to subagent updates", userFacingError(error));
+        }
+      }
+      if (!isCurrent()) return;
+      let pageItems: HistoryItem[] | undefined;
+      // Active child sessions can expose their live message view. Completed
+      // children are no longer active app-server sessions, so read their
+      // persisted transcript directly instead of trying to resume them.
+      if (state.status === "running") {
+        try { pageItems = (await this.fetchMessages(200, childSessionId)).items; }
+        catch (error) { logDebug("Could not read live subagent transcript", userFacingError(error)); }
+      }
+      if (!pageItems) {
+        try {
+          const stored = loadSubagentMessages(parentSessionId, childSessionId, 200);
+          if (stored) pageItems = stored
+            .map(item => this.normalizeHistoryItem(item, childSessionId))
+            .filter((item): item is HistoryItem => item !== null);
+        } catch (error) {
+          logDebug("Could not read persisted subagent transcript", userFacingError(error));
+        }
+      }
+      if (!pageItems) pageItems = (await this.fetchMessages(200, childSessionId)).items;
+      if (!isCurrent()) return;
+      const userPrompt = pageItems.find(item => item.role === "user" && item.text.trim())?.text;
+      if (userPrompt) state.prompt = userPrompt;
+      const thinking = pageItems.flatMap(item => {
+        if (item.role !== "assistant") return [];
+        const text = item.work?.text?.trim()
+          || item.steps?.filter(step => step.kind === "reasoning").map(step => step.text).join("\n\n").trim();
+        return text ? [text] : [];
+      }).join("\n\n");
+      if (thinking) state.thinking = thinking;
+      const snapshotTimeline: SubagentTimelineEntry[] = [];
+      for (const [itemIndex, item] of pageItems.entries()) {
+        if (item.role !== "assistant") continue;
+        const fallbackSteps: HistoryStep[] = item.steps?.length ? item.steps : [
+          ...(item.work?.text ? [{ kind: "reasoning" as const, text: item.work.text }] : []),
+          ...item.tools.map(tool => ({ kind: "tool" as const, ...tool })),
+        ];
+        fallbackSteps.forEach((step, stepIndex) => {
+          if (step.kind === "reasoning" || step.kind === "text") {
+            if (step.text.trim()) snapshotTimeline.push({
+              id: `${step.kind}:${step.partId ?? `${item.id ?? itemIndex}:${stepIndex}`}`,
+              kind: step.kind,
+              text: step.text,
+            });
+          } else if (step.kind === "tool") {
+            snapshotTimeline.push({
+              id: `tool:${step.toolCallId ?? `${item.id ?? itemIndex}:${stepIndex}`}`,
+              kind: "tool",
+              toolCallId: step.toolCallId,
+              toolName: step.toolName,
+              status: step.status,
+              inputText: step.inputText,
+              outputText: step.outputText,
+            });
+          }
+        });
+      }
+      const snapshotTools = pageItems.flatMap(item => item.role === "assistant" ? item.tools : []);
+      const toolsById = new Map(state.tools.map((tool, index) => [tool.toolCallId || `snapshot:${index}`, tool]));
+      snapshotTools.forEach((tool, index) => {
+        const key = tool.toolCallId || `snapshot:${index}`;
+        if (tool.toolCallId && state.liveToolIds.has(tool.toolCallId)) return;
+        const previous = toolsById.get(key);
+        if (previous && isTerminalToolStatus(previous.status) && !isTerminalToolStatus(tool.status)) return;
+        toolsById.set(key, {
+          toolCallId: tool.toolCallId,
+          toolName: tool.toolName,
+          status: tool.status,
+          inputText: tool.inputText,
+          outputText: tool.outputText,
+        });
+      });
+      state.tools = [...toolsById.values()];
+      const liveToolsById = new Map(state.tools
+        .filter((tool): tool is SubagentTool & { toolCallId: string } => !!tool.toolCallId && state.liveToolIds.has(tool.toolCallId))
+        .map(tool => [tool.toolCallId, tool]));
+      const liveTextById = new Map(state.timeline
+        .filter((entry): entry is Extract<SubagentTimelineEntry, { kind: "reasoning" | "text" }> => entry.kind !== "tool")
+        .map(entry => [entry.id, entry]));
+      state.timeline = snapshotTimeline.map(entry => {
+        if (entry.kind === "tool") {
+          const live = entry.toolCallId ? liveToolsById.get(entry.toolCallId) : undefined;
+          return live ? { ...entry, ...live } : entry;
+        }
+        const live = liveTextById.get(entry.id);
+        return live ? { ...entry, text: mergeSubagentStreamedText(entry.text, live.text) } : entry;
+      });
+      const timelineEntryIds = new Set(state.timeline.map(entry => entry.id));
+      for (const entry of liveTextById.values()) {
+        if (!timelineEntryIds.has(entry.id)) state.timeline.push(entry);
+      }
+      const timelineToolIds = new Set(state.timeline.flatMap(entry => entry.kind === "tool" && entry.toolCallId ? [entry.toolCallId] : []));
+      for (const tool of liveToolsById.values()) {
+        if (!timelineToolIds.has(tool.toolCallId)) state.timeline.push({ id: `tool:${tool.toolCallId}`, kind: "tool", ...tool });
+      }
+      state.detailsState = "loaded";
+      this.publishSubagentDetails(state);
+    } catch (error) {
+      if (!isCurrent()) return;
+      state.detailsState = state.timeline.length || state.tools.length ? "loaded" : "unavailable";
+      logDebug("Could not read subagent transcript", userFacingError(error));
+      this.publishSubagentDetails(state);
+    }
+  }
+
+  private publishSubagentDetails(state: SubagentDetailsState): void {
+    if (state.publishTimer) clearTimeout(state.publishTimer);
+    state.publishTimer = null;
+    if (this.sessionId !== state.parentSessionId || state.generation !== this.sessionGeneration
+        || this.subagentDetails.get(state.childSessionId) !== state) return;
+    const {
+      parentSessionId,
+      generation: _generation,
+      liveToolIds: _liveToolIds,
+      streamSources: _streamSources,
+      subscribed: _subscribed,
+      publishTimer: _publishTimer,
+      ...activity
+    } = state;
+    this.opts.onEvent({
+      type: "subagent_details",
+      data: { sessionId: parentSessionId, parentToolCallId: activity.parentToolCallId, activity },
+    });
+  }
+
+  private scheduleSubagentDetailsPublish(state: SubagentDetailsState): void {
+    if (state.publishTimer) return;
+    state.publishTimer = setTimeout(() => {
+      state.publishTimer = null;
+      this.publishSubagentDetails(state);
+    }, 50);
   }
 
   private async fetchMessages(
@@ -1945,6 +2237,7 @@ export class ZCodeClient {
     const replica = this.replica;
     if (!replica) return;
     const previous = replica.rows;
+    const previousEpoch = replica.logEpoch;
     const previousGoalChecks = replica.goal?.verifications.length ?? 0;
     const result = replica.receive(logical);
     if (result === "resync") {
@@ -1953,6 +2246,7 @@ export class ZCodeClient {
     }
     if (result !== "applied") return;
     for (const patch of usagePatchesInFrame(logical)) this.emitContextUsage(patch);
+    if (previousEpoch !== replica.logEpoch) this.historyRowIds.clear();
     this.conversationRows = replica.rows;
     this.lastLogEpoch = replica.logEpoch;
     this.conversationRevision = replica.revision ?? null;
@@ -1997,6 +2291,11 @@ export class ZCodeClient {
       return !old || old.marker?.fromProvider !== row.marker.fromProvider || old.marker?.fromModel !== row.marker.fromModel
         || old.marker?.toProvider !== row.marker.toProvider || old.marker?.toModel !== row.marker.toModel;
     });
+    const subagentChanged = replica.rows.some(row => {
+      if (row.kind !== "subagent") return false;
+      const old = previous.find(item => item.rowId === row.rowId);
+      return !old || JSON.stringify(old) !== JSON.stringify(row);
+    }) || previous.some(row => row.kind === "subagent" && !replica.rows.some(next => next.rowId === row.rowId));
     // The completion header can arrive after its reasoning and answer rows.
     // Redraw then so a work fold does not stay on its generic label.
     const turnHeaderChanged = replica.rows.some(row => {
@@ -2007,7 +2306,7 @@ export class ZCodeClient {
     });
     // Structural corrections replace the transcript; ordinary streamed text
     // updates exactly one stable row without rebuilding the view.
-    if (snapshot || finishedGoalMarker || compactMarkerChanged || modelMarkerChanged || turnHeaderChanged || goalCheckRecorded || previous.some(row => !replica.rows.some(next => next.rowId === row.rowId)) ||
+    if (snapshot || finishedGoalMarker || compactMarkerChanged || modelMarkerChanged || subagentChanged || turnHeaderChanged || goalCheckRecorded || previous.some(row => !replica.rows.some(next => next.rowId === row.rowId)) ||
         replica.rows.some(row => row.kind === "userInput" && !previous.some(old => old.rowId === row.rowId))) {
       this.publishTranscript();
       this.publishProjectionStatus(true);
@@ -2081,7 +2380,34 @@ export class ZCodeClient {
 
   private projectionHistory(rows = this.conversationRows): HistoryItem[] {
     const items: HistoryItem[] = [];
-    const turnHeaders = new Map([...this.conversationRows, ...rows].filter(row => row.kind === "turnHeader" && row.turnId).map(row => [row.turnId, row]));
+    const allRows = [...new Map([...this.conversationRows, ...rows].map(row => [row.rowId, row])).values()];
+    const currentRows = new Map(this.conversationRows.map(row => [row.rowId, row]));
+    const turnHeaders = new Map(allRows.filter(row => row.kind === "turnHeader" && row.turnId).map(row => [row.turnId, row]));
+    const subagentsByToolCall = new Map<string, SubagentActivity[]>();
+    for (const row of allRows) {
+      if (row.kind !== "subagent" || !row.parentToolCallId || !row.childSessionId) continue;
+      const currentRow = currentRows.get(row.rowId);
+      const activityFromRow = subagentActivityFromRow(currentRow?.childSessionId === row.childSessionId ? currentRow : row);
+      if (this.sessionId) this.knownSubagents.set(row.childSessionId, {
+        activity: activityFromRow,
+        parentSessionId: this.sessionId,
+        generation: this.sessionGeneration,
+      });
+      const cached = this.subagentDetails.get(row.childSessionId);
+      const activity: SubagentActivity = {
+        ...activityFromRow,
+        ...(cached?.parentSessionId === this.sessionId && cached.generation === this.sessionGeneration ? {
+          detailsState: cached.detailsState,
+          prompt: cached.prompt,
+          thinking: cached.thinking,
+          tools: cached.tools,
+          timeline: cached.timeline,
+        } : { detailsState: "idle" as const }),
+      };
+      const list = subagentsByToolCall.get(row.parentToolCallId) ?? [];
+      list.push(activity);
+      subagentsByToolCall.set(row.parentToolCallId, list);
+    }
     for (const row of rows) {
       const header = turnHeaders.get(row.turnId);
       const workDurationMs = header?.activeMs ?? (header?.startedAt !== undefined && header.endedAt !== undefined
@@ -2181,9 +2507,11 @@ export class ZCodeClient {
         items.push({ id, role: "assistant", text: "", ...timing, running: false, tools: [], steps: [modelStep] });
       } else if (row.kind === "toolCall") {
         const inputText = row.inputText || (row.input ? JSON.stringify(row.input) : "");
+        const subagents = row.toolCallId ? subagentsByToolCall.get(row.toolCallId) : undefined;
         const tool = { toolCallId: row.toolCallId, toolName: row.toolName ?? "Tool",
           status: mapToolStatus(row.status ?? "running"), inputText, outputText: row.output?.text,
-          fileChange: parseFileChange(row.toolName ?? "", row.input) ?? undefined };
+          fileChange: parseFileChange(row.toolName ?? "", row.input) ?? undefined,
+          ...(subagents?.length ? { subagents } : {}) };
         items.push({ id, role: "assistant", text: "", ...timing,
           running: active === false ? false : header ? header.state === "running" : tool.status === "running",
           tools: [tool], steps: [{ kind: "tool", ...tool }] });
@@ -2270,10 +2598,16 @@ export class ZCodeClient {
     this.resyncFailures = 0;
   }
 
-  private async resyncConversation(): Promise<void> {
+  private async resyncConversation(afterTurn = false): Promise<void> {
     const gen = this.conversationGen;
     const replica = this.replica;
-    if (this.disposed || !replica || this.resyncGeneration === gen || this.snapshotWait || this.resyncRetryTimer) return;
+    if (this.disposed || !replica) return;
+    if (this.resyncGeneration === gen) {
+      if (afterTurn) this.terminalResyncGeneration = gen;
+      return;
+    }
+    if (this.snapshotWait || this.resyncRetryTimer) return;
+    this.terminalResyncGeneration = null;
     this.resyncGeneration = gen;
     this.opts.onEvent({type: "sync_status", data: {sessionId: this.sessionId, active: true}});
     const wait = this.expectSnapshot();
@@ -2299,7 +2633,15 @@ export class ZCodeClient {
       logWarn("conversation resync failed", e);
     } finally {
       if (this.resyncGeneration === gen) this.resyncGeneration = null;
-      if (gen === this.conversationGen && !this.disposed) this.opts.onEvent({type: "sync_status", data: {sessionId: this.sessionId, active: false}});
+      if (gen === this.conversationGen && !this.disposed) {
+        // A turn can finish, or another frame can go missing, after the server
+        // prepared the snapshot for this request.
+        if (!this.resyncRetryTimer && (replica.needsSnapshot || this.terminalResyncGeneration === gen)) {
+          void this.resyncConversation();
+        } else {
+          this.opts.onEvent({type: "sync_status", data: {sessionId: this.sessionId, active: false}});
+        }
+      }
     }
   }
 
@@ -2403,10 +2745,10 @@ export class ZCodeClient {
       this.conversationSubId = result.ack?.subscriptionId ?? "";
       if (!this.conversationSubId) throw new LocalizedError("会话订阅未返回 subscriptionId");
       this.replica = new ConversationReplica(nextTopic, this.conversationSubId);
+      if (result.ack?.logEpoch) this.lastLogEpoch = result.ack.logEpoch;
       const frames = this.pendingConversationFrames ?? [];
       this.pendingConversationFrames = null;
       for (const frame of frames) this.handleConversationFrame(frame);
-      if (result.ack?.logEpoch) this.lastLogEpoch = result.ack.logEpoch;
       await wait;
       this.activeTiming?.add("conversationSubscribe", Date.now() - subscribeStarted);
       if (gen !== this.conversationGen) return;
@@ -2621,7 +2963,7 @@ export class ZCodeClient {
     let staleAttempts = 0;
     const retryModelSwitchWithTargetThought = async (error: unknown): Promise<boolean> => {
       const message = error instanceof Error ? error.message : String(error);
-      if (retriedWithTargetThought || !/reasoning level is required|unsupported reasoning effort/i.test(message)) {
+      if (retriedWithTargetThought || !/reasoning level is required|unsupported reasoning effort|reasoning effort .* is not supported/i.test(message)) {
         return false;
       }
       // Some app-server versions can apply the new model before rejecting an
@@ -2632,14 +2974,20 @@ export class ZCodeClient {
       const activeModel = extractModel(snapshot?.settings?.model?.current)
         || extractModel(snapshot?.session?.model)
         || extractModel(snapshot?.settings?.model?.lastUsed);
-      if (!activeModel || activeModel.providerId !== providerId || activeModel.modelId !== modelId) return false;
+      if (!activeModel || activeModel.providerId !== providerId || activeModel.modelId !== modelId) {
+        if (!thought || !/unsupported reasoning effort|reasoning effort .* is not supported/i.test(message)) return false;
+        // The wire field is required. An empty string selects the target default.
+        thought = "";
+        retriedWithTargetThought = true;
+        return true;
+      }
       const levelSettings = snapshot?.settings?.thoughtLevel;
       const supported = (levelSettings?.available ?? [])
         .map(level => String(level.value ?? "").trim())
         .filter(Boolean);
-      if (!supported.length) return false;
+      if (!supported.length && !thought) return false;
       thought = [levelSettings?.current, levelSettings?.defaultLevel, ...supported]
-        .find(level => typeof level === "string" && supported.includes(level))!;
+        .find(level => typeof level === "string" && supported.includes(level)) ?? "";
       retriedWithTargetThought = true;
       this.applySnapshotSettings(snapshot);
       logWarn("Retrying model switch with a reasoning level supported by the target model", {
@@ -3363,7 +3711,10 @@ export class ZCodeClient {
       await this.awaitStartupLogin();
       if (this.disposed) return;
       const cached = this.reusableRuntime({ providerId });
-      const held = cached?.apiKeyId ? null : cached;
+      // Start Plan uses the desktop JWT, which can rotate or disappear
+      // independently of the runtime kept for the currently open chat.
+      const isStartPlan = /^(?:account|builtin):(?:bigmodel|zai)-start-plan$/.test(providerId);
+      const held = isStartPlan || cached?.apiKeyId ? null : cached;
       timing?.addCount(held ? "runtimeHeadersCacheHits" : "runtimeHeadersCacheMisses");
       const stale = [this.sessionRuntime, this.defaultRuntime].find(
         runtime => runtime && sameDesktopLogin(runtime, providerId) && this.isRejectedAuth(runtime.apiKey)
@@ -3739,10 +4090,17 @@ export class ZCodeClient {
         kind?: string;
         partId?: string;
         assistantMessageId?: string;
+        messageId?: string;
+        field?: string;
         delta?: string;
         title?: string;
         toolName?: string;
         toolCallId?: string;
+        parentToolCallId?: string;
+        childToolCallId?: string;
+        childSessionId?: string;
+        agentId?: string;
+        source?: string;
         input?: unknown;
         status?: string;
         message?: string;
@@ -3767,22 +4125,39 @@ export class ZCodeClient {
       }
       if (id) this.turnAuth.delete(id);
     }
-    if (p.type === "model.streaming" && p.payload?.kind !== "tool_call") return;
+    // Parent sessions use the conversation projection for text, but an
+    // expanded child has no parent projection to drive its live transcript.
+    // Let its streamed text and reasoning reach the child-specific handler.
+    if (p.type === "model.streaming" && p.payload?.kind !== "tool_call"
+        && !(p.sessionId && this.subagentDetails.has(p.sessionId))) return;
     if (p.sessionId === this.sessionId && this.projectionPhase() && (p.type === "turn.started" || p.type === "turn.completed" || p.type === "turn.failed")) {
-      if (p.type !== "turn.started") void this.resyncConversation();
+      if (p.type !== "turn.started") void this.resyncConversation(true);
       return;
     }
-    if (!replay) this.noteSessionTurn(p.sessionId, p.type);
+    const childSession = p.sessionId ? this.subagentDetails.get(p.sessionId) : undefined;
+    const childOwner = p.sessionId ? this.subagentSessionOwners.get(p.sessionId) : undefined;
+    if (!replay && !childSession && !childOwner) this.noteSessionTurn(p.sessionId, p.type);
     if (!this.acceptLive) {
       if (p.sessionId) this.heldSessionEvents.push(params);
       return;
     }
-    if (p.sessionId && this.sessionId && p.sessionId !== this.sessionId) return;
+    if (p.sessionId && this.sessionId && p.sessionId !== this.sessionId) {
+      const child = childSession;
+      if (child?.parentSessionId === this.sessionId && child.generation === this.sessionGeneration) {
+        this.handleSubagentSessionEvent(p, child);
+      }
+      if (childOwner && (p.type === "turn.completed" || p.type === "turn.failed")) {
+        this.subagentSessionOwners.delete(p.sessionId);
+      }
+      return;
+    }
 
     if (p.type === "model.streaming") {
       // Scheduled events may omit input already delivered by this stream.
       if (p.payload?.toolCallId && p.payload.input !== undefined) {
-        this.emitToolCall(normalizeToolUpdated({ ...p.payload, kind: "scheduled" }));
+        if (!this.routeSubagentToolEvent(p.payload, "scheduled")) {
+          this.emitToolCall(normalizeToolUpdated({ ...p.payload, kind: "scheduled" }));
+        }
       }
       return;
     }
@@ -3807,7 +4182,7 @@ export class ZCodeClient {
       });
       void this.refreshPlanQuota();
       // Reconcile the final text even when a final fragmented frame had no successor to expose a gap.
-      void this.resyncConversation();
+      void this.resyncConversation(true);
     } else if (p.type === "turn.failed") {
       const payload = p.payload;
       const message =
@@ -3828,8 +4203,144 @@ export class ZCodeClient {
         data: { title: p.payload.title, sessionId: this.sessionId },
       });
     } else if (p.type === "tool.updated") {
-      this.emitToolCall(normalizeToolUpdated(p.payload));
+      if (!this.routeSubagentToolEvent(p.payload)) this.emitToolCall(normalizeToolUpdated(p.payload));
     }
+  }
+
+  private handleSubagentSessionEvent(
+    event: { type?: string; sessionId?: string; payload?: {
+      kind?: string;
+      toolCallId?: string;
+      parentToolCallId?: string;
+      childToolCallId?: string;
+      childSessionId?: string;
+      agentId?: string;
+      source?: string;
+      toolName?: string;
+      assistantMessageId?: string;
+      partId?: string;
+      messageId?: string;
+      field?: string;
+      delta?: string;
+    } },
+    state: SubagentDetailsState
+  ): void {
+    if (event.payload?.parentToolCallId && event.payload.parentToolCallId !== state.parentToolCallId) return;
+    if (event.payload?.childSessionId && event.payload.childSessionId !== state.childSessionId) return;
+    if (event.payload?.agentId && state.agentId && event.payload.agentId !== state.agentId) return;
+    if (event.type === "turn.started") {
+      state.status = "running";
+      state.startedAt ??= Date.now();
+      state.endedAt = undefined;
+      this.publishSubagentDetails(state);
+      return;
+    }
+    if (event.type === "turn.completed" || event.type === "turn.failed") {
+      state.status = event.type === "turn.completed" ? "completed" : "failed";
+      state.endedAt = Date.now();
+      this.publishSubagentDetails(state);
+      return;
+    }
+    const streamKind = event.type === "model.streaming" ? event.payload?.kind : undefined;
+    const partField = event.type === "part.delta" ? event.payload?.field : undefined;
+    const partDelta = event.type === "part.delta" && (partField === "reasoning" || partField === "text");
+    if (streamKind === "reasoning_start" || streamKind === "reasoning_delta"
+        || streamKind === "text_start" || streamKind === "text_delta" || partDelta) {
+      const kind: "reasoning" | "text" = partDelta
+        ? partField as "reasoning" | "text"
+        : streamKind!.startsWith("reasoning") ? "reasoning" : "text";
+      const partKey = event.payload?.partId ?? event.payload?.assistantMessageId ?? event.payload?.messageId ?? "stream";
+      const id = `${kind}:${partKey}`;
+      const source = partDelta ? "part" : "model";
+      const previousSource = state.streamSources.get(id);
+      if (previousSource && previousSource !== source) return;
+      state.streamSources.set(id, source);
+      const index = state.timeline.findIndex(entry => entry.id === id);
+      const previous = index >= 0 ? state.timeline[index] : undefined;
+      const delta = partDelta || streamKind!.endsWith("_delta") ? event.payload?.delta ?? "" : "";
+      const next: SubagentTimelineEntry = {
+        id,
+        kind,
+        text: previous?.kind === kind ? previous.text + delta : delta,
+      };
+      if (index < 0) state.timeline.push(next);
+      else state.timeline[index] = next;
+      state.detailsState = "loaded";
+      this.scheduleSubagentDetailsPublish(state);
+      return;
+    }
+    if (event.type !== "tool.updated" && !(event.type === "model.streaming" && streamKind === "tool_call")) return;
+    const tool = normalizeToolUpdated({
+      ...event.payload,
+      toolCallId: event.payload?.childToolCallId ?? event.payload?.toolCallId,
+    });
+    if (!tool.toolCallId) return;
+    const index = state.tools.findIndex(item => item.toolCallId === tool.toolCallId);
+    const next: SubagentTool = {
+      toolCallId: tool.toolCallId,
+      toolName: tool.toolName || state.tools[index]?.toolName || "tool",
+      status: tool.status,
+      inputText: tool.inputText || state.tools[index]?.inputText,
+      outputText: tool.outputText || state.tools[index]?.outputText,
+    };
+    if (index < 0) state.tools.push(next);
+    else state.tools[index] = next;
+    const timelineEntry: SubagentTimelineEntry = { id: `tool:${tool.toolCallId}`, kind: "tool", ...next };
+    const timelineIndex = state.timeline.findIndex(entry => entry.kind === "tool" && entry.toolCallId === tool.toolCallId);
+    if (timelineIndex < 0) state.timeline.push(timelineEntry);
+    else state.timeline[timelineIndex] = timelineEntry;
+    state.liveToolIds.add(tool.toolCallId);
+    state.detailsState = "loaded";
+    this.publishSubagentDetails(state);
+  }
+
+  /** Subagent tool events can be echoed on the parent session stream. Keep them
+   * out of the main transcript and attach them to the matching child when its
+   * details are open. If the child is not open yet, its transcript read will
+   * supply the missed event when the user expands it. */
+  private routeSubagentToolEvent(raw: unknown, fallbackKind?: string): boolean {
+    if (!raw || typeof raw !== "object") return false;
+    const event = raw as {
+      kind?: string;
+      source?: string;
+      toolCallId?: string;
+      childToolCallId?: string;
+      toolName?: string;
+      parentToolCallId?: string;
+      childSessionId?: string;
+      agentId?: string;
+    };
+    const toolCallId = event.childToolCallId ?? event.toolCallId;
+    const rememberedOwner = toolCallId ? this.subagentToolOwners.get(toolCallId) : undefined;
+    const isSubagent = event.source === "subagent" || !!event.childToolCallId || !!event.childSessionId
+      || !!event.parentToolCallId
+      || rememberedOwner?.generation === this.sessionGeneration;
+    if (!isSubagent) return false;
+
+    const candidates = [...this.knownSubagents.entries()].filter(([childSessionId, known]) =>
+      known.parentSessionId === this.sessionId && known.generation === this.sessionGeneration
+      && (!rememberedOwner || childSessionId === rememberedOwner.childSessionId)
+      && (!event.childSessionId || childSessionId === event.childSessionId)
+      && (!event.parentToolCallId || known.activity.parentToolCallId === event.parentToolCallId)
+      && (!event.agentId || known.activity.agentId === event.agentId));
+    if (candidates.length === 1) {
+      const [childSessionId, known] = candidates[0];
+      if (toolCallId) this.subagentToolOwners.set(toolCallId, { childSessionId, generation: this.sessionGeneration });
+      const state = this.subagentDetails.get(childSessionId);
+      if (state && state.parentSessionId === this.sessionId && state.generation === this.sessionGeneration
+          && state.parentToolCallId === known.activity.parentToolCallId) {
+        this.handleSubagentSessionEvent({
+          type: "tool.updated",
+          sessionId: childSessionId,
+          payload: {
+            ...event,
+            kind: event.kind ?? fallbackKind,
+            toolCallId: event.childToolCallId ?? event.toolCallId,
+          },
+        }, state);
+      }
+    }
+    return true;
   }
 
   private beginAssistantSegment(): void {
@@ -3880,6 +4391,7 @@ export class ZCodeClient {
           });
           break;
         case "toolCall": {
+          if (this.routeSubagentToolEvent(row)) break;
           this.emitToolCall(normalizeToolRow(row));
           break;
         }
@@ -3955,6 +4467,11 @@ export class ZCodeClient {
     }
     this.pending.clear();
     this.turnAuth.clear();
+    for (const state of this.subagentDetails.values()) if (state.publishTimer) clearTimeout(state.publishTimer);
+    this.subagentDetails.clear();
+    this.knownSubagents.clear();
+    this.subagentToolOwners.clear();
+    this.subagentSessionOwners.clear();
     this.providersNeedingAuthRefresh.clear();
     this.clearLateResumes();
     this.rl?.close();
@@ -4347,6 +4864,52 @@ function mapToolStatus(status?: string): string {
     default:
       return "running";
   }
+}
+
+function isTerminalToolStatus(status: string): boolean {
+  return status === "completed" || status === "error" || status === "cancelled";
+}
+
+function mapSubagentStatus(status?: string): string {
+  const normalized = status?.trim().toLowerCase().replace(/[_-]/g, "");
+  if (!normalized) return "running";
+  if (/^(failed|error|errored)$/.test(normalized) || /^completed(failed|error)/.test(normalized)) return "failed";
+  if (/^(cancelled|canceled|stopped|interrupted)$/.test(normalized) || /^completed(cancelled|canceled|interrupted)/.test(normalized)) return "cancelled";
+  if (/^(success|complete|completed|done|finished)$/.test(normalized) || /^completedsuccess/.test(normalized)) return "completed";
+  return "running";
+}
+
+function mergeSubagentStreamedText(snapshotText: string, streamedText: string): string {
+  if (!streamedText || snapshotText.endsWith(streamedText)) return snapshotText;
+  if (snapshotText.startsWith(streamedText)) return snapshotText;
+  if (streamedText.startsWith(snapshotText)) return streamedText;
+  const prefix = new Uint32Array(streamedText.length);
+  for (let i = 1, matched = 0; i < streamedText.length; i++) {
+    while (matched > 0 && streamedText[i] !== streamedText[matched]) matched = prefix[matched - 1];
+    if (streamedText[i] === streamedText[matched]) matched++;
+    prefix[i] = matched;
+  }
+  let overlap = 0;
+  const start = Math.max(0, snapshotText.length - streamedText.length);
+  for (let i = start; i < snapshotText.length; i++) {
+    while (overlap > 0 && snapshotText[i] !== streamedText[overlap]) overlap = prefix[overlap - 1];
+    if (snapshotText[i] === streamedText[overlap]) overlap++;
+    if (overlap === streamedText.length && i < snapshotText.length - 1) overlap = prefix[overlap - 1];
+  }
+  return snapshotText + streamedText.slice(overlap);
+}
+
+function subagentActivityFromRow(row: ConvRow): SubagentActivity {
+  return {
+    childSessionId: row.childSessionId ?? "",
+    parentToolCallId: row.parentToolCallId ?? "",
+    ...(row.agentId ? { agentId: row.agentId } : {}),
+    ...(row.subagentType ? { agentType: row.subagentType } : {}),
+    ...(row.summaryText ? { summary: row.summaryText } : {}),
+    status: mapSubagentStatus(row.status),
+    ...(row.startedAt !== undefined ? { startedAt: row.startedAt } : {}),
+    ...(row.endedAt !== undefined ? { endedAt: row.endedAt } : {}),
+  };
 }
 
 function normalizeToolRow(row: ZCodeRow): {

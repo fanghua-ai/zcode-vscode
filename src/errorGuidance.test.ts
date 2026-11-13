@@ -11,6 +11,8 @@ const cases: Array<[string,string,string]> = [
   ["provider.notInRegistry","model","pickModel"],
   ["ZCode error -32031: 模型已不可用","model","pickModel"],
   ["401 Unauthorized","login","retry"],
+  ["ZCODE_CREDENTIAL_FORMAT_UNSUPPORTED","compatibility","retry"],
+  ["ZCODE_CREDENTIAL_KEYCHAIN_UNAVAILABLE","login","retry"],
   ["模型驗證需要重新整理，請確認桌面端的憑證有效，點選「重新讀取登入」後重試。","login","retry"],
   ["余额不足 1113","quota","retry"],
   ["Method not found","compatibility","retry"],
@@ -32,7 +34,7 @@ test("common diagnostics map to actionable recovery instead of log-only errors",
   for(const [source,category,action] of cases){const guidance=errorGuidance(source);assert.equal(guidance.category,category,source);assert.equal(guidance.action,action);assert.ok(guidance.hint.length);}
   assert.match(errorGuidance(cases[0][0]).hint,/zcode\.binaryPath.*resources\/glm\/zcode\.cjs/);
   assert.match(errorGuidance("No available model").hint,/重新选择.*重试/);
-  assert.match(errorGuidance("ZCode error -32602: Unrecognized key: \"newField\"").hint,/3\.12\.3–3\.16\.3/);
+  assert.match(errorGuidance("ZCode error -32602: Unrecognized key: \"newField\"").hint,/核对桌面端与扩展版本/);
   assert.notEqual(errorGuidance("会话同步失败").category,"compatibility");
   assert.equal(errorGuidance("会话同步失败：401 Unauthorized").category,"login");
   assert.equal(errorGuidance("Session sync failed: ZCode error -32602: Invalid params").category,"compatibility");

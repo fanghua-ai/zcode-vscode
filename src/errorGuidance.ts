@@ -3,10 +3,18 @@ export const COMMUNITY_URL = "https://marketplace.visualstudio.com/items?itemNam
 export type RecoveryAction = "pickModel" | "retry" | "binaryPath" | "nodePath";
 export interface ErrorGuidance { category: string; title: string; hint: string; action: RecoveryAction; label: string }
 export function errorGuidance(message: string): ErrorGuidance {
+  if (message === "ZCODE_CREDENTIAL_FORMAT_UNSUPPORTED") return {
+    category: "compatibility", title: "当前扩展不支持此 ZCode 凭据格式", action: "retry", label: "重新读取登录",
+    hint: "请核对 ZCode 桌面端和扩展版本，并更新扩展后重试。仍有问题时，请复制诊断信息并反馈。",
+  };
+  if (message === "ZCODE_CREDENTIAL_KEYCHAIN_UNAVAILABLE") return {
+    category: "login", title: "无法读取 ZCode 系统钥匙串凭据", action: "retry", label: "重新读取登录",
+    hint: "请确认系统钥匙串已解锁，并允许访问 ZCode 的凭据，然后重新读取登录。",
+  };
   // Explicit RPC schema failures take precedence over field names such as apiKey or quota.
   if (/\bZCode error -3260[12]\b|unrecognized key|method not found|unknown method|schema mismatch|协议.*不匹配|版本.*不支持/i.test(message)) return {
     category:"compatibility", title:"当前版本可能不支持这项操作", action:"retry", label:"重新连接",
-    hint:"ZCode 服务端未识别这项请求，或请求参数不符合要求。桌面端升级可能改变 app-server 协议，也可能是扩展发送的参数有误。本扩展支持桌面端 3.12.3–3.16.3；请核对桌面端与扩展版本后重新连接。仍有问题时，请复制诊断信息并反馈。",
+    hint:"ZCode 服务端未识别这项请求，或请求参数不符合要求。桌面端升级可能改变 app-server 协议，也可能是扩展发送的参数有误。请核对桌面端与扩展版本后重新连接。仍有问题时，请复制诊断信息并反馈。",
   };
   if (/zcode\.nodePath|Node\.js.*(?:not found|无法|不存在)|node runtime|spawn.*node.*ENOENT|运行时.*(?:不存在|无法启动)/i.test(message)) return {
     category:"runtime", title:"无法启动 ZCode 运行时", action:"nodePath", label:"设置运行时路径",

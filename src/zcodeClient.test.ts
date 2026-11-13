@@ -665,6 +665,50 @@ test("gap recovery requests a forced snapshot and ignores subsequent legacy text
   } finally { client.dispose(); }
 });
 
+for (const signal of ["terminal event", "sequence gap"]) {
+  test(`a ${signal} arriving during resync can still recover the final reply`, async () => {
+    const { client, state } = fixture();
+    const firstAck = deferred<object>();
+    const snapshot = (seq: number, text: string, completed = false) => ({
+      topic: "conversation/A", subscriptionId: "sub", fromSeq: 0, toSeq: seq,
+      payload: { kind: "snapshot", snapshot: { logEpoch: "epoch", seq,
+        control: { phase: completed ? "completedSuccess" : "running" },
+        rows: { window: [{ rowId: 2, kind: "assistantText", text, state: completed ? "done" : "streaming" }], totalCount: 1 },
+      } },
+    });
+    const gap = (fromSeq: number) => state.handleConversationFrame({
+      topic: "conversation/A", subscriptionId: "sub", fromSeq, toSeq: fromSeq + 1,
+      payload: { kind: "deltas", deltas: [] },
+    });
+    let resyncs = 0;
+    state.sendRequest = async method => {
+      if (method === "v4/conversation/subscribe") {
+        state.handleConversationFrame(snapshot(5, "The beginning."));
+        return { ack: { subscriptionId: "sub" } };
+      }
+      assert.equal(method, "v4/conversation/resync");
+      if (++resyncs === 1) return firstAck.promise;
+      state.handleConversationFrame(snapshot(12, "The beginning. The final sentence.", true));
+      return {};
+    };
+    try {
+      await state.subscribeConversation();
+      client.endViewChange();
+      gap(7);
+      // The server sends ACK before the snapshot. The reader can dispatch
+      // several lines before the awaiting request resumes.
+      firstAck.resolve({});
+      state.handleConversationFrame(snapshot(9, "The beginning. Still incomplete."));
+      if (signal === "terminal event") state.handleSessionEvent({ sessionId: "A", type: "turn.completed" });
+      else gap(11);
+      assert.equal(resyncs, 1, "only one resync should be in flight");
+      await tick();
+      assert.equal(resyncs, 2, "the in-flight resync did not cover the later signal");
+      assert.equal((await client.loadHistory()).items[0]?.text, "The beginning. The final sentence.");
+    } finally { client.dispose(); }
+  });
+}
+
 test("projection pagination retains user message identity and loads through older questions", async () => {
   const { client, state } = fixture();
   const beforeIds: number[] = [];
@@ -693,6 +737,42 @@ test("projection pagination retains user message identity and loads through olde
     assert.deepEqual(beforeIds, [400, 200]);
     assert.deepEqual(page.items.map(item => item.id), ["old-user-message", "projection:200"]);
     assert.equal(page.more, false);
+  } finally { client.dispose(); }
+});
+
+test("history page from an earlier log epoch cannot populate the replaced transcript", async () => {
+  const { client, state } = fixture();
+  const oldPage = deferred<object>();
+  let requests = 0;
+  const snapshot = (epoch: string, seq: number, text: string) => ({
+    topic: "conversation/A", subscriptionId: "sub", fromSeq: 0, toSeq: seq,
+    payload: { kind: "snapshot", snapshot: { logEpoch: epoch, seq,
+      rows: { totalCount: 10, window: [{ rowId: 10, kind: "userInput", entityId: epoch + "-anchor", text }] },
+    } },
+  });
+  state.sendRequest = async method => {
+    if (method === "v4/conversation/subscribe") {
+      state.handleConversationFrame(snapshot("old", 5, "Old anchor"));
+      return { ack: { subscriptionId: "sub" } };
+    }
+    assert.equal(method, "v4/conversation/rowsRange");
+    return ++requests === 1 ? oldPage.promise : {
+      atLogEpoch: "new", hasMore: false,
+      rows: [{ rowId: 1, kind: "assistantText", text: "Current earlier text" }],
+    };
+  };
+  try {
+    await state.subscribeConversation();
+    client.endViewChange();
+    await client.loadHistory();
+    const page = client.olderMessages("old-anchor");
+    state.handleConversationFrame(snapshot("new", 1, "New anchor"));
+    oldPage.resolve({ atLogEpoch: "old", hasMore: true, rows: [{ rowId: 1, kind: "assistantText", text: "Obsolete text" }] });
+    await assert.rejects(page, /会话历史已更新/);
+    await assert.rejects(client.olderMessages("old-anchor"), /会话历史已更新/);
+    assert.equal(requests, 1, "do not reuse an anchor from the replaced log");
+    const retry = await client.olderMessages("new-anchor");
+    assert.deepEqual(retry.items.map(item => [item.text, item.logEpoch]), [["Current earlier text", "new"]]);
   } finally { client.dispose(); }
 });
 
@@ -2373,6 +2453,54 @@ test("new session cannot announce readiness after its configured model is reject
   try {await assert.rejects(client.newSession(),/MODEL_UNAVAILABLE/);assert.equal(state.liveModelReady,false);assert.ok(attachedForRecovery);assert.ok(!events.some(event=>event.type==="session_ready"));}
   finally {client.dispose();}
 });
+
+for (const catalog of ["empty", "placeholder-only", "registered", "disabled", "oauth"] as const) {
+  test(`new session handles a backend placeholder with a ${catalog} configured default`, async () => {
+    const target = { providerId: "local-api", modelId: "working" };
+    const placeholder = { providerId: "account:bigmodel-individual-coding-plan", modelId: "GLM-5.3" };
+    const runtime: ResolvedRuntime = {
+      ...target, providerName: "Local API", kind: "openai", baseURL: "http://localhost",
+      apiKey: "test-only", models: { working: {} }, source: "custom-provider",
+    };
+    const { client, state, events } = fixture(target, async model => {
+      if (model.providerId !== target.providerId) return null;
+      assert.notEqual(catalog, "oauth", "an OAuth launch must not look up a stale API default");
+      return catalog === "disabled" ? false : runtime;
+    });
+    client.setDefaultRuntime(catalog === "registered" ? runtime : {
+      ...runtime, providerId: "legacy-alias", models: {},
+      source: catalog === "oauth" ? "desktop-personal-oauth" : runtime.source,
+    });
+    state.subscribeConversation = async () => {};
+    let current = placeholder;
+    let switches = 0;
+    const snapshot = () => ({ settings: { model: {
+      current, available: catalog === "registered" ? [{ ref: target }] :
+        catalog === "placeholder-only" ? [{ ref: placeholder }] : [],
+    } } });
+    state.sendRequest = async (method, params) => {
+      if (method === "session/create") return { session: { sessionId: "NEW" } };
+      if (method === "session/subscribe") return { snapshot: snapshot() };
+      if (method === "session/read") return snapshot();
+      if (method === "v4/command") {
+        assert.deepEqual((params as { payload: unknown }).payload,
+          { provider: target.providerId, model: target.modelId, thought: "max" });
+        assert.ok(events.some(event => event.type === "session_title"), "persist the new workspace identity first");
+        assert.ok(!events.some(event => event.type === "session_ready"));
+        switches++;
+        current = target;
+        return { status: "accepted" };
+      }
+      return {};
+    };
+    try {
+      await client.newSession();
+      const usesApi = catalog !== "disabled" && catalog !== "oauth";
+      assert.deepEqual(client.confirmedModel(), usesApi ? target : placeholder);
+      assert.equal(switches, usesApi ? 1 : 0);
+    } finally { client.dispose(); }
+  });
+}
 
 test("new-session defaults apply model before model-specific reasoning and before readiness", async () => {
   const { client, state, events } = fixture();

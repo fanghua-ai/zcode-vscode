@@ -790,6 +790,38 @@ for (const family of ["bigmodel", "zai"] as const) {
   }
 }
 
+for (const change of ["switch", "sign-out", "expired request"] as const) {
+  test(`Start Plan discards an in-flight balance after ${change}`, async t => {
+    const file = path.join(fixture(t), "credentials.json");
+    const save = (jwt?: string) => fs.writeFileSync(file, JSON.stringify(
+      jwt ? { "oauth:active_provider": "bigmodel", zcodejwttoken: jwt } : {}));
+    save("TEST-OLD-JWT");
+    const api = mockPlanQuotaApi(t);
+    api.hold(async (_method, _path, headers) => {
+      if (headers.Authorization === "Bearer TEST-OLD-JWT") {
+        save(change === "sign-out" ? undefined : "TEST-NEW-JWT");
+      }
+    });
+    api.respond(() => {
+      const old = api.requests.at(-1)?.headers.Authorization === "Bearer TEST-OLD-JWT";
+      if (old && change === "expired request") return { status: 401, payload: {} };
+      return { payload: { code: 0, data: {
+        plans: [{ user_plan_id: "start", plan_id: "zcode-start-plan", status: "active" }],
+        balances: [{ user_plan_id: "start", capabilities: [old ? "model:GLM-5.3" : "model:GLM-5.3-Flash"] }],
+      } } };
+    });
+    const access = await readStartPlanAccess("bigmodel", "3.17.2");
+    if (change === "sign-out") {
+      assert.equal(access, null);
+      assert.equal(api.requests.length, 1);
+    } else {
+      assert.equal(access?.auth.apiKey, "TEST-NEW-JWT");
+      assert.deepEqual(access?.models, ["GLM-5.3-Flash"]);
+      assert.deepEqual(api.requests.map(request => request.headers.Authorization), ["Bearer TEST-OLD-JWT", "Bearer TEST-NEW-JWT"]);
+    }
+  });
+}
+
 test("Start model names use desktop canonical IDs, deduplicate case-insensitively and preserve unknown spelling", async t => {
   const dir = fixture(t);
   fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:active_provider": "bigmodel", zcodejwttoken: "TEST-START-JWT" }));
@@ -805,6 +837,30 @@ test("Start model names use desktop canonical IDs, deduplicate case-insensitivel
   } } }));
   assert.deepEqual((await readStartPlanAccess("bigmodel"))?.models,
     ["GLM-5.3-Flash", "GLM-4.7-FlashX", "glm-Next-Preview", "CustomMODEL", "UnKnown-Display-Name"]);
+});
+
+test("Start Plan request headers use the current desktop login and stop after sign-out", async t => {
+  const file = path.join(fixture(t), "credentials.json");
+  const save = (jwt?: string) => fs.writeFileSync(file, JSON.stringify(
+    jwt ? { "oauth:active_provider": "bigmodel", zcodejwttoken: jwt } : {}));
+  const providerId = "account:bigmodel-start-plan";
+  const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", onEvent: () => {},
+    runtime: { providerId, providerName: "Start Plan", modelId: "GLM-5.3", models: {},
+      kind: "anthropic", baseURL: "https://example.invalid", apiKey: "TEST-STARTUP-JWT", source: "desktop-personal-oauth" },
+  });
+  t.after(() => client.dispose());
+  const replies: Array<{ result: { headersApplied: boolean; requestAuth?: { apiKey: string } } }> = [];
+  const state = client as unknown as {
+    write: (reply: (typeof replies)[number]) => void;
+    handleProviderRuntimeHeaders: (id: number, params: unknown) => Promise<void>;
+  };
+  state.write = reply => replies.push(reply);
+  save("TEST-ROTATED-JWT");
+  await state.handleProviderRuntimeHeaders(1, { providerId });
+  save();
+  await state.handleProviderRuntimeHeaders(2, { providerId });
+  assert.deepEqual(replies.map(reply => [reply.result.headersApplied, reply.result.requestAuth?.apiKey]),
+    [[true, "TEST-ROTATED-JWT"], [false, undefined]]);
 });
 
 test("missing selection with no entitlements fails even when personal key exchange succeeds", async t => {

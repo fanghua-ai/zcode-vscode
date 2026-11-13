@@ -84,6 +84,15 @@ try {
     emit({type:'session_ready',sessionId:'B',title:'B',viewGen:2});
     emit({type:'historyOlder',sessionId:'A',viewGen:1,items:[{id:'old',role:'user',text:'STALE_HISTORY_MARKER',tools:[]}],more:false});
     check(!document.getElementById('messages').textContent.includes('STALE_HISTORY_MARKER'),'stale history rendered');
+    emit({type:'history',sessionId:'B',viewGen:2,truncated:true,items:[
+      {id:'new-anchor',role:'user',text:'NEW_HISTORY_ANCHOR',tools:[],rowId:10,logEpoch:'new'}
+    ]});
+    document.querySelector('.history-more').click();
+    emit({type:'historyOlder',sessionId:'B',viewGen:2,items:[
+      {id:'old-page',role:'user',text:'OLD_EPOCH_PAGE',tools:[],rowId:1,logEpoch:'old'}
+    ],more:false});
+    check(!document.getElementById('messages').textContent.includes('OLD_EPOCH_PAGE'),'older page from a replaced log rendered');
+    check(document.querySelector('.history-more')?.disabled===false,'discarded page prevented history retry');
     emit({type:'history',sessionId:'B',viewGen:2,items:[{
       id:'reasoning-history',role:'assistant',text:'Answer',tools:[],steps:[
         {kind:'reasoning',text:'EARLY_REASONING'},

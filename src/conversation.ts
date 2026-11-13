@@ -24,6 +24,12 @@ export interface ConvRow {
   endedAt?: number;
   activeMs?: number;
   toolCallId?: string;
+  parentToolCallId?: string;
+  childSessionId?: string;
+  agentId?: string;
+  subagentType?: string;
+  summaryText?: string;
+  backgrounded?: boolean;
   toolName?: string;
   status?: string;
   inputText?: string;
@@ -134,6 +140,13 @@ export function slimRow(raw: unknown): ConvRow | null {
     endedAt: typeof row.endedAt === "number" ? row.endedAt : undefined,
     activeMs: typeof row.activeMs === "number" ? row.activeMs : undefined,
     toolCallId: typeof row.toolCallId === "string" ? row.toolCallId : undefined,
+    parentToolCallId: typeof row.parentToolCallId === "string" ? row.parentToolCallId : undefined,
+    childSessionId: typeof row.childSessionId === "string" ? row.childSessionId : undefined,
+    agentId: typeof row.agentId === "string" ? row.agentId : undefined,
+    subagentType: typeof row.agentType === "string" ? row.agentType
+      : typeof row.subagentType === "string" ? row.subagentType : undefined,
+    summaryText: typeof row.summaryText === "string" ? row.summaryText : undefined,
+    backgrounded: row.backgrounded === true ? true : undefined,
     toolName: typeof row.toolName === "string" ? row.toolName : undefined,
     status: typeof row.status === "string" ? row.status : undefined,
     inputText: typeof row.inputText === "string" ? row.inputText : undefined,

@@ -209,6 +209,7 @@ function safePackEntries(entries: readonly ZipEntry[]): Map<string, Buffer> {
   return files;
 }
 
+const MAX_INSTALL_ATTEMPTS = 8;
 const TRANSIENT_INSTALL_CODES = new Set(["ENOENT", "ENOTEMPTY", "EEXIST", "EPERM", "EBUSY"]);
 
 export async function installMathFontPack(
@@ -245,7 +246,7 @@ async function commitMathFontPack(staging: string, destination: string, expected
   const backups: string[] = [];
   let failure: unknown;
   try {
-    for (let attempt = 0; attempt < 5; attempt++) {
+    for (let attempt = 0; attempt < MAX_INSTALL_ATTEMPTS; attempt++) {
       if (mathFontPackReady(destination, expectedSha256)) return;
       try {
         await rename(staging, destination);
@@ -270,9 +271,9 @@ async function commitMathFontPack(staging: string, destination: string, expected
             }
           }
         }
-        if (attempt === 4) break;
+        if (attempt === MAX_INSTALL_ATTEMPTS - 1) break;
       }
-      await new Promise(resolve => setTimeout(resolve, 15 * (attempt + 1)));
+      await new Promise(resolve => setTimeout(resolve, Math.min(25 * 2 ** attempt, 250)));
     }
   } finally {
     await discardInstallBackups(backups, destination, expectedSha256);

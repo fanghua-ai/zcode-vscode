@@ -28,6 +28,29 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run verify
+      - name: Verify ZCode 3.18.2 system credentials
+        if: runner.os == 'Windows' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          platform="$(node -p 'process.platform')"
+          arch="$(node -p 'process.arch')"
+          package="keyring-${platform}-${arch}"
+          if [[ "$platform" == win32 ]]; then
+            package="$package-msvc"
+          else
+            keychain="$RUNNER_TEMP/zcode-test.keychain-db"
+            password="$(openssl rand -hex 24)"
+            original="$(security default-keychain -d user | xargs)"
+            security create-keychain -p "$password" "$keychain"
+            trap 'security list-keychains -d user -s "$original"; security default-keychain -d user -s "$original"; security delete-keychain "$keychain"' EXIT
+            security unlock-keychain -p "$password" "$keychain"
+            security list-keychains -d user -s "$keychain"
+            security default-keychain -d user -s "$keychain"
+          fi
+          prefix="$RUNNER_TEMP/zcode-keyring"
+          npm install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "@napi-rs/$package@2.1.2"
+          node scripts/credential-keyring-smoke.mjs "$prefix/node_modules/@napi-rs/$package"
   browser:
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -3,6 +3,8 @@ import * as os from "os";
 import * as fs from "fs";
 import * as path from "path";
 import * as https from "https";
+import { createRequire } from "node:module";
+import { defaultCandidatePaths } from "./serverPath";
 import { JsonRequestError, readJsonRequest } from "./httpJson";
 import { logDebug, logInfo, logWarn } from "./log";
 import { readDesktopJson, readDesktopJsonWithRetry } from "./desktopJson";
@@ -153,12 +155,13 @@ function deriveCipherKey(secret: string): Buffer {
 }
 
 export function isEncrypted(value: string): boolean {
-  return value.startsWith(ENC_PREFIX);
+  return value.startsWith("enc:");
 }
 
 export function decryptValue(value: string, key: Buffer): string {
   if (!isEncrypted(value)) return value;
 
+  if (!value.startsWith(ENC_PREFIX)) throw new Error("Unsupported credential encryption format");
   const payload = value.slice(ENC_PREFIX.length);
   const parts = payload.split(".");
   if (parts.length !== 3) {
@@ -180,6 +183,78 @@ export function decryptValue(value: string, key: Buffer): string {
   const decipher = crypto.createDecipheriv(CIPHER, key, iv);
   decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(data), decipher.final()]).toString();
+}
+
+let desktopCredentialBinary: string | undefined;
+
+export function setDesktopCredentialBinary(binary: string): void {
+  desktopCredentialBinary = binary;
+}
+
+function readSystemCredentialKey(): Buffer {
+  const candidates = [desktopCredentialBinary, ...defaultCandidatePaths(process.platform, process.env, os.homedir())];
+  const nativeRequire = createRequire(__filename);
+  const platformPrefix = `keyring-${process.platform}-${process.arch}`;
+  const account = crypto.createHash("sha256").update(path.resolve(v2Dir(), "credentials.json")).digest("hex");
+  for (const binary of candidates) {
+    if (!binary) continue;
+    const modules = path.resolve(path.dirname(binary), "..", "app.asar.unpacked", "node_modules", "@napi-rs");
+    let packages: string[];
+    try { packages = fs.readdirSync(modules); } catch { continue; }
+    for (const name of packages) {
+      if (name !== platformPrefix && !name.startsWith(platformPrefix + "-")) continue;
+      try {
+        const directory = path.join(modules, name);
+        const binding = fs.readdirSync(directory).find(file => /^keyring\..+\.node$/.test(file));
+        if (!binding) continue;
+        const { Entry } = nativeRequire(path.join(directory, binding));
+        const password = new Entry("ZCode Credential Encryption", account, { linux: { store: "secret-service" } }).getPassword();
+        if (typeof password === "string" && /^[A-Za-z0-9_-]{43}$/.test(password)) return Buffer.from(password, "base64url");
+      } catch { /* Try the next installed binding. */ }
+    }
+  }
+  throw new Error("ZCode system credential store unavailable");
+}
+
+function decryptDesktopValue(value: string, env: NodeJS.ProcessEnv, keyFor: (source: string) => Buffer): string {
+  if (!value.startsWith("enc:v2:")) return decryptValue(value, deriveCipherKey(resolveCredentialSecret(env)));
+  const match = /^enc:v2:(os|env):([a-f0-9]{24}):([A-Za-z0-9_.-]+)$/.exec(value);
+  if (!match) throw new Error("Invalid ZCode credential envelope");
+  const [, source, fingerprint, payload] = match;
+  const key = keyFor(source);
+  if (crypto.createHash("sha256").update(key).digest("hex").slice(0, 24) !== fingerprint) {
+    throw new Error("ZCode credential key mismatch");
+  }
+  return decryptValue(ENC_PREFIX + payload, key);
+}
+
+function desktopKeyReader(env: NodeJS.ProcessEnv): (source: string) => Buffer {
+  const keys = new Map<string, Buffer | null>();
+  return source => {
+    if (!keys.has(source)) {
+      keys.set(source, null);
+      if (source === "os") keys.set(source, readSystemCredentialKey());
+      else {
+        const explicit = env.ZCODE_CREDENTIAL_SECRET;
+        const configured = env.ZCODE_CREDENTIAL_SECRET_FILE;
+        if (explicit && configured) throw new Error("Conflicting ZCode credential secret sources");
+        if (explicit) keys.set(source, deriveCipherKey(explicit));
+        else {
+          const file = configured || path.join(v2Dir(), "credential-secret");
+          const info = fs.statSync(file);
+          if (!info.isFile() || (!configured && process.platform !== "win32" && (info.mode & 0o077))) {
+            throw new Error("Invalid ZCode credential secret file");
+          }
+          const secret = fs.readFileSync(file, "utf8");
+          if (Buffer.byteLength(secret) < 32 || Buffer.byteLength(secret) > 4096) throw new Error("Invalid ZCode credential secret length");
+          keys.set(source, deriveCipherKey(secret));
+        }
+      }
+    }
+    const key = keys.get(source);
+    if (!key) throw new Error("ZCode credential key unavailable");
+    return key;
+  };
 }
 
 export function zcodeDir(): string {
@@ -241,14 +316,14 @@ export function readCredentials(
 }
 
 function decryptCredentials(raw: Record<string, string>, env: NodeJS.ProcessEnv): Record<string, string> {
-  const key = deriveCipherKey(resolveCredentialSecret(env));
+  const keyFor = desktopKeyReader(env);
 
   const result: Record<string, string> = {};
   let failed = 0;
   for (const [k, v] of Object.entries(raw)) {
     if (typeof v === "string" && isEncrypted(v)) {
       try {
-        result[k] = decryptValue(v, key);
+        result[k] = decryptDesktopValue(v, env, keyFor);
       } catch {
         failed++; // Do not reuse values encrypted for another user or secret.
       }
@@ -260,6 +335,23 @@ function decryptCredentials(raw: Record<string, string>, env: NodeJS.ProcessEnv)
   return result;
 }
 
+/** Diagnose only credentials relevant to the selected login, after startup fails. */
+export async function desktopLoginCredentialIssue(family: PlanFamily, startPlan: boolean): Promise<string | undefined> {
+  try {
+    const raw = await readDesktopJsonWithRetry<Record<string, string>>(path.join(v2Dir(), "credentials.json"));
+    const key = startPlan ? CRED_KEYS.zcodeJwtToken
+      : family === "bigmodel" ? CRED_KEYS.bigmodelAccessToken : CRED_KEYS.zaiAccessToken;
+    const value = raw[key];
+    if (typeof value !== "string" || !isEncrypted(value)) return;
+    if (!value.startsWith(ENC_PREFIX) && !/^enc:v2:(os|env):/.test(value)) {
+      return "ZCODE_CREDENTIAL_FORMAT_UNSUPPORTED";
+    }
+    if (value.startsWith("enc:v2:os:") && !maybeDecryptSecret(value)) {
+      return "ZCODE_CREDENTIAL_KEYCHAIN_UNAVAILABLE";
+    }
+  } catch { /* Keep the original login failure if the file cannot be inspected. */ }
+}
+
 export function maybeDecryptSecret(
   value: string | undefined,
   env: NodeJS.ProcessEnv = process.env
@@ -267,8 +359,7 @@ export function maybeDecryptSecret(
   if (!value) return "";
   if (!isEncrypted(value)) return value;
   try {
-    const key = deriveCipherKey(resolveCredentialSecret(env));
-    return decryptValue(value, key);
+    return decryptDesktopValue(value, env, desktopKeyReader(env));
   } catch {
     return "";
   }
@@ -997,9 +1088,8 @@ export async function readStartPlanAuth(family: PlanFamily): Promise<PlanAuth | 
 export async function readStartPlanAccess(family: PlanFamily, appVersion?: string | null): Promise<{
   auth: PlanAuth; models: string[]; quota: PlanQuotaLimit[];
 } | null> {
-  const auth = await readStartPlanAuth(family);
+  let auth = await readStartPlanAuth(family);
   if (!auth) return null;
-  const jwt = auth.apiKey;
 
   const url = new URL(START_PLAN_BALANCE_URL);
   // The desktop app version affects which Start Plan entitlements the service
@@ -1008,7 +1098,7 @@ export async function readStartPlanAccess(family: PlanFamily, appVersion?: strin
     url.searchParams.set("app_version", appVersion);
   }
   const version = url.searchParams.get("app_version");
-  const headers: Record<string, string> = { Authorization: `Bearer ${jwt}` };
+  const headers: Record<string, string> = {};
   if (version) headers["X-ZCode-App-Version"] = version;
   // The balance endpoint requires the device identity already created by ZCode.
   try {
@@ -1019,7 +1109,22 @@ export async function readStartPlanAccess(family: PlanFamily, appVersion?: strin
   const context = { family, appVersion: version, hasDeviceMid: !!headers["X-Device-Mid"] };
   logInfo("Checking Start Plan access", context);
   recordDiagnosticEvent("start_plan_check", context);
-  const response = await httpGetJson(url.toString(), headers) as StartPlanBalanceResponse;
+  let response: StartPlanBalanceResponse | undefined;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const reply = await httpGetJson(url.toString(), { ...headers, Authorization: `Bearer ${auth.apiKey}` }).then(
+      value => ({ value }), (error: unknown) => ({ error }),
+    );
+    const current = await readStartPlanAuth(family);
+    if (current?.apiKey === auth.apiKey) {
+      if ("error" in reply) throw reply.error;
+      response = reply.value as StartPlanBalanceResponse;
+      break;
+    }
+    logDebug("Discarding Start Plan balance after desktop credentials changed", { family });
+    if (!current) return null;
+    auth = current;
+  }
+  if (!response) return null;
   if (response.success === false || (response.code !== undefined && !["0", "200"].includes(String(response.code)))) {
     const details = { family, stage: "start_plan_balance", resultCode: resultCode(response.code) };
     logWarn("Start Plan balance rejected", details);

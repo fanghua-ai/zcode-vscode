@@ -1,5 +1,35 @@
 # 更新日志 / Changelog
 
+## 2.2.4 — 2026-11-13
+
+### 中文
+- 修复升级到 ZCode 3.18.2 后可能无法登录或切换模型的问题。支持从系统钥匙串读取新版凭据，并在凭据格式不支持或钥匙串无法读取时显示对应的处理提示。
+- 修复 Start Plan 模型列表刷新后排队切换可能阻止发送的问题，并在菜单中正确高亮当前模型。
+- 修复会话同步期间收到结束通知或再次丢帧时，回复可能停在半截的问题。
+- 修复新会话偶尔采用后端临时套餐模型、忽略本地已配置 API 模型的问题。
+- 修复会话历史更新时，迟到的分页可能把旧消息混入新记录的问题。
+- 切换或退出 ZCode 账号时，Start Plan 重新读取当前登录，并丢弃迟到的旧凭据和模型列表。
+- 在 Agent 工具下查看子智能体的任务提示、思考过程、状态和工具调用；完成的子智能体从本地记录读取详情，展开后不会因 Agent 进度更新而收起。
+- 子智能体详情按会话顺序交错显示思考过程和工具调用。
+- 子智能体运行时持续更新思考、工具和任务状态；并发子智能体各自归属到对应卡片，思考内容不再显示重复标签。
+- 子智能体工具事件从主会话实时流中识别并归入对应 Agent 卡片，不再先显示为外层工具后再移动。
+- 子智能体回复实时按普通 Markdown 正文渲染，不再额外显示“结果”标签。
+- 回复与子智能体回复中的代码块统一使用回复区的复制图标；子智能体代码块的复制操作也会正确绑定。
+
+### English
+- Fix sign-in and model switching issues after upgrading to ZCode 3.18.2. Read the new credentials from the system keychain and show specific guidance when the credential format is unsupported or the keychain cannot be read.
+- Apply queued Start Plan model switches after the picker refreshes and keep the current model highlighted.
+- Recover the full reply if a turn ends or another frame is missed during conversation recovery.
+- Honor the configured API model when a new chat initially reports a temporary plan model.
+- Discard outdated history pages after the chat history is replaced.
+- Refresh Start Plan sign-in and discard late credentials and model lists after switching or signing out of a ZCode account.
+- Show subagent prompts, thinking, status, and tool calls under Agent entries. Read completed child details from local session records, keep expanded details open during Agent progress updates, and retain summary and status when no transcript is available.
+- Preserve the child transcript order so reasoning and tool calls appear interleaved.
+- Stream child reasoning and tool status updates into the matching agent card, including when multiple subagents run concurrently.
+- Route mirrored child tool events directly to their Agent card so they do not briefly appear in the parent timeline.
+- Render child replies as live Markdown without an extra result label.
+- Use the same copy icon in reply and subagent code blocks, and bind copy actions in subagent replies.
+
 ## 2.2.3 — 2026-11-09
 
 ### 中文

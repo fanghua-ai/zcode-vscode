@@ -51,8 +51,8 @@ import { locateAppServer } from "./serverPath";
 import { materializeGitDiff, type StructuredPatch } from "./conversation";
 import { DiffDocuments } from "./diffDocuments";
 import { sameWorkspacePath, preferredWorkspacePath } from "./workspacePath";
-import { normalizeNewSessionDefaults, type NewSessionDefaults } from "./newSessionDefaults";
-import { readConfiguredProviderApiKey, readV2Config, readV2Settings, v2Dir } from "./credentials";
+import { normalizeNewSessionDefaults, type NewSessionDefaults, type SessionModelChoice } from "./newSessionDefaults";
+import { desktopLoginCredentialIssue, readConfiguredProviderApiKey, readV2Config, readV2Settings, setDesktopCredentialBinary, v2Dir } from "./credentials";
 import { buildQuotaAdapterRegistry, fetchQuotaAdapter, quotaSecretStorageKey, type QuotaAdapterConfig } from "./quotaAdapters";
 import {
   loadTaskFlags,
@@ -77,6 +77,17 @@ const SESSION_MODELS_KEY = "zcode.sessionModels";
 const NEW_SESSION_DEFAULTS_KEY = "newSessionDefaults";
 const DEFENDER_NOTICE_KEY = "zcode.defenderNoticeDismissed";
 const START_PLAN_PROVIDER = /^(?:account|builtin):(?:bigmodel|zai)-start-plan$/;
+
+function startPlanId(providerId: string): string | undefined {
+  return START_PLAN_PROVIDER.test(providerId) ? providerId.slice(providerId.indexOf(":") + 1) : undefined;
+}
+
+function samePickerModel(left: SessionModelChoice, right: SessionModelChoice): boolean {
+  const plan = startPlanId(left.providerId);
+  return plan
+    ? plan === startPlanId(right.providerId) && left.modelId.toLowerCase() === right.modelId.toLowerCase()
+    : left.providerId === right.providerId && left.modelId === right.modelId;
+}
 
 function configuredQuotaAdapters(): QuotaAdapterConfig[] {
   const raw = vscode.workspace.getConfiguration("zcode").get<unknown>("quotaAdapters", []);
@@ -973,6 +984,14 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           this.client.refreshSubagentCatalog();
         }
         break;
+      case "loadSubagentDetails": {
+        const client = this.client;
+        if (!client || typeof msg.sessionId !== "string" || msg.sessionId !== client.currentSessionId
+            || typeof msg.parentToolCallId !== "string" || !msg.parentToolCallId || msg.parentToolCallId.length > 256
+            || typeof msg.childSessionId !== "string" || !msg.childSessionId || msg.childSessionId.length > 256) break;
+        await client.loadSubagentDetails(msg.parentToolCallId, msg.childSessionId);
+        break;
+      }
       case "ready":
         // The page posts "ready" once per load. A reload without a new
         // resolveWebviewView (Reload Webviews, renderer recovery) is still a
@@ -1964,15 +1983,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const selectionIsCurrent = this.viewScope();
     await this.refreshStartPlanCatalog(providerId);
     if (!selectionIsCurrent()) return;
-    if (/^builtin:(?:bigmodel|zai)-start-plan$/.test(providerId)) {
-      const accountId = `account:${providerId.slice("builtin:".length)}`;
-      const live = this.modelChoices().find(model => model.providerId === accountId
-        && model.modelId.toLowerCase() === modelId.toLowerCase());
-      if (live) {
-        providerId = live.providerId;
-        modelId = live.modelId;
-      }
-    }
+    const model = this.startPlanSelection({ providerId, modelId });
+    providerId = model.providerId;
+    modelId = model.modelId;
     if (this.disabledModelKeys.has(`${providerId}\0${modelId}`)) {
       await this.pushModels();
       if (!selectionIsCurrent()) return;
@@ -2001,11 +2014,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const isCurrent = () => client === this.client && sessionId === client.currentSessionId && ticket === this.switchTicket;
     if (sessionId && client.isGenerating()) {
       this.pendingModel = { sessionId, providerId, modelId };
-      this.post({
-        type: "models",
-        current: { providerId, modelId },
-        available: this.modelChoices(),
-      });
+      this.postModelChoices(model);
       return;
     }
     if (this.pendingModel?.sessionId === sessionId) this.pendingModel = null;
@@ -2013,7 +2022,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     try {
       const runtime = await this.resolveSessionModelRuntime({ providerId, modelId });
       if (!isCurrent()) return;
-      if (runtime === false) {
+      const isStartPlan = START_PLAN_PROVIDER.test(providerId);
+      if (isStartPlan) ({ providerId, modelId } = this.startPlanSelection({ providerId, modelId }));
+      if (runtime === false || (isStartPlan && this.modelUnavailable({ providerId, modelId }))) {
         vscode.window.showWarningMessage(t("该模型已不可用，请刷新模型列表后重新选择。"));
         await this.pushModels();
         return;
@@ -2051,6 +2062,20 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     return { providerId: this.pendingModel.providerId, modelId: this.pendingModel.modelId };
   }
 
+  private startPlanSelection(model: SessionModelChoice): SessionModelChoice {
+    const plan = startPlanId(model.providerId);
+    if (!plan) return model;
+    // A partial snapshot can omit an account provider that we already selected.
+    const match = this.modelChoices().find(choice => choice.providerId === `account:${plan}` && samePickerModel(model, choice));
+    return match ? { providerId: match.providerId, modelId: match.modelId } : model;
+  }
+
+  private postModelChoices(current?: SessionModelChoice): void {
+    const available = this.modelChoices();
+    const match = current && startPlanId(current.providerId) && available.find(choice => samePickerModel(current, choice));
+    this.post({ type: "models", current: match ? { providerId: match.providerId, modelId: match.modelId } : current, available });
+  }
+
   /**
    * For Start Plan, the picker keeps entitled models even if the session only
    * lists a subset. An outdated session catalog cannot establish disablement.
@@ -2059,10 +2084,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     if (this.disabledModelKeys.has(`${model.providerId}\0${model.modelId}`)) return true;
     const isStartPlan = START_PLAN_PROVIDER.test(model.providerId);
     if (isStartPlan ? this.liveCatalogState() !== "fresh" : !this.providerInventoryAuthoritative) return false;
-    const choices = this.modelChoices();
-    return !choices.some(choice => choice.providerId === model.providerId && (isStartPlan
-      ? choice.modelId.toLowerCase() === model.modelId.toLowerCase()
-      : choice.modelId === model.modelId));
+    return !this.modelChoices().some(choice => samePickerModel(model, choice));
   }
 
   private async applyPendingModel(client: ZCodeClient): Promise<boolean> {
@@ -2070,12 +2092,18 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const pending = this.pendingModel;
     if (!pending || pending.sessionId !== sessionId) return true;
     const isCurrent = this.viewScope();
-    const model = { providerId: pending.providerId, modelId: pending.modelId };
     const previous = this.currentModel ? { ...this.currentModel } : undefined;
+    const isStartPlan = START_PLAN_PROVIDER.test(pending.providerId);
+    if (isStartPlan) {
+      await this.refreshStartPlanCatalog(pending.providerId);
+      if (!isCurrent()) return false;
+    }
+    let model = this.startPlanSelection({ providerId: pending.providerId, modelId: pending.modelId });
     const runtime = await this.resolveSessionModelRuntime(model);
     if (!isCurrent()) return false;
-    await this.refreshStartPlanCatalog(pending.providerId);
-    if (!isCurrent()) return false;
+    // The aliases share credentials. Reconcile the wire ID with the catalog
+    // again after the credential lookup, which may have overlapped a refresh.
+    if (isStartPlan) model = this.startPlanSelection(model);
     if (runtime === false || this.modelUnavailable(model)) {
       if (this.pendingModel === pending) this.pendingModel = null;
       this.currentModel = client.confirmedModel() ?? this.currentModel;
@@ -2088,7 +2116,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       syncCliConfig(runtime, readV2Config(), false);
     }
     try {
-      await client.setModel(pending.providerId, pending.modelId);
+      await client.setModel(model.providerId, model.modelId);
     } catch (error) {
       if (!isModelRegistryRejection(error) || !isCurrent()) throw error;
       logError("Queued model switch rejected by the session registry", error);
@@ -2228,6 +2256,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         preferred: this.context.globalState.get<string>(LAST_BINARY_KEY) || "",
       });
       this.appServerPath = binaryPath;
+      setDesktopCredentialBinary(binaryPath);
       timing.add("locateBinary", Date.now() - locateStarted);
     } catch (e) {
       timing.add("locateBinary", Date.now() - locateStarted);
@@ -2377,7 +2406,19 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     let resolved = await resolveRuntime(request);
     if (resolved.ok && resolved.runtime) return resolved;
     logWarn("Could not reuse desktop defaults", resolved.reason);
-    if (resolved.accountPlanUnavailable) return resolved;
+    if (resolved.accountPlanUnavailable) {
+      const settings = readV2Settings();
+      const provider = request.preferredProviderId || request.modelOverride?.split("/")[0];
+      const explicitFamily = /^(?:account|builtin):(bigmodel|zai)-(?:.*coding-plan|start-plan)$/.exec(provider ?? "")?.[1];
+      const family = provider ? explicitFamily : settings?.providerFamilyDomain;
+      if (family === "bigmodel" || family === "zai") {
+        const startPlan = provider ? START_PLAN_PROVIDER.test(provider)
+          : settings?.providerFamilyConnectionSelections?.[family]?.kind === "start-plan";
+        const issue = await desktopLoginCredentialIssue(family, startPlan);
+        if (issue) return { ...resolved, reason: issue, hint: undefined };
+      }
+      return resolved;
+    }
     const fallbackPick = resolved.picker.find(
       (p) =>
         p.hasKey &&
@@ -2837,19 +2878,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (read === this.liveCatalogReads && !known) this.markLiveCatalogStale(client, sessionId);
     }
     const pending = this.pendingModelFor(this.client?.currentSessionId);
-    this.post({
-      type: "models",
-      current:
-        pending ??
-        this.currentModel ??
-        (this.runtime
-          ? {
-              providerId: this.runtime.providerId,
-              modelId: this.runtime.modelId,
-            }
-          : undefined),
-      available: this.modelChoices(),
-    });
+    this.postModelChoices(pending ?? this.currentModel ?? (this.runtime
+      ? { providerId: this.runtime.providerId, modelId: this.runtime.modelId }
+      : undefined));
     this.pushNewSessionDefaults();
   }
 
@@ -2966,6 +2997,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         if (data.sessionId === this.client?.currentSessionId) this.post({ type: "subagent_catalog", ...data });
         break;
       }
+      case "subagent_details": {
+        const data = event.data as { sessionId: string; parentToolCallId: string; activity: unknown };
+        if (data.sessionId === this.client?.currentSessionId) this.post({ type: "subagent_details", ...data });
+        break;
+      }
       case "assistant_text":
         this.post({
           type: "assistant_text",
@@ -3024,11 +3060,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       }
       case "model_info": {
         const pending = this.pendingModelFor(this.client?.currentSessionId);
-        this.post({
-          type: "models",
-          current: pending ?? this.currentModel,
-          available: this.modelChoices(),
-        });
+        this.postModelChoices(pending ?? this.currentModel);
         break;
       }
       case "permission_request":
@@ -3219,6 +3251,8 @@ export type WebviewIn = {
   enabled?: boolean;
   text?: string;
   sessionId?: string;
+  parentToolCallId?: string;
+  childSessionId?: string;
   providerId?: string;
   modelId?: string;
   restart?: boolean;

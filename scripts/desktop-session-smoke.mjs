@@ -129,7 +129,10 @@ try {
   const session=client.currentSessionId;
   const ready=events.filter(event=>event.type==='session_ready'&&event.data.sessionId===session);
   assert.ok(ready.length,'new session not ready');
-  const models=await client.readAvailableModels();if(models.current)assert.equal(models.current.providerId,'fake');
+  const models=await client.readAvailableModels();
+  const expectedModel={providerId:'fake',modelId:'test'};
+  assert.deepEqual(client.confirmedModel(),expectedModel,'new chat did not select the configured local model');
+  assert.deepEqual(models.current,expectedModel,'backend snapshot disagrees with the configured new-chat model');
   await client.sendMessage('Session regression test '+round);
   const deadline=Date.now()+15000;
   const received=()=>events.some(event=>event.type==='assistant_text_delta'&&event.data.fullText?.includes('Image received.') ||
@@ -185,14 +188,35 @@ try {
   const history=await client.loadHistory();assert.equal(history.items.filter(item=>item.role==='assistant'&&item.text===expected(tag)).length,1,'reply duplicated: '+tag);
  }
  let metadataOnlySubscriptions=0;
+ let forcedSnapshots=0;
  const request=client.sendRequest.bind(client);
  client.sendRequest=async(method,params)=>{
   if(method==='session/subscribe' && params.includeSnapshot===false){
    metadataOnlySubscriptions++;
    assert.equal(params.afterSeq,0,'resume must preserve interaction replay');
   }
+  if(method==='v4/conversation/resync' && params.forceSnapshot===true)forcedSnapshots++;
   return request(method,params);
  };
+ await client.newSession();
+ const recoveryReplica=client.replica;
+ const receiveFrame=recoveryReplica.receive.bind(recoveryReplica);
+ let dropped=false;
+ recoveryReplica.receive=frame=>{
+  if(!dropped && frame.payload?.deltas?.some(delta=>delta.op==='row.delta' &&
+    delta.append?.includes('[REGRESSION_RECOVERY_ROOT:'))){
+   dropped=true;
+   return 'ignored';
+  }
+  return receiveFrame(frame);
+ };
+ try{
+  await client.sendMessage('REGRESSION_RECOVERY_ROOT');
+  await waitReply('REGRESSION_RECOVERY_ROOT');
+  assert.ok(dropped,'the fault injection did not remove a real assistant delta');
+  assert.ok(forcedSnapshots>0,'the client did not request a recovery snapshot');
+ }finally{recoveryReplica.receive=receiveFrame;}
+ console.log('Real backend: a dropped assistant delta is recovered without missing or duplicated reply text.');
  async function switchTo(id){await client.prepareViewChange();try{await client.switchSession(id);}finally{client.endViewChange();}}
  await client.newSession();const early=client.currentSessionId;
  await client.sendMessage('REGRESSION_EARLY_ROOT');

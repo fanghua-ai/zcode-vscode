@@ -29,7 +29,7 @@ function fixture() {
   const visibility: boolean[] = [];
   let backgroundPolls = 0;
   const response = deferred();
-  const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", extensionPath: "/unused", subscriptions: [], workspaceState: { get: () => undefined } } as unknown as vscode.ExtensionContext);
+  const provider = new ZCodeViewProvider({ extensionUri: "file:///unused", extensionPath: "/unused", subscriptions: [], workspaceState: { get: () => undefined, update: async () => {} } } as unknown as vscode.ExtensionContext);
   const state = provider as unknown as {
     client: { currentSessionId: string; currentMode: () => string; confirmedModel: () => {providerId: string; modelId: string} | undefined; confirmedControls: () => Partial<import("./zcodeClient").SessionControls>; setViewVisible: (visible: boolean) => void; pollBackgroundRuns: () => void; dispose: () => void; editUserQuery: () => Promise<unknown>; insertQueuedMessage: (text?: unknown) => Promise<unknown>; conversationFileChanges: () => Promise<unknown>; sendMessage: (...args: unknown[]) => Promise<unknown>; setMode: (mode: string) => Promise<void>; setModel: (...args: unknown[]) => Promise<unknown>; hasFreshSessionModel: () => boolean; readAvailableModels: () => Promise<{ current?: { providerId: string; modelId: string }; available: AvailableModel[]; known: boolean }>;
       activitySince: () => number | undefined; noteHistoryDelivered: () => void; queuedMessages: () => unknown[] };
@@ -356,7 +356,7 @@ function startPlanFixture() {
   const f = fixture();
   const providerId = "account:bigmodel-start-plan";
   Object.assign(f.state, {
-    runtime: { providerId, providerName: "Start Plan", kind: "anthropic", models: { "GLM-5.3": {}, "GLM-5.3-Flash": {} } },
+    runtime: { providerId, providerName: "Start Plan", kind: "anthropic", modelId: "GLM-5.3", models: { "GLM-5.3": {}, "GLM-5.3-Flash": {} } },
     startPlanModelProvider: providerId,
     picker: [],
   });
@@ -379,6 +379,117 @@ test("the model menu keeps both Start Plan options when new chats return only th
     assert.deepEqual((menu?.available as PickerModel[]).map(model => model.modelId), expected);
     assert.deepEqual(menu?.current, current);
   }
+});
+
+test("sending applies a queued Start Plan selection after the catalog changes its alias", async t => {
+  const { f, providerId, flash } = startPlanFixture();
+  t.after(f.dispose);
+  const builtin = "builtin:bigmodel-start-plan";
+  Object.assign(f.state, {
+    runtime: { providerId: builtin, providerName: "Start Plan", kind: "anthropic", modelId: "GLM-5.3",
+      models: { "GLM-5.3": {}, "GLM-5.3-Flash": {} } },
+    startPlanModelProvider: undefined,
+  });
+  Object.assign(f.state.client, { isGenerating: () => true });
+  f.state.resolveSessionModelRuntime = async () => null;
+  const calls: unknown[][] = [];
+  f.state.client.setModel = async (...args) => { calls.push(args); };
+  await f.state.onWebviewMessage({ type: "selectModel", providerId: builtin, modelId: "GLM-5.3" });
+  assert.equal(f.state.pendingModel?.providerId, builtin);
+  f.state.client.readAvailableModels = async () => ({ known: true, available: [flash] });
+  Object.assign(f.state, { livePicker: null });
+  Object.assign(f.state.client, {
+    sendMessage: async () => { calls.push(["send"]); },
+  });
+  Object.assign(f.state.client, { isGenerating: () => false });
+  await f.state.onWebviewMessage({ type: "send", sessionId: "A", text: "test message" });
+  assert.deepEqual(calls, [[providerId, "GLM-5.3"], ["send"]]);
+  assert.equal(f.state.pendingModel, null);
+});
+
+test("the picker highlights the account entry when the active Start Plan model uses a builtin alias", async t => {
+  const { f, flash } = startPlanFixture();
+  t.after(f.dispose);
+  f.state.client.readAvailableModels = async () => ({
+    known: true,
+    current: { providerId: "builtin:bigmodel-start-plan", modelId: "GLM-5.3" },
+    available: [flash],
+  });
+  await f.state.pushModels(true);
+  assert.equal(f.state.currentModel?.providerId, "builtin:bigmodel-start-plan");
+  const menu = f.posted.filter(message => message.type === "models").at(-1);
+  const current = menu?.current as { providerId: string; modelId: string };
+  assert.ok((menu?.available as PickerModel[]).some(model =>
+    model.providerId === current.providerId && model.modelId === current.modelId));
+});
+
+test("account selection survives a later snapshot listing only the builtin alias", async t => {
+  const { f, providerId, flash } = startPlanFixture();
+  t.after(f.dispose);
+  const builtin = "builtin:bigmodel-start-plan";
+  Object.assign(f.state, {
+    startPlanModelProvider: undefined,
+    runtime: { providerId: builtin, providerName: "Start Plan", kind: "anthropic", modelId: flash.modelId,
+      models: { "GLM-5.3": {}, "GLM-5.3-Flash": {} } },
+  });
+  let generating = true;
+  const calls: string[] = [];
+  Object.assign(f.state.client, {
+    isGenerating: () => generating,
+    readAvailableModels: async () => ({ known: true, available: [flash] }),
+    setModel: async (id: string) => { calls.push(id); },
+    sendMessage: async () => { calls.push("send"); },
+  });
+  f.state.resolveSessionModelRuntime = async () => null;
+  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  assert.equal(f.state.pendingModel?.providerId, providerId);
+  f.state.client.readAvailableModels = async () => ({ known: true, available: [{ ...flash, providerId: builtin }] });
+  await f.state.pushModels(true);
+  const menu = f.posted.filter(message => message.type === "models").at(-1)!;
+  const current = menu.current as { providerId: string; modelId: string };
+  const highlighted = (menu.available as PickerModel[]).some(model =>
+    model.providerId === current.providerId && model.modelId === current.modelId);
+  generating = false;
+  await f.state.onWebviewMessage({ type: "send", sessionId: "A", text: "test" });
+  assert.deepEqual({ highlighted, calls }, { highlighted: true, calls: [providerId, "send"] });
+});
+
+test("new account catalog arriving during credential lookup does not invalidate queued builtin selection", async t => {
+  const { f, flash } = startPlanFixture();
+  t.after(f.dispose);
+  const builtin = "builtin:bigmodel-start-plan";
+  Object.assign(f.state, {
+    startPlanModelProvider: undefined,
+    runtime: { providerId: builtin, providerName: "Start Plan", kind: "anthropic", modelId: flash.modelId,
+      models: { "GLM-5.3": {}, "GLM-5.3-Flash": {} } },
+  });
+  let generating = true;
+  const calls: string[] = [];
+  Object.assign(f.state.client, {
+    isGenerating: () => generating,
+    readAvailableModels: async () => ({ known: true, available: [{ ...flash, providerId: builtin }] }),
+    setModel: async (id: string) => { calls.push(id); },
+    sendMessage: async () => { calls.push("send"); },
+  });
+  const resolving = deferred();
+  const release = deferred();
+  const authLookups: string[] = [];
+  f.state.resolveSessionModelRuntime = async model => {
+    authLookups.push(model.providerId);
+    resolving.resolve();
+    await release.promise;
+    return null;
+  };
+  await f.state.onWebviewMessage({ type: "selectModel", providerId: builtin, modelId: "GLM-5.3" });
+  generating = false;
+  const send = f.state.onWebviewMessage({ type: "send", sessionId: "A", text: "test" });
+  await resolving.promise;
+  f.state.client.readAvailableModels = async () => ({ known: true, available: [flash] });
+  await f.state.pushModels(true);
+  release.resolve();
+  await send;
+  assert.deepEqual(calls, [flash.providerId, "send"]);
+  assert.deepEqual(authLookups, [builtin]);
 });
 
 test("an unreadable session catalog neither hides Start Plan models nor replaces the last valid one", async () => {
