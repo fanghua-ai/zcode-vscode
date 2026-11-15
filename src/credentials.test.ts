@@ -1560,3 +1560,33 @@ test("CLI synchronization updates or removes credentials for providers other tha
     else assert.equal(provider, undefined);
   }
 });
+
+test("API-key mode selects the configured provider instance over the legacy alias", async t => {
+  const dir = fixture(t);
+  for (const family of ["bigmodel", "zai"]) {
+    const legacyId = `builtin:${family}`;
+    const providerId = `migrated-${family}`;
+    const modelId = "GLM-5.3";
+    fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({
+      providerFamilyDomain: family, modelProviderFamilyModes: { [family]: "apiKey" },
+    }));
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ provider: {
+      [legacyId]: { options: { apiKey: "TEST-STALE" }, models: { [modelId]: {} } },
+    } }));
+    fs.writeFileSync(path.join(dir, "provider_config.json"), JSON.stringify({ config: {
+      defaultModelSelection: { providerId, modelId },
+      providerConfigRules: { providerRules: [{
+        providerId, templateId: `${family}-standard-api`,
+        config: { access: { type: "api-key", apiKey: "TEST-CURRENT" }, modelOrder: [modelId] },
+      }] },
+    } }));
+    const result = await resolveRuntime({ appVersion: "3.18.2" });
+    assert.equal(result.runtime?.providerId, providerId);
+    assert.equal(result.runtime?.source, "desktop-apikey");
+    assert.deepEqual([...new Set(result.picker.map(model => model.providerId))], [providerId]);
+    assert.equal(result.picker.filter(model => model.modelId === modelId).length, 1);
+    assert.equal(await resolveRuntimeForSession({ providerId: legacyId, modelId }), false);
+    assert.equal((await resolveRuntime({ preferredProviderId: providerId, preferredModelId: modelId,
+      strictPreferredProvider: true })).runtime?.apiKey, "TEST-CURRENT");
+  }
+});

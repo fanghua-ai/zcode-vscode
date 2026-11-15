@@ -657,6 +657,10 @@ export function readConfiguredDefaultModel(runtime: ResolvedRuntime | null, bina
     return { providerId: registeredStartPlanProvider(binaryPath, runtime.providerId) ?? runtime.providerId, modelId: runtime.modelId };
   }
   const cli = readCliDefaultModel();
+  if (runtime?.source === "desktop-apikey" && runtime.modelId
+      && (!cli || (/^builtin:(bigmodel|zai)$/.test(cli.providerId) && cli.providerId !== runtime.providerId))) {
+    return { providerId: runtime.providerId, modelId: runtime.modelId };
+  }
   if (cli) return cli;
   // When the CLI has no default yet (common on a fresh Windows install),
   // use the active account's advertised provider rather than its login alias.
@@ -708,7 +712,7 @@ function addProviderModels(
   }
 }
 
-export function buildPicker(config: V2Config | null): PickerModel[] {
+export function buildPicker(config: RuntimeConfig | null): PickerModel[] {
   const out: PickerModel[] = [];
   const providers = config?.provider ?? {};
   const settings = readV2Settings();
@@ -716,10 +720,10 @@ export function buildPicker(config: V2Config | null): PickerModel[] {
   const mode = domain ? settings?.modelProviderFamilyModes?.[domain] ?? "oauth" : "";
 
   if (isPlanFamily(domain) && mode === "apiKey") {
-    const providerId = `builtin:${domain}`;
+    const providerId = config?.desktopApiProviderIds?.[domain] ?? `builtin:${domain}`;
     const api = providers[providerId];
     const hasKey = providerApiKey(api).length > 0;
-    if (api && hasKey) {
+    if (api && hasKey && providerId.startsWith("builtin:")) {
       addProviderModels(out, providerId, api, api.name || "API key", true);
     }
   }
@@ -819,7 +823,11 @@ export function mergeDesktopApiProviders(
   return providers;
 }
 
-async function readRuntimeConfig(): Promise<V2Config | null> {
+type RuntimeConfig = V2Config & {
+  desktopApiProviderIds?: Partial<Record<PlanFamily, string>>;
+};
+
+async function readRuntimeConfig(): Promise<RuntimeConfig | null> {
   const legacy = await readV2ConfigWithRetry();
   const file = path.join(zcodeDir(), "v2", "provider_config.json");
   if (!fs.existsSync(file)) return legacy;
@@ -829,7 +837,25 @@ async function readRuntimeConfig(): Promise<V2Config | null> {
       readDesktopJsonWithRetry<unknown>(file),
       builtinFile ? readDesktopJsonWithRetry<unknown>(builtinFile).catch(() => null) : Promise.resolve(null),
     ]);
-    return { ...legacy, provider: mergeDesktopApiProviders(legacy?.provider ?? {}, personal, builtin) };
+    const config = (personal as {
+      config?: {
+        defaultModelSelection?: { providerId?: string };
+        providerConfigRules?: { providerRules?: DesktopProviderRule[] };
+      };
+    } | null)?.config;
+    const provider = mergeDesktopApiProviders(legacy?.provider ?? {}, personal, builtin);
+    const desktopApiProviderIds: RuntimeConfig["desktopApiProviderIds"] = {};
+    for (const family of ["bigmodel", "zai"] as const) {
+      const matching = (config?.providerConfigRules?.providerRules ?? []).filter(rule =>
+        rule?.providerId && (rule.templateId === `${family}-api` || rule.templateId === `${family}-standard-api`));
+      if (!matching.length) continue;
+      const legacyId = `builtin:${family}`;
+      if (!matching.some(rule => rule.providerId === legacyId)) delete provider[legacyId];
+      const selected = matching.find(rule => rule.providerId === config?.defaultModelSelection?.providerId)
+        ?? (matching.length === 1 ? matching[0] : undefined);
+      if (selected?.providerId) desktopApiProviderIds[family] = selected.providerId;
+    }
+    return { ...legacy, provider, desktopApiProviderIds };
   } catch {
     // A present but unreadable current registry must not revive stale keys.
     return { ...legacy, provider: {} };
@@ -911,6 +937,7 @@ export function buildPersonalShortcutPickerState(providerConfig: unknown, builti
     const ids = [
       ...(Array.isArray(rule.config?.modelOrder) ? rule.config.modelOrder : []),
       ...(Array.isArray(rule.config?.personalModelIds) ? rule.config.personalModelIds : []),
+      ...Object.keys(apiProviders[providerId]?.models ?? {}),
     ];
     if (rule.enabled === false || rule.config?.visibility === "hidden") {
       for (const rawModelId of ids) {
@@ -1379,7 +1406,7 @@ export async function resolveRuntime(opts?: {
   // Desktop family: oauth (personal or team) vs apiKey vs custom
   if (domain === "bigmodel" || domain === "zai") {
     if (mode === "apiKey") {
-      const stored = tryStored(`builtin:${domain}`, "desktop-apikey");
+      const stored = tryStored(config?.desktopApiProviderIds?.[domain] ?? `builtin:${domain}`, "desktop-apikey");
       if (stored) {
         logInfo("Reusing desktop API-key mode", stored.providerId);
         return finish(stored);
@@ -1480,6 +1507,7 @@ export async function resolveRuntimeForSession(model: {
     !resolved.managedProviderIds?.includes(model.providerId)
   ) return null;
   if (resolved.providerInventoryAuthoritative && resolved.managedProviderIds?.includes(model.providerId)) return null;
+  if (/^builtin:(bigmodel|zai)$/.test(model.providerId)) return false;
   if (isDesktopOauthProvider(model.providerId)) return null;
   return runtimeFromStoredProvider(model.providerId, model.modelId);
 }

@@ -1,5 +1,13 @@
 # 更新日志 / Changelog
 
+## 2.2.5 — 2026-11-15
+
+### 中文
+- 修复 ZCode 3.18.2 的 BigModel 和 Z.AI API Key 模式可能因沿用旧供应商 ID，导致模型无法选择或消息无法发送的问题。
+
+### English
+- Fix model selection and sending in ZCode 3.18.2 when BigModel or Z.AI API Key mode uses an outdated provider ID.
+
 ## 2.2.4 — 2026-11-13
 
 ### 中文
