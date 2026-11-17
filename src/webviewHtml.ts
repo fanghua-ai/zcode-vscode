@@ -90,7 +90,7 @@ export function getWebviewHtml(
   #settings-menu {
     font-size: 12px; line-height: 16px;
     position: absolute; top: calc(100% + 4px); right: 0; z-index: 100;
-    width: 280px; max-height: min(72vh, 440px); padding: 6px; border-radius: 10px;
+    width: min(280px, calc(100vw - 8px)); max-height: min(72vh, 440px); padding: 6px; border-radius: 10px;
     display: flex; flex-direction: column; gap: 6px;
     background: color-mix(in srgb, var(--vscode-menu-background, var(--vscode-editor-background)) 62%, transparent);
     border: 1px solid color-mix(in srgb, var(--vscode-foreground) 14%, transparent);
@@ -337,6 +337,8 @@ export function getWebviewHtml(
   }
   body.vscode-light .empty-mark svg { opacity: .36; }
   .empty-title { position: relative; font-size: 15px; line-height: 1.5; font-weight: 500; text-wrap: balance; }
+  .empty-status { margin: 8px 0 0; color: var(--z-muted); font-size: 12px; line-height: 1.45; }
+  .empty-action { margin-top: 10px; }
 
   .message { max-width: 100%; line-height: 1.55; }
   /* Desktop-parity tail spinner: alone at the transcript's bottom-left. */
@@ -486,15 +488,17 @@ export function getWebviewHtml(
   .turn-edit-btn,
   .question-fold-btn {
     position: static;
-    width: 22px;
-    height: 28px;
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    min-height: 24px;
     border: 0;
     border-radius: 5px;
     background: transparent;
   }
   .msg-meta.outside { gap: 4px; }
   .msg-meta.outside .msg-copy { width: 22px; height: 22px; }
-  .msg-meta.outside .question-fold-btn { width: 22px; height: 22px; }
+  .msg-meta.outside .question-fold-btn { width: 24px; height: 24px; min-width: 24px; min-height: 24px; }
   .msg-meta.outside .turn-chevron,
   .msg-meta.outside .msg-copy { border-radius: 4px; color: inherit; }
   .msg-meta.outside .turn-chevron:hover,
@@ -872,7 +876,13 @@ export function getWebviewHtml(
     flex-shrink: 0;
     padding-top: 2px;
     cursor: default;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
   }
+  #conn-status.actionable { cursor: pointer; border-radius: 4px; }
+  #conn-status.actionable:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
   #conn-label {
     font-size: 11px;
     color: var(--z-muted);
@@ -1088,7 +1098,8 @@ export function getWebviewHtml(
   #question-rail-track::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
   .q-dot {
     flex: 0 0 auto;
-    min-width: 18px;
+    min-width: 24px;
+    min-height: 24px;
     width: auto;
     align-self: stretch;
     position: relative;
@@ -1471,6 +1482,16 @@ export function getWebviewHtml(
   #goal-actions button:disabled { opacity:.4; cursor:default; }
   #goal-actions button:disabled:hover { background:transparent; color:var(--z-muted); }
   #image-drafts { overflow-x:auto; padding:6px 10px 2px; }
+  #unconfirmed-sends { margin:2px 10px 6px; font-size:11px; color:var(--z-muted); }
+  #unconfirmed-sends summary { cursor:pointer; }
+  #unconfirmed-sends-list { max-height:140px; overflow-y:auto; }
+  .unconfirmed-send { padding:4px 0; display:flex; align-items:center; flex-wrap:wrap; gap:4px; }
+  .unconfirmed-preview { flex:1 1 72px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .unconfirmed-send button {
+    padding:3px 6px; border:0; border-radius:4px; cursor:pointer;
+    color:var(--vscode-button-secondaryForeground); background:var(--vscode-button-secondaryBackground);
+  }
+  .unconfirmed-send button:hover { background:var(--vscode-button-secondaryHoverBackground); }
   .user-images { flex-wrap:wrap; margin-bottom:6px; }
   #attach-files { display:grid; place-items:center; flex:0 0 24px; width:24px; height:24px; padding:0; margin-top:-1px; }
   .image-chip { position:relative; display:flex; flex:0 0 auto; width:64px; height:64px; padding:0; border:1px solid var(--vscode-panel-border); border-radius:9px; overflow:hidden; color:var(--z-muted); background:var(--vscode-editor-background); }
@@ -1972,6 +1993,10 @@ export function getWebviewHtml(
     z-index: 300;
   }
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
   #tooltip {
     position: fixed; z-index: 120; max-width: 300px; padding: 6px 10px;
     background: var(--vscode-editorWidget-background);
@@ -2045,7 +2070,7 @@ export function getWebviewHtml(
     <button type="button" class="icon-btn" id="btn-settings" title="${t("设置")}" aria-label="${t("设置")}" aria-haspopup="dialog" aria-expanded="false">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" /><circle cx="12" cy="12" r="3" /></svg>
     </button>
-    <div id="settings-menu" role="dialog" aria-label="${t("设置")}" hidden>
+    <div id="settings-menu" role="dialog" aria-modal="true" aria-label="${t("设置")}" hidden>
         <div class="settings-section">${t("新会话默认值")}</div>
         <div class="settings-select-group">
           <label class="settings-select-label" for="default-session-model">${t("模型")}</label>
@@ -2102,7 +2127,7 @@ export function getWebviewHtml(
     </div>
   </div>
   <!-- Keep transcript selection focused when VS Code forwards clipboard commands. -->
-  <div id="messages" tabindex="-1"></div>
+  <div id="messages" tabindex="-1" role="log" aria-relevant="additions"></div>
   <div id="messages-scrollbar" hidden aria-hidden="true"><div id="messages-thumb"></div></div>
   <div id="composer">
     <div id="goal-zone">
@@ -2146,6 +2171,10 @@ export function getWebviewHtml(
         </div>
       </div>
       <div id="image-drafts"></div>
+      <details id="unconfirmed-sends" hidden>
+        <summary>${t("发送未确认")}</summary>
+        <div id="unconfirmed-sends-list"></div>
+      </details>
       <div id="input-area">
         <textarea id="input" rows="1" placeholder="${t("向 ZCode 提问，@ 添加上下文，/ 选择命令或能力")}"></textarea>
       </div>
@@ -2208,7 +2237,8 @@ export function getWebviewHtml(
     </div>
   </div>
 
-  <div id="toast"></div>
+  <div id="toast" aria-live="polite"></div>
+  <div id="live-summary" class="sr-only" aria-live="polite"></div>
   <div id="tooltip" role="tooltip"></div>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

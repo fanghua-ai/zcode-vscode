@@ -5,12 +5,13 @@ import * as os from "node:os";
 import nodeOs from "node:os";
 import * as path from "node:path";
 import type * as vscode from "vscode";
-import { mergeAvailablePickerModels, quotaProviderIsSelectable, ZCodeViewProvider } from "./extension";
+import { configuredQuotaAdapters, createRetryingDirectoryWatch, fetchConfiguredProviderQuota, mergeAvailablePickerModels, quotaProviderIsSelectable, resolveStartupWorkspacePath, ZCodeViewProvider } from "./extension";
 import type { PickerModel, ResolvedRuntime } from "./desktop";
-import { ZCodeClient } from "./zcodeClient";
+import { readConfiguredProviderApiKey } from "./credentials";
+import { SendStatusUnknownError, ZCodeClient } from "./zcodeClient";
 import { StartupTiming } from "./startupTiming";
 import type { AvailableModel } from "./zcodeClient";
-import { Uri, setTestLanguage, setTestFiles, workspace, window as testWindow, commands, recoveryCalls, recoveryNotices, setInformationChoice, configUpdates, resetConfigValues } from "./testSupport/vscode";
+import { Uri, setTestLanguage, setTestFiles, workspace, window as testWindow, commands, recoveryCalls, recoveryNotices, setInformationChoice, configUpdates, resetConfigValues, setConfigInspection } from "./testSupport/vscode";
 import { DiffDocuments } from "./diffDocuments";
 
 function deferred() {
@@ -1432,6 +1433,16 @@ test("retryLast acknowledges admission and associates a rejected retry with its 
   f.dispose();
 });
 
+test("legacy send and retry timeouts report an unconfirmed outcome separately from rejection", async () => {
+  const f = fixture();
+  f.state.client.sendMessage = async () => { throw new SendStatusUnknownError(true); };
+  for (const type of ["send", "retryLast"]) {
+    await f.state.onWebviewMessage({ type, sessionId: "A", commandId: type, text: "QUESTION" });
+  }
+  assert.deepEqual(f.posted.map(({type, sessionId, commandId, running}) => ({type, sessionId, commandId, running})),
+    ["send", "retryLast"].map(commandId => ({ type: "send_unconfirmed", sessionId: "A", commandId, running: true })));
+});
+
 test("retryLast reapplies a rejected Plan shortcut before sending and restores controls on failure", async () => {
   const f = fixture();
   const order: string[] = [];
@@ -2053,4 +2064,172 @@ test("model selections serialize delayed resolution and switching in selection o
   await Promise.all([a, b]);
   assert.deepEqual(switched, ["first", "second"]);
   assert.deepEqual(f.state.currentModel, { providerId: "sample", modelId: "second" });
+});
+
+test("quota adapters read user settings and only allow packaged hosts for missing desktop base URLs", async t => {
+  const manifest = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  assert.equal(manifest.contributes.configuration.properties["zcode.quotaAdapters"].scope, "window",
+    "application scope would ignore quota adapters stored in non-default VS Code profiles");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-quota-scope-"));
+  t.mock.method(nodeOs, "homedir", () => home);
+  t.after(() => { setConfigInspection("quotaAdapters", undefined); fs.rmSync(home, { recursive: true, force: true }); });
+  fs.mkdirSync(path.join(home, ".zcode", "v2"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".zcode", "v2", "config.json"), JSON.stringify({
+    provider: Object.fromEntries(["deepseek", "moonshot-kimi", "custom/global"].map(provider => [provider, { options: { apiKey: "TEST-ONLY-KEY" } }])),
+  }));
+  const workspaceOnly = {
+    id: "workspace-only", providerId: "custom/workspace", displayName: "Workspace",
+    endpoint: "https://quota.example.test/usage", auth: "none",
+    fields: [{ label: "Quota", remainingCountPath: "/remaining" }],
+  };
+  const globalOnly = { ...workspaceOnly, id: "global-only", providerId: "custom/global", displayName: "Global",
+    auth: "bearer", apiKeySource: "zcode", providerBaseURL: "https://quota.example.test" };
+  setConfigInspection("quotaAdapters", { workspaceValue: [workspaceOnly], globalValue: [globalOnly], defaultValue: [] });
+  const mixed = configuredQuotaAdapters();
+  assert.ok(mixed.some(item => item.providerId === "custom/global"));
+  assert.equal(mixed.some(item => item.providerId === "custom/workspace"), false);
+  const otherProfile = { ...globalOnly, id: "profile-other", providerId: "custom/profile-other" };
+  setConfigInspection("quotaAdapters", { globalValue: [otherProfile], workspaceValue: [workspaceOnly] });
+  const other = configuredQuotaAdapters();
+  assert.ok(other.some(item => item.providerId === "custom/profile-other"));
+  assert.equal(other.some(item => item.providerId === "custom/global" || item.providerId === "custom/workspace"), false);
+  setConfigInspection("quotaAdapters", { workspaceValue: [workspaceOnly], workspaceFolderValue: [workspaceOnly], defaultValue: [] });
+  assert.equal(configuredQuotaAdapters().some(item => item.providerId === "custom/workspace"), false);
+  const credential = await readConfiguredProviderApiKey("deepseek");
+  assert.equal(credential?.apiKey, "TEST-ONLY-KEY");
+  assert.equal(credential?.baseURL, undefined);
+  const https = require("https") as typeof import("https");
+  const targets: string[] = [];
+  t.mock.method(https, "request", (url: URL) => { targets.push(url.origin); throw new Error("fixture stops request"); });
+  setConfigInspection("quotaAdapters", { globalValue: [globalOnly] });
+  const context = { secrets: { get: async () => { throw new Error("secret storage"); } } } as never;
+  assert.equal(await fetchConfiguredProviderQuota(context, "custom/global"), null);
+  assert.deepEqual(targets, []);
+  await assert.rejects(fetchConfiguredProviderQuota(context, "deepseek"), /request-failed/);
+  await assert.rejects(fetchConfiguredProviderQuota(context, "moonshot-kimi"), /request-failed/);
+  assert.deepEqual(targets, ["https://api.deepseek.com", "https://api.moonshot.cn"]);
+});
+
+test("trusted workspaces keep their own opened directory overrides across projects", t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-workspace-path-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const first = path.join(directory, "first");
+  const second = path.join(directory, "second");
+  const nested = path.join(first, "nested");
+  fs.mkdirSync(nested, { recursive: true });
+  fs.mkdirSync(second);
+  const folders = [first, second].map(fsPath => ({ uri: { fsPath } }));
+  assert.deepEqual(resolveStartupWorkspacePath({ inspect: () => ({ globalValue: directory, workspaceValue: second }) }, folders, true), { path: second });
+  assert.deepEqual(resolveStartupWorkspacePath({ inspect: () => ({ globalValue: directory, workspaceValue: "nested" }) }, folders, true), { path: fs.realpathSync(nested) });
+  assert.deepEqual(resolveStartupWorkspacePath({ inspect: () => ({ workspaceValue: second }) }, folders, false), { blocked: true });
+  assert.deepEqual(resolveStartupWorkspacePath({ inspect: () => ({ globalValue: directory, workspaceValue: "" }) }, folders, true), { path: first });
+  assert.deepEqual(resolveStartupWorkspacePath({ inspect: () => ({ globalValue: directory, workspaceValue: directory }) }, folders, true), { path: directory });
+  assert.deepEqual(resolveStartupWorkspacePath({ inspect: () => ({ globalValue: second, workspaceValue: directory }) }, folders, true), { blocked: true });
+  assert.deepEqual(resolveStartupWorkspacePath({ inspect: () => ({ globalValue: second }) }, undefined, true), { path: second });
+  assert.deepEqual(resolveStartupWorkspacePath({ inspect: () => ({}) }, undefined, true), { path: "" });
+});
+
+test("workspace paths reject escaping symlinks while retaining an explicitly opened root alias", t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-workspace-links-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const root = path.join(directory, "root");
+  const nested = path.join(root, "nested");
+  const external = path.join(directory, "root-external");
+  const rootAlias = path.join(directory, "alias");
+  const nestedAlias = path.join(root, "nested-link");
+  const escape = path.join(root, "escape");
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  fs.mkdirSync(nested, { recursive: true });
+  fs.mkdirSync(external);
+  fs.symlinkSync(root, rootAlias, linkType);
+  fs.symlinkSync(external, escape, linkType);
+  fs.symlinkSync(nested, nestedAlias, linkType);
+  fs.writeFileSync(path.join(root, "file.txt"), "fixture");
+  const resolve = (workspaceValue: string) => resolveStartupWorkspacePath({ inspect: () => ({ workspaceValue }) }, [{ uri: { fsPath: rootAlias } }], true);
+  assert.deepEqual(resolve(rootAlias), { path: rootAlias });
+  assert.deepEqual(resolve(nestedAlias), { path: fs.realpathSync(nested) });
+  for (const entry of [escape, external, "escape", "../root-external", "not-found", "file.txt"]) {
+    assert.deepEqual(resolve(entry), { blocked: true }, entry);
+  }
+});
+
+test("startup blocks an external project path without switching directories and offers User Settings", async () => {
+  const f = fixture();
+  const state = f.state as typeof f.state & { startZCodeInner: () => Promise<void>; workspacePath: string };
+  Object.assign(state.client, { clearTiming() {} });
+  const previous = workspace.workspaceFolders;
+  workspace.workspaceFolders = [{ uri: { fsPath: path.join(os.tmpdir(), "opened") } }];
+  setConfigInspection("workspacePath", { workspaceValue: path.join(os.tmpdir(), "not-opened") });
+  try {
+    await state.startZCodeInner();
+    assert.equal(state.workspacePath, "");
+    assert.ok(f.posted.some(message => message.type === "workspace_required" && message.pathBlocked === true));
+    assert.equal(f.posted.some(message => JSON.stringify(message).includes(os.homedir())), false);
+    f.handler({ type: "openWorkspacePathSettings" });
+    assert.equal(recoveryCalls.at(-1)?.command, "workbench.action.openGlobalSettings");
+  } finally {
+    workspace.workspaceFolders = previous;
+    setConfigInspection("workspacePath", undefined);
+  }
+});
+
+test("editing an invalid or unchanged workspace path leaves the active session connected", async t => {
+  const f = fixture();
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-workspace-restart-"));
+  const first = path.join(directory, "first");
+  const second = path.join(directory, "second");
+  fs.mkdirSync(first);
+  fs.mkdirSync(second);
+  const previous = workspace.workspaceFolders;
+  workspace.workspaceFolders = [first, second].map(fsPath => ({ uri: { fsPath } }));
+  t.after(() => {
+    workspace.workspaceFolders = previous;
+    setConfigInspection("workspacePath", undefined);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  Object.assign(f.provider, { workspacePath: first });
+  const restart = t.mock.method(f.provider, "restart", async () => {});
+  const warn = t.mock.method(testWindow, "showWarningMessage", async () => undefined);
+  setConfigInspection("workspacePath", { workspaceValue: directory });
+  await f.provider.applyWorkspacePathSetting();
+  assert.equal(warn.mock.callCount(), 1);
+  setConfigInspection("workspacePath", { workspaceValue: first });
+  await f.provider.applyWorkspacePathSetting();
+  assert.equal(restart.mock.callCount(), 0);
+  setConfigInspection("workspacePath", { workspaceValue: second });
+  await f.provider.applyWorkspacePathSetting();
+  assert.equal(restart.mock.callCount(), 1);
+});
+
+test("directory watch retries and dispose does not close an already closed watcher", () => {
+  const events: string[] = [];
+  let onError: (error: unknown) => void = () => {};
+  let exists = false;
+  const handle = createRetryingDirectoryWatch({
+    exists: () => exists,
+    watch: (report) => {
+      events.push("watch");
+      onError = report;
+      return { close() { events.push("close"); if (events.filter(item => item === "close").length > 1) throw new Error("closed twice"); } };
+    },
+    schedule: (run) => { events.push("retry"); return { cancel() { events.push("cancel"); void run; } }; },
+    log: () => events.push("log"),
+  });
+  assert.deepEqual(events, ["retry"]);
+  handle.dispose();
+  assert.deepEqual(events, ["retry", "cancel"]);
+  exists = true;
+  let failed = false;
+  const started = createRetryingDirectoryWatch({
+    exists: () => true,
+    watch: (report) => {
+      onError = report;
+      return { close() { if (failed) throw new Error("closed twice"); failed = true; } };
+    },
+    schedule: () => ({ cancel() {} }),
+    log: () => {},
+  });
+  onError(new Error("watch failed"));
+  started.dispose();
+  assert.equal(failed, true);
 });

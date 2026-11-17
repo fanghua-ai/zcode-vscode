@@ -11,6 +11,7 @@ import * as readline from "readline";
 import { sameWorkspacePath } from "./workspacePath";
 import { listWorkspacePathVariants, sessionsFinishedSince, loadSubagentMessages, persistEmptySessionMode, loadSessionExecutionState, saveSessionRestoreIntent } from "./taskIndex";
 import { logDebug, logError, logInfo, logWarn } from "./log";
+import { redactSecrets } from "./redact";
 import {
   ResolvedRuntime,
   ResolveResult,
@@ -247,6 +248,8 @@ export interface PermissionRequest {
   rpcIds: Array<string | number>;
   requestId: string;
   sessionId?: string;
+  /** Shown against the current session only because the protocol omitted sessionId. */
+  inferredSession?: boolean;
   toolCallId?: string;
   toolName: string;
   reason?: string;
@@ -271,6 +274,8 @@ export interface UserInputRequest {
   rpcIds: Array<string | number>;
   requestId: string;
   sessionId?: string;
+  /** Shown against the current session only because the protocol omitted sessionId. */
+  inferredSession?: boolean;
   toolName?: string;
   prompt?: string;
   questions: UserInputQuestion[];
@@ -380,6 +385,14 @@ interface Pending {
   timer?: NodeJS.Timeout;
   method?: string;
   timing?: StartupTiming;
+}
+
+/** The legacy send request may still execute after its acknowledgement times out. */
+export class SendStatusUnknownError extends LocalizedError {
+  constructor(readonly running = false) {
+    super("发送状态未确认，请先查看当前对话。");
+    this.name = "SendStatusUnknownError";
+  }
 }
 
 const BASE_SESSION_MODES = new Set(["build", "edit", "yolo", "auto"]);
@@ -522,6 +535,7 @@ export class ZCodeClient {
   private projectionTruncated = false;
   private historyRowIds = new Map<string, number>();
   private snapshotWait: (() => void) | null = null;
+  private snapshotWaitReject: ((error: Error) => void) | null = null;
   private lastContext: { used: number; max: number } | null = null;
   private modelWindow: number | null = null;
   private lastQuota: QuotaLine[] = [];
@@ -873,6 +887,15 @@ export class ZCodeClient {
       crlfDelay: Infinity,
     });
     this.rl.on("line", (line) => this.handleLine(line));
+    const logStreamError = (stream: string) => (error: unknown) => {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      logWarn(`ZCode ${stream} stream error`, code ?? "stream-error");
+    };
+    proc.stdin.on("error", logStreamError("stdin"));
+    proc.stdout.on("error", logStreamError("stdout"));
+    proc.stderr.on("error", logStreamError("stderr"));
+    this.rl.on("error", logStreamError("stdout readline"));
+    this.errRl.on("error", logStreamError("stderr readline"));
     const accountSync = this.syncAccountProviders();
     if (opts?.createNew) {
       await accountSync;
@@ -1146,6 +1169,7 @@ export class ZCodeClient {
     this.releaseStopWait();
     this.runtimeNeedsRevalidation = true;
     this.sessionGeneration++;
+    this.denyInferredInteractions("Session changed");
     for (const state of this.subagentDetails.values()) if (state.publishTimer) clearTimeout(state.publishTimer);
     this.subagentDetails.clear();
     this.knownSubagents.clear();
@@ -1179,16 +1203,7 @@ export class ZCodeClient {
     // creation is in flight. Its identity must not win over the create response.
     if (created?.session?.sessionId) this.sessionId = created.session.sessionId;
 
-    if (!this.sessionId) {
-      this.opts.onEvent({
-        type: "session_error",
-        data: {
-          message:
-            "Session created but sessionId was not captured from requestRuntimePreferences",
-        },
-      });
-      return;
-    }
+    if (!this.sessionId) throw new LocalizedError("会话已创建，但没有返回会话编号。");
 
     this.sessionReadable = true;
     const stillThisSession = this.sessionScope();
@@ -1207,6 +1222,7 @@ export class ZCodeClient {
     this.releaseStopWait();
     this.runtimeNeedsRevalidation = true;
     this.sessionGeneration++;
+    if (changingSession) this.denyInferredInteractions("Session changed");
     for (const state of this.subagentDetails.values()) if (state.publishTimer) clearTimeout(state.publishTimer);
     this.subagentDetails.clear();
     this.knownSubagents.clear();
@@ -2660,23 +2676,35 @@ export class ZCodeClient {
     this.snapshotWait?.();
   }
 
+  private supersedeSnapshotWait(): void {
+    this.snapshotWaitReject?.(new LocalizedError("会话订阅已被新的订阅取代"));
+  }
+
   private expectSnapshot(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const finish = () => {
+        clearTimeout(timer);
         this.snapshotWait = null;
+        this.snapshotWaitReject = null;
+      };
+      const timer = setTimeout(() => {
+        finish();
         reject(new LocalizedError("会话快照同步超时，请重新切换会话"));
       }, 15000);
       this.snapshotWait = () => {
-        clearTimeout(timer);
-        this.snapshotWait = null;
+        finish();
         resolve();
+      };
+      this.snapshotWaitReject = (error: Error) => {
+        finish();
+        reject(error);
       };
     });
   }
 
   private async subscribeConversation(): Promise<void> {
     if (!this.sessionId) return;
-    this.snapshotWait?.();
+    this.supersedeSnapshotWait();
     this.resetResyncRetry();
     const gen = ++this.conversationGen;
     const nextTopic = `conversation/${this.sessionId}`;
@@ -2739,6 +2767,18 @@ export class ZCodeClient {
       if (typeof openTiming?.snapshotRowCount === "number") this.activeTiming?.note("snapshotRowCount", openTiming.snapshotRowCount);
       if (gen !== this.conversationGen) {
         this.activeTiming?.add("conversationSubscribe", Date.now() - subscribeStarted);
+        const subscriptionId = result.ack?.subscriptionId;
+        if (subscriptionId) {
+          try {
+            await this.sendRequest("v4/conversation/unsubscribe", {
+              topic: nextTopic,
+              subscriptionId,
+              connectionId: "zcode-vscode",
+            }, 5000);
+          } catch (error) {
+            logWarn("conversation unsubscribe failed", error);
+          }
+        }
         return;
       }
       this.conversationTopic = nextTopic;
@@ -2760,7 +2800,8 @@ export class ZCodeClient {
         snapshotRowCount: result.ack?.openTiming?.snapshotRowCount,
       });
     } catch (e) {
-      this.snapshotWait?.();
+      if (e instanceof LocalizedError && e.code === "会话订阅已被新的订阅取代" && gen !== this.conversationGen) return;
+      if (gen === this.conversationGen) this.snapshotWait?.();
       throw e;
     }
   }
@@ -3267,11 +3308,12 @@ export class ZCodeClient {
             sessionId,
             content,
           },
-          0
+          15000
         );
         this.stopping = false;
         return;
       } catch (e) {
+        if (e instanceof SendStatusUnknownError) throw e;
         lastError = e as Error;
         const message = lastError.message;
         if (this.stopping && isStopLikeError(message)) {
@@ -3401,10 +3443,21 @@ export class ZCodeClient {
         await this.requestSessionStop(sessionId);
         if (!isCurrent()) throw new LocalizedError("会话已切换，请在当前会话重新发送。");
         await this.waitForTurnIdle(4000);
+        if (!isCurrent()) throw new LocalizedError("会话已切换，请在当前会话重新发送。");
+        if (this.turnActive()) throw new LocalizedError("无法停止当前回复，编辑已取消。");
       } catch (e) {
         if (!isCurrent()) throw new LocalizedError("会话已切换，请在当前会话重新发送。");
+        if (e instanceof LocalizedError && (
+          e.code === "会话已切换，请在当前会话重新发送。" || e.code === "无法停止当前回复，编辑已取消。"
+        )) throw e;
         const message = e instanceof Error ? e.message : String(e);
-        if (!/guard\.stopTargetChanged/.test(message)) logWarn("stop before edit failed", e);
+        // The stop target already moved. Continue only when that turn is actually idle.
+        if (/guard\.stopTargetChanged/.test(message)) {
+          if (this.turnActive()) throw new LocalizedError("无法停止当前回复，编辑已取消。");
+        } else {
+          logWarn("stop before edit failed", e);
+          throw new LocalizedError("停止当前回复失败，编辑已取消。");
+        }
       }
     }
     if (!isCurrent()) throw new LocalizedError("会话已切换，请在当前会话重新发送。");
@@ -3790,7 +3843,13 @@ export class ZCodeClient {
       }>;
     };
     const requestId = p.requestId || String(id);
-    const owner = p.sessionId || this.sessionId || undefined;
+    const explicitSession = typeof p.sessionId === "string" && p.sessionId.length > 0;
+    const inferredSession = !explicitSession;
+    if (inferredSession && (!this.acceptLive || !this.sessionId)) {
+      this.respondToServer([id], { decision: "deny", reason: "No current session" });
+      return;
+    }
+    const owner = explicitSession ? p.sessionId : this.sessionId || undefined;
     const existing = this.pendingPermissions.get(requestId);
     if (existing) {
       existing.rpcIds.push(id);
@@ -3821,6 +3880,7 @@ export class ZCodeClient {
       rpcIds: [id],
       requestId,
       sessionId: owner,
+      ...(inferredSession ? { inferredSession: true } : {}),
       toolCallId: p.toolCallId,
       toolName: p.toolName || "tool",
       reason: p.reason,
@@ -3859,7 +3919,13 @@ export class ZCodeClient {
       }>;
     };
     const requestId = p.requestId || String(id);
-    const owner = p.sessionId || this.sessionId || undefined;
+    const explicitSession = typeof p.sessionId === "string" && p.sessionId.length > 0;
+    const inferredSession = !explicitSession;
+    if (inferredSession && (!this.acceptLive || !this.sessionId)) {
+      this.respondToServer([id], { action: "cancel", reason: "No current session" });
+      return;
+    }
+    const owner = explicitSession ? p.sessionId : this.sessionId || undefined;
     const existing = this.pendingUserInputs.get(requestId);
     if (existing) {
       existing.rpcIds.push(id);
@@ -3873,6 +3939,7 @@ export class ZCodeClient {
       rpcIds: [id],
       requestId,
       sessionId: owner,
+      ...(inferredSession ? { inferredSession: true } : {}),
       toolName: p.toolName,
       prompt: p.prompt,
       schema: p.schema,
@@ -3892,6 +3959,19 @@ export class ZCodeClient {
     if (!this.shouldShowInteraction(owner)) return;
     this.beginAssistantSegment();
     this.opts.onEvent({ type: "user_input_request", data: request });
+  }
+
+  private denyInferredInteractions(reason: string): void {
+    for (const [id, pending] of this.pendingPermissions) {
+      if (!pending.inferredSession) continue;
+      this.pendingPermissions.delete(id);
+      this.respondToServer(pending.rpcIds, { decision: "deny", reason });
+    }
+    for (const [id, pending] of this.pendingUserInputs) {
+      if (!pending.inferredSession) continue;
+      this.pendingUserInputs.delete(id);
+      this.respondToServer(pending.rpcIds, { action: "cancel", reason });
+    }
   }
 
   private denyPendingInteractions(reason: string, sessionId?: string): void {
@@ -3944,20 +4024,44 @@ export class ZCodeClient {
               if (this.pending.has(id)) {
                 this.pending.delete(id);
                 if (method === "session/resume") this.noteLateResume(id);
-                reject(new Error(`Request ${method} timed out after ${timeoutMs}ms`));
+                reject(method === "session/send"
+                  ? new SendStatusUnknownError(this.turnActive())
+                  : new Error(`Request ${method} timed out after ${timeoutMs}ms`));
               }
             }, timeoutMs)
           : undefined;
       this.pending.set(id, { resolve, reject, timer, method, timing: this.activeTiming });
-      this.write({ id, method, params });
+      const rejectWrite = (error: unknown) => {
+        if (!this.pending.delete(id)) return;
+        if (timer) clearTimeout(timer);
+        reject(error);
+      };
+      try {
+        this.write({ id, method, params }, rejectWrite);
+      } catch (error) {
+        rejectWrite(error);
+      }
     });
   }
 
-  private write(msg: ZCodeMessage): void {
+  private write(msg: ZCodeMessage, onError?: (error: Error) => void): void {
     if (!this.proc?.stdin) {
       throw new LocalizedError("ZCode 标准输入不可用");
     }
-    this.proc.stdin.write(JSON.stringify(msg) + "\n");
+    const payload = JSON.stringify(msg) + "\n";
+    const fail = (error: unknown) => {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code === "EPIPE") logWarn("ZCode stdin closed", code);
+      else logWarn("ZCode stdin write failed", code ?? "write-failed");
+      onError?.(new LocalizedError("ZCode 标准输入不可用"));
+    };
+    try {
+      this.proc.stdin.write(payload, (error) => {
+        if (error) fail(error);
+      });
+    } catch (error) {
+      fail(error);
+    }
   }
 
   private handleLine(line: string): void {
@@ -3969,7 +4073,7 @@ export class ZCodeClient {
     try {
       msg = JSON.parse(line);
     } catch {
-      logError("Failed to parse line", line.slice(0, 200));
+      logError("Failed to parse line", redactSecrets(line.slice(0, 200)));
       return;
     }
     const parseMs = performance.now() - parseStarted;
@@ -3980,6 +4084,7 @@ export class ZCodeClient {
       const timing = this.activeTiming;
       const started = performance.now();
       try { this.handleNotification(msg as ZCodeNotification); }
+      catch (error) { logError("Failed to handle notification", error); }
       finally { timing?.add("notificationHandlingMs", performance.now() - started); }
     } else if ("id" in msg && "result" in msg) {
       this.settleLateResume(msg.id);
@@ -4136,7 +4241,9 @@ export class ZCodeClient {
     }
     const childSession = p.sessionId ? this.subagentDetails.get(p.sessionId) : undefined;
     const childOwner = p.sessionId ? this.subagentSessionOwners.get(p.sessionId) : undefined;
-    if (!replay && !childSession && !childOwner) this.noteSessionTurn(p.sessionId, p.type);
+    if (!replay && !childSession && !childOwner) {
+      this.noteSessionTurn(p.sessionId || (this.acceptLive ? this.sessionId ?? undefined : undefined), p.type);
+    }
     if (!this.acceptLive) {
       if (p.sessionId) this.heldSessionEvents.push(params);
       return;
@@ -4482,36 +4589,41 @@ export class ZCodeClient {
       clearInterval(this.quotaTimer);
       this.quotaTimer = null;
     }
-    if (this.killTimer) {
-      clearTimeout(this.killTimer);
-      this.killTimer = null;
+    const proc = this.proc;
+    this.proc = null;
+    if (!proc) return;
+    try {
+      proc.stdin?.end();
+    } catch {
+      // ignore
     }
-    if (this.proc) {
-      const proc = this.proc;
-      this.proc = null;
+    // Node 22 keeps a failed spawn's handle until the error tick. kill()
+    // then uses pid 0 and signals the current process group.
+    if (!childIsRunning(proc)) {
+      if (this.killTimer) {
+        clearTimeout(this.killTimer);
+        this.killTimer = null;
+      }
+      return;
+    }
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      // ignore
+    }
+    // A second dispose must not cancel a SIGKILL that has not fired yet.
+    if (this.killTimer) return;
+    const timer = setTimeout(() => {
+      if (this.killTimer === timer) this.killTimer = null;
+      if (!childIsRunning(proc)) return;
       try {
-        proc.stdin?.end();
+        proc.kill("SIGKILL");
       } catch {
         // ignore
       }
-      // Node 22 keeps a failed spawn's handle until the error tick. kill()
-      // then uses pid 0 and signals the current process group.
-      if (childIsRunning(proc)) {
-        try {
-          proc.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
-        this.killTimer = setTimeout(() => {
-          if (!childIsRunning(proc)) return;
-          try {
-            proc.kill("SIGKILL");
-          } catch {
-            // ignore
-          }
-        }, 2000);
-      }
-    }
+    }, 2000);
+    timer.unref?.();
+    this.killTimer = timer;
   }
 }
 

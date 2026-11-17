@@ -8,7 +8,12 @@ let informationChoice: number | undefined;
 export const setInformationChoice = (index: number | undefined) => { informationChoice = index; };
 export const configUpdates: Array<{ key: string; value: unknown; target?: unknown }> = [];
 const configValues = new Map<string, unknown>();
-export const resetConfigValues = () => configValues.clear();
+const configLayers = new Map<string, { globalValue?: unknown; workspaceValue?: unknown; workspaceFolderValue?: unknown; defaultValue?: unknown }>();
+export const resetConfigValues = () => { configValues.clear(); configLayers.clear(); };
+export function setConfigInspection(key: string, value: { globalValue?: unknown; workspaceValue?: unknown; workspaceFolderValue?: unknown; defaultValue?: unknown } | undefined): void {
+  if (value === undefined) configLayers.delete(key);
+  else configLayers.set(key, value);
+}
 const disposable = () => ({ dispose() {} });
 export const recoveryNotices: Array<{message:string;items:string[]}> = [];
 export const window = {
@@ -40,11 +45,19 @@ export const workspace = {
       if (key === "language") return languageSetting;
       return configValues.has(key) ? configValues.get(key) : fallback;
     },
+    inspect(key: string) {
+      const layer = configLayers.get(key);
+      if (layer) return { key: `zcode.${key}`, ...layer };
+      if (configValues.has(key)) return { key: `zcode.${key}`, globalValue: configValues.get(key) };
+      return { key: `zcode.${key}` };
+    },
     async update(key: string, value: unknown, target?: unknown) {
       configUpdates.push({ key, value, target });
       configValues.set(key, value);
       if (key === "language") languageSetting = String(value);
     }, }; },
+  workspaceFolders: undefined as Array<{ uri: { fsPath: string } }> | undefined,
+  isTrusted: true,
   onDidChangeConfiguration: disposable,
   onDidChangeWorkspaceFolders: disposable,
   registerTextDocumentContentProvider: disposable,

@@ -300,6 +300,8 @@ let completionRevealJump = "";
 let completionRevealRaf = 0;
 let holdStreams = false;
 let sessionConnected = false;
+let workspaceRequired: false | "folder" | "path" = false;
+let lastSetup: { reason: string; hint: string; picker: PickerModel[] } | null = null;
 let viewGen = 0;
 let runningSessions = new Set<string>();
 let turnWorkStarted = 0;
@@ -376,6 +378,7 @@ interface LocalFile {
   change: FileChange;
 }
 const composerDrafts = new ComposerDrafts(vscode.getState()?.composerDrafts);
+const submittedDrafts = new ComposerDrafts(vscode.getState()?.submittedDrafts);
 let draftSessionId = typeof vscode.getState()?.draftSessionId === "string" ? String(vscode.getState()!.draftSessionId) : "";
 let draftPlanEnabled = false;
 let explicitChips: ContextChip[] = [];
@@ -384,11 +387,73 @@ let selectedSkills: SkillReference[] = [];
 let selectedAgents: AgentReference[] = [];
 let imageDrafts: DraftImage[] = [];
 const pendingInputs = new Map<string, { sessionId: string; draft: ComposerDraft; restoreOnReject?: boolean }>();
+const unconfirmedSendsEl = document.getElementById("unconfirmed-sends") as HTMLDetailsElement;
+const unconfirmedSendsList = document.getElementById("unconfirmed-sends-list")!;
 
-function persistComposerDraft(): void {
+function submittedDraftKey(sessionId: string, commandId: string): string {
+  return `${sessionId}\0${commandId}`;
+}
+
+function persistSubmittedDrafts(): void {
+  vscode.setState({ ...(vscode.getState() ?? {}), submittedDrafts: submittedDrafts.serialize() });
+}
+
+function rememberSubmittedDraft(sessionId: string, commandId: string, draft: ComposerDraft): void {
+  submittedDrafts.set(submittedDraftKey(sessionId, commandId), draft.text, draft.chips, draft.images, draft.sessionRefs,
+    draft.skills, draft.agents, draft.planEnabled);
+  persistSubmittedDrafts();
+}
+
+function takeSubmittedDraft(key: string): ComposerDraft | undefined {
+  const draft = submittedDrafts.take(key);
+  if (draft) persistSubmittedDrafts();
+  return draft;
+}
+
+function renderUnconfirmedSends(): void {
+  unconfirmedSendsList.replaceChildren();
+  setUiLabel(unconfirmedSendsEl.querySelector("summary")!, "发送未确认");
+  const owner = draftSessionId;
+  const prefix = submittedDraftKey(owner, "");
+  for (const key of submittedDrafts.keys()) {
+    if (!owner || !key.startsWith(prefix) || pendingInputs.has(key.slice(prefix.length))) continue;
+    const draft = submittedDrafts.get(key);
+    const row = document.createElement("div");
+    row.className = "unconfirmed-send";
+    const preview = document.createElement("span");
+    preview.className = "unconfirmed-preview";
+    preview.textContent = (draft.text.trim() || draft.images?.map(image => image.fileName).join(", ") || "").slice(0, 180);
+    const button = (label: string, restore: boolean) => {
+      const el = document.createElement("button");
+      el.type = "button";
+      el.dataset.action = restore ? "restore" : "discard";
+      setUiLabel(el, label);
+      el.addEventListener("click", () => {
+        if (draftSessionId !== owner) return;
+        const saved = submittedDrafts.take(key);
+        if (!saved) return;
+        if (restore) {
+          persistComposerDraft();
+          restoreComposerDraft(composerDrafts.recover(owner, saved));
+          persistComposerDraft(true);
+        } else persistSubmittedDrafts();
+        renderUnconfirmedSends();
+        input.focus();
+      });
+      return el;
+    };
+    row.append(preview, button("恢复到草稿", true), button("丢弃未确认的内容", false));
+    unconfirmedSendsList.append(row);
+  }
+  unconfirmedSendsEl.hidden = !unconfirmedSendsList.childElementCount;
+  if (unconfirmedSendsEl.hidden) unconfirmedSendsEl.open = false;
+}
+
+function persistComposerDraft(includeSubmitted = false): void {
   const text = activeCommand ? `/${activeCommand} ${input.value}` : input.value;
   composerDrafts.set(draftSessionId, text, explicitChips, imageDrafts, explicitSessionRefs, selectedSkills, selectedAgents, draftPlanEnabled);
-  vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId });
+  vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId,
+    ...(includeSubmitted ? { submittedDrafts: submittedDrafts.serialize() } : {}) });
 }
 
 let inputHistory: { texts: string[]; index: number; original: string } | undefined;
@@ -419,11 +484,13 @@ function restoreComposerDraft(draft: ComposerDraft): void {
 }
 
 function attachComposerDraft(sessionId: string): void {
-  if (sessionId === draftSessionId) return;
-  persistComposerDraft();
-  draftSessionId = sessionId;
-  restoreComposerDraft(composerDrafts.takePending(sessionId));
-  persistComposerDraft();
+  if (sessionId !== draftSessionId) {
+    persistComposerDraft();
+    draftSessionId = sessionId;
+    restoreComposerDraft(composerDrafts.takePending(sessionId));
+    persistComposerDraft();
+  }
+  renderUnconfirmedSends();
 }
 
 function prepareComposerSwitch(): void {
@@ -439,6 +506,7 @@ function prepareComposerSwitch(): void {
   draftSessionId = "";
   restoreComposerDraft(composerDrafts.get(""));
   persistComposerDraft();
+  renderUnconfirmedSends();
 }
 
 function recoverInput(msg: { commandId?: string; sessionId?: string; text?: string; chips?: ContextChip[]; sessionRefs?: SessionReference[]; attachments?: ImageAttachment[] }): ComposerDraft | undefined {
@@ -446,8 +514,11 @@ function recoverInput(msg: { commandId?: string; sessionId?: string; text?: stri
   const owner = pending ? (pending.sessionId || msg.sessionId || "") : msg.sessionId;
   const recoveredText = typeof msg.text === "string" ? extractLeadingSkills(msg.text) : undefined;
   const recoveredAgents = recoveredText ? extractLeadingAgents(recoveredText.text) : undefined;
-  const failed = pending?.draft ?? (recoveredText && recoveredAgents ? { ...recoveredText, ...recoveredAgents, chips: msg.chips ?? [], sessionRefs: msg.sessionRefs ?? [], images: readImageAttachments(msg.attachments).map(image => ({...image,id:crypto.randomUUID(),sessionId:owner || "",status:"ready" as const})) } : undefined);
+  const key = owner && msg.commandId ? submittedDraftKey(owner, msg.commandId) : undefined;
+  const stored = key ? takeSubmittedDraft(key) : undefined;
+  if (stored) renderUnconfirmedSends();
   if (msg.commandId) pendingInputs.delete(msg.commandId);
+  const failed = pending?.draft ?? stored ?? (recoveredText && recoveredAgents ? { ...recoveredText, ...recoveredAgents, chips: msg.chips ?? [], sessionRefs: msg.sessionRefs ?? [], images: readImageAttachments(msg.attachments).map(image => ({...image,id:crypto.randomUUID(),sessionId:owner || "",status:"ready" as const})) } : undefined);
   if (owner === undefined || !failed) return;
   persistComposerDraft();
   // A retry can leave an edited recovery draft in place instead of consuming it.
@@ -1021,7 +1092,8 @@ function updateComposerActions(): void {
   sendBtn.classList.toggle("stop", stopping);
   sendBtn.hidden = stopping;
   sendBtn.innerHTML = inserting ? ICON_QUEUE : ICON_SEND;
-  const sendTitle = !sessionConnected ? t("连接中") : inserting ? t("排队发送") : t("发送");
+  const sendTitle = workspaceRequired === "path" ? t("工作区路径需要确认")
+    : workspaceRequired ? t("请先打开文件夹") : !sessionConnected ? t("连接中") : inserting ? t("排队发送") : t("发送");
   sendBtn.title = sendTitle;
   sendBtn.setAttribute("aria-label", sendTitle);
   sendBtn.disabled = holdStreams || !sessionConnected;
@@ -1415,18 +1487,54 @@ function refreshEmptyGreeting(): void {
   greetingTimer = window.setTimeout(refreshEmptyGreeting, nextGreetingDelay(now));
 }
 
+function reopenSetup(): void {
+  if (!lastSetup || setupEl.classList.contains("open")) return;
+  showSetup(lastSetup.reason, lastSetup.hint, lastSetup.picker);
+}
+
+function syncConnAction(): void {
+  const reopen = !!lastSetup && !setupEl.classList.contains("open");
+  connStatus.classList.toggle("actionable", reopen);
+  if (reopen) {
+    connStatus.tabIndex = 0;
+    connStatus.setAttribute("role", "button");
+    connStatus.setAttribute("aria-label", t("重新打开设置"));
+  } else {
+    connStatus.tabIndex = -1;
+    connStatus.removeAttribute("role");
+    connStatus.removeAttribute("aria-label");
+  }
+}
+
+function announce(text: string): void {
+  const region = document.getElementById("live-summary");
+  if (!region || !text) return;
+  region.textContent = "";
+  region.textContent = text;
+}
+
 function emptyState(): void {
   questionIndex = [];
   oldestLoadedId = "";
   pendingJump = "";
   stopWorkTicker();
   turnWorkStarted = 0;
+  const guidance = workspaceRequired === "path"
+    ? `<p class="empty-status">${escapeText(t("工作区路径需要确认"))}</p><p class="empty-status">${escapeText(t("请打开目标文件夹，或在用户设置中确认 ZCode 的工作区路径。"))}</p><button type="button" class="empty-action" id="open-workspace-path-settings">${escapeText(t("打开设置"))}</button>`
+    : workspaceRequired ? `<p class="empty-status">${escapeText(t("请先打开文件夹。"))}</p><p class="empty-status">${escapeText(t("打开文件夹后才能开始对话。"))}</p>`
+    : lastSetup && !setupEl.classList.contains("open")
+      ? `<p class="empty-status">${escapeText(t("需要设置"))}</p><button type="button" class="empty-action" id="reopen-setup">${escapeText(t("重新打开设置"))}</button>`
+      : "";
   messagesEl.innerHTML = `<div class="empty">
     <div class="empty-mark" aria-hidden="true">${EMPTY_LOGO}</div>
     <div class="empty-title"></div>
+    ${guidance}
   </div>`;
+  messagesEl.querySelector("#reopen-setup")?.addEventListener("click", reopenSetup);
+  messagesEl.querySelector("#open-workspace-path-settings")?.addEventListener("click", () => post({ type: "openWorkspacePathSettings" }));
   refreshEmptyGreeting();
   syncQuestionRail();
+  syncConnAction();
 }
 
 function attachMessage(el: HTMLElement): void {
@@ -2028,14 +2136,18 @@ function addErrorMessage(text: string, rejectedDraft?: ComposerDraft): void {
         btn.disabled = true;
         const images = readImageAttachments(JSON.parse(question?.dataset.images || "[]"));
         const commandId = crypto.randomUUID();
-        if (rejectedDraft) {
+        const { text: retryText, skills } = extractLeadingSkills(failedPrompt || "");
+        const draft = rejectedDraft ?? {
+          ...extractLeadingAgents(retryText), skills, chips: [],
+          images: images.map(image => ({ ...image, id: crypto.randomUUID(), sessionId: ownerSessionId, status: "ready" as const })),
+        };
+        if (rejectedDraft) persistComposerDraft();
+        const consumed = rejectedDraft && draftSessionId === ownerSessionId && sameComposerDraft(composerDrafts.get(draftSessionId), rejectedDraft);
+        pendingInputs.set(commandId, { sessionId: ownerSessionId, draft, restoreOnReject: rejectedDraft ? consumed : true });
+        rememberSubmittedDraft(ownerSessionId, commandId, draft);
+        if (consumed) {
+          restoreComposerDraft({ text: "", chips: [] });
           persistComposerDraft();
-          const consumed = draftSessionId === ownerSessionId && sameComposerDraft(composerDrafts.get(draftSessionId), rejectedDraft);
-          pendingInputs.set(commandId, { sessionId: ownerSessionId, draft: rejectedDraft, restoreOnReject: consumed });
-          if (consumed) {
-            restoreComposerDraft({ text: "", chips: [] });
-            persistComposerDraft();
-          }
         }
         addUserMessage(failedPrompt || "", [], false, undefined, undefined, undefined, undefined, images);
         setGenerating(true);
@@ -5388,8 +5500,51 @@ function finishSessionAction(sessionId: string, requestId: string): void {
   if (overlayMode === "sessions") rebuildOverlay(overlaySearch.value);
 }
 
+let overlayReturn: HTMLElement | null = null;
+
+function rememberOverlayTrigger(): void {
+  const active = document.activeElement;
+  overlayReturn = active instanceof HTMLElement ? active : null;
+}
+
+function restoreOverlayTrigger(): void {
+  const target = overlayReturn;
+  overlayReturn = null;
+  if (target?.isConnected) target.focus();
+  else input.focus();
+}
+
+function overlayItemButtons(): HTMLButtonElement[] {
+  const list = overlay.classList.contains("open") ? overlayList : popoverList;
+  return [...list.querySelectorAll<HTMLButtonElement>(":scope > button.overlay-item:not([disabled])")];
+}
+
+function focusOverlayItem(index: number): void {
+  const items = overlayItemButtons();
+  if (!items.length) return;
+  const item = items[Math.max(0, Math.min(index, items.length - 1))];
+  item.focus({ preventScroll: true });
+  item.scrollIntoView({ block: "nearest" });
+}
+
+function moveOverlayItem(delta: number): void {
+  const items = overlayItemButtons();
+  if (!items.length) return;
+  const current = items.indexOf(document.activeElement as HTMLButtonElement);
+  const start = current === -1 ? (delta > 0 ? -1 : items.length) : current;
+  focusOverlayItem(start + delta);
+}
+
+function onOverlayKeydown(event: KeyboardEvent): void {
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  if (!overlay.classList.contains("open") && !popover.classList.contains("open")) return;
+  event.preventDefault();
+  moveOverlayItem(event.key === "ArrowDown" ? 1 : -1);
+}
+
 function openOverlay(mode: "sessions" | "models" | "mode" | "thought"): void {
   hideTooltip();
+  rememberOverlayTrigger();
   if (mode === "sessions") {
     closePicker();
     overlayMode = mode;
@@ -5460,6 +5615,7 @@ function openPicker(mode: "models" | "mode" | "thought"): void {
   // Opening a menu from the hovered chip must dismiss its hover card, or the
   // card sits on top of the menu the user is trying to read.
   hideTooltip();
+  rememberOverlayTrigger();
   overlay.classList.remove("open");
   if (overlayMode === mode && popover.classList.contains("open")) {
     closePicker();
@@ -5470,6 +5626,9 @@ function openPicker(mode: "models" | "mode" | "thought"): void {
   setPickerExpanded(mode);
   rebuildOverlay("");
   placePicker();
+  const items = overlayItemButtons();
+  const active = items.findIndex((item) => item.classList.contains("active"));
+  focusOverlayItem(active >= 0 ? active : 0);
 }
 
 function closePicker(): void {
@@ -5480,11 +5639,15 @@ function closePicker(): void {
   setPickerExpanded(null);
 }
 
-function closeOverlay(): void {
+function closeOverlay(opts?: { restoreTrigger?: boolean }): void {
   overlay.classList.remove("open");
   closePicker();
   overlayMode = null;
-  input.focus();
+  if (opts?.restoreTrigger) restoreOverlayTrigger();
+  else {
+    overlayReturn = null;
+    input.focus();
+  }
 }
 
 function rebuildOverlay(query: string): void {
@@ -5492,6 +5655,15 @@ function rebuildOverlay(query: string): void {
   overlayItems = [];
   const listEl =
     overlayMode === "sessions" ? overlayList : popoverList;
+  const focused = document.activeElement as HTMLElement | null;
+  const focusedRow = focused?.closest<HTMLButtonElement>(".overlay-item[data-item-id]");
+  const focusedId = focusedRow?.parentElement === listEl ? focusedRow.dataset.itemId : undefined;
+  const focusedAction = focused?.dataset?.act;
+  const restoreFallbackFocus = () => {
+    if (focusedId === undefined) return;
+    if (overlayMode === "sessions") overlaySearch.focus();
+    else if (overlayMode) pickerAnchor(overlayMode).focus();
+  };
   listEl.innerHTML = "";
   paintSessionListNotice();
 
@@ -5559,12 +5731,13 @@ function rebuildOverlay(query: string): void {
 
   if (overlayItems.length === 0) {
     if (overlayMode === "sessions" && sessionListNotice === "initial") {
-      listEl.innerHTML = "";
+      restoreFallbackFocus();
       placePicker();
       return;
     }
     const key = "Nothing matches.";
     listEl.innerHTML = `<div class="overlay-empty" data-i18n-key="${escapeText(key)}">${t(key)}</div>`;
+    restoreFallbackFocus();
     placePicker();
     return;
   }
@@ -5583,6 +5756,7 @@ function rebuildOverlay(query: string): void {
     }
     const el = document.createElement("button");
     el.type = "button";
+    el.dataset.itemId = item.id;
     el.className =
       "overlay-item" +
       (item.disabled ? " disabled" : "") +
@@ -5639,10 +5813,20 @@ function rebuildOverlay(query: string): void {
     el.addEventListener("click", () => selectOverlay(idx));
     listEl.appendChild(el);
   });
-  // The compact model picker can hold more entries than its visible viewport.
-  // Keep the current choice in view after search-driven rebuilds as well.
-  listEl.querySelector<HTMLElement>(".overlay-item.active")?.scrollIntoView({ block: "nearest" });
   placePicker();
+  if (focusedId !== undefined) {
+    const buttons = overlayItemButtons();
+    const row = buttons.find(button => button.dataset.itemId === focusedId);
+    const action = focusedAction && [...(row?.querySelectorAll<HTMLButtonElement>("button[data-act]:not([disabled])") ?? [])]
+      .find(button => button.dataset.act === focusedAction);
+    const target = action || row || buttons.find(button => button.classList.contains("active")) || buttons[0];
+    if (target) {
+      target.focus({ preventScroll: true });
+      target.scrollIntoView({ block: "nearest" });
+    } else restoreFallbackFocus();
+  } else {
+    listEl.querySelector<HTMLElement>(".overlay-item.active")?.scrollIntoView({ block: "nearest" });
+  }
 }
 
 function selectOverlay(idx: number): void {
@@ -5702,7 +5886,10 @@ function selectOverlay(idx: number): void {
 }
 
 function showSetup(reason: string, hint: string, picker: PickerModel[]): void {
+  lastSetup = { reason, hint, picker: picker.slice() };
+  workspaceRequired = false;
   setupEl.classList.add("open");
+  syncConnAction();
   const guidance = errorGuidance(reason || hint);
   setUiLabel(setupTitle, guidance.title);
   setUiLabel(setupHint, guidance.hint);
@@ -5743,7 +5930,10 @@ function showSetup(reason: string, hint: string, picker: PickerModel[]): void {
 }
 
 function hideSetup(): void {
+  const wasOpen = setupEl.classList.contains("open");
   setupEl.classList.remove("open");
+  syncConnAction();
+  if (wasOpen && !messagesEl.querySelector(".message, .tool-call, .perm-card, .ask-card")) emptyState();
 }
 
 type HistoryViewItem = {
@@ -6768,7 +6958,9 @@ function sendMessage(immediate = false): void {
   const refs = explicitSessionRefs.map(reference => ({ ...reference }));
   const commandId = crypto.randomUUID();
   const recoveryText = prompt;
-  pendingInputs.set(commandId, { sessionId: draftSessionId, draft: { text: recoveryText, ...(planShortcut ? { planEnabled: true } : {}), chips: explicitChips.map(chip => ({ ...chip })), sessionRefs: refs, images, skills: selectedSkills.map(skill => ({ ...skill })), agents: selectedAgents.map(agent => ({ ...agent })) } });
+  const draft = { text: recoveryText, ...(planShortcut ? { planEnabled: true } : {}), chips: explicitChips.map(chip => ({ ...chip })), sessionRefs: refs, images, skills: selectedSkills.map(skill => ({ ...skill })), agents: selectedAgents.map(agent => ({ ...agent })) };
+  pendingInputs.set(commandId, { sessionId: draftSessionId, draft });
+  if (!isGenerating) rememberSubmittedDraft(draftSessionId, commandId, draft);
   draftPlanEnabled = false;
   input.value = "";
   clearActiveCommand();
@@ -7767,6 +7959,12 @@ function closeSettings(): void {
   settingsMenu.hidden = true;
   settingsButton.setAttribute("aria-expanded", "false");
 }
+function settingsFocusables(): HTMLElement[] {
+  return [...settingsMenu.querySelectorAll<HTMLElement>("button, input, select, textarea, a[href]")].filter((el) => {
+    if (el.hasAttribute("disabled") || el.getAttribute("aria-hidden") === "true") return false;
+    return !el.closest("[hidden]");
+  });
+}
 settingsButton.addEventListener("click", () => {
   settingsMenu.hidden = !settingsMenu.hidden;
   settingsButton.setAttribute("aria-expanded", String(!settingsMenu.hidden));
@@ -7795,9 +7993,32 @@ function applyComposerChrome(chrome: {
   applyQuestionRailVisibility();
   applyUsageVisibility();
   applyControlFold();
+  applyNarrowComposer();
 }
 const controlsToggle = document.getElementById("controls-toggle") as HTMLButtonElement;
 let sessionControlsOpen = vscode.getState()?.sessionControlsOpen === true;
+let narrowComposer = false;
+let narrowControlsOpen = sessionControlsOpen;
+function savedControlFlag(id: string): boolean {
+  return (document.getElementById(id) as HTMLInputElement | null)?.checked === true;
+}
+function applyNarrowComposer(): void {
+  const width = composerEl.clientWidth;
+  const narrow = width > 0 && width < 420;
+  const icons = narrow ? "true" : String(savedControlFlag("session-controls-icons"));
+  const fold = narrow ? "true" : String(savedControlFlag("fold-session-controls"));
+  const root = document.documentElement;
+  const changed = narrow !== narrowComposer || root.dataset.sessionControlsIcons !== icons || root.dataset.foldSessionControls !== fold;
+  if (!changed) return;
+  if (narrow && !narrowComposer) {
+    narrowControlsOpen = sessionControlsOpen;
+    sessionControlsOpen = false;
+  } else if (!narrow && narrowComposer) sessionControlsOpen = narrowControlsOpen;
+  narrowComposer = narrow;
+  root.dataset.sessionControlsIcons = icons;
+  root.dataset.foldSessionControls = fold;
+  applyControlFold();
+}
 function applyControlFold(): void {
   const fold = document.documentElement.dataset.foldSessionControls === "true";
   const open = fold && sessionControlsOpen;
@@ -7811,6 +8032,7 @@ function applyControlFold(): void {
 controlsToggle.addEventListener("click", (event) => {
   event.stopPropagation();
   sessionControlsOpen = !sessionControlsOpen;
+  if (narrowComposer) narrowControlsOpen = sessionControlsOpen;
   vscode.setState({ ...(vscode.getState() ?? {}), sessionControlsOpen });
   applyControlFold();
 });
@@ -7820,6 +8042,7 @@ for (const input of settingsMenu.querySelectorAll<HTMLInputElement>("input[data-
     applyQuestionRailVisibility();
     applyUsageVisibility();
     applyControlFold();
+    applyNarrowComposer();
     post({ type: "setChrome", chromeKey: input.dataset.chrome, enabled: input.checked });
   });
 }
@@ -7827,7 +8050,25 @@ document.addEventListener("click", event => {
   if (!settingsMenu.contains(event.target as Node) && !settingsButton.contains(event.target as Node)) closeSettings();
 });
 settingsMenu.addEventListener("keydown", event => {
-  if (event.key === "Escape") { closeSettings(); settingsButton.focus(); }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeSettings();
+    settingsButton.focus();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const items = settingsFocusables();
+  if (!items.length) return;
+  const first = items[0];
+  const last = items[items.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 });
 function applyInterfaceLanguage(language: string, setting: LanguageSetting): void {
   setUiLanguage(resolveUiLanguage(language, "en"));
@@ -7902,7 +8143,7 @@ document.getElementById("btn-retry")!.addEventListener("click", () => {
 modelChip.addEventListener("click", () => openOverlay("models"));
 modeChip.addEventListener("click", () => openOverlay("mode"));
 thoughtChip.addEventListener("click", () => openOverlay("thought"));
-new ResizeObserver(() => placePicker()).observe(composerEl);
+new ResizeObserver(() => { placePicker(); applyNarrowComposer(); }).observe(composerEl);
 document.addEventListener("mousedown", (e) => {
   if (!popover.classList.contains("open")) return;
   const t = e.target as Node;
@@ -7916,7 +8157,7 @@ document.addEventListener("mousedown", (e) => {
   }
   closePicker();
 });
-document.getElementById("overlay-close")!.addEventListener("click", closeOverlay);
+document.getElementById("overlay-close")!.addEventListener("click", () => closeOverlay());
 document.querySelector("#session-list-notice button")?.addEventListener("click", () => {
   if (sessionListRequestId) return;
   const loadMore = sessionListHasMore && sessionListNotice === "ready";
@@ -7929,19 +8170,44 @@ overlay.addEventListener("click", (e) => {
 });
 overlaySearch.addEventListener("input", () => rebuildOverlay(overlaySearch.value));
 overlaySearch.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    e.stopPropagation();
+    moveOverlayItem(e.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
   if (e.key === "Enter" && overlayItems[0]) {
     e.preventDefault();
     selectOverlay(0);
   }
 });
+overlay.addEventListener("keydown", onOverlayKeydown);
+popover.addEventListener("keydown", onOverlayKeydown);
+connStatus.addEventListener("click", () => reopenSetup());
+connStatus.addEventListener("keydown", (event) => {
+  if (!connStatus.classList.contains("actionable")) return;
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  reopenSetup();
+});
 
 document.getElementById("setup-close")!.addEventListener("click", hideSetup);
 
 window.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") {
-    closeOverlay();
-    hideSetup();
+  if (e.key !== "Escape") return;
+  if (!settingsMenu.hidden) {
+    if (settingsMenu.contains(document.activeElement)) return;
+    e.preventDefault();
+    closeSettings();
+    settingsButton.focus();
+    return;
   }
+  if (overlay.classList.contains("open") || popover.classList.contains("open")) {
+    e.preventDefault();
+    closeOverlay({ restoreTrigger: true });
+    return;
+  }
+  hideSetup();
 });
 
 window.addEventListener("message", (event) => {
@@ -7955,6 +8221,8 @@ window.addEventListener("message", (event) => {
   switch (msg.type) {
     case "session_ready":
       if (msg.sessionId !== currentSessionId) { slashSkills = []; slashAgents = []; }
+      workspaceRequired = false;
+      lastSetup = null;
       hideSetup();
       clearStartupWait();
       if (
@@ -8308,10 +8576,9 @@ window.addEventListener("message", (event) => {
         ? `${msg.current.providerId} / ${msg.current.modelId}`
         : t("Select model");
       refreshModelSwitchLabels();
-      if (msg.needsSelection) {
+      if (msg.needsSelection && overlayMode !== "models") {
         openOverlay("models");
-      }
-      if (overlayMode === "models") rebuildOverlay(overlaySearch.value);
+      } else if (overlayMode === "models") rebuildOverlay(overlaySearch.value);
       renderNewSessionSettings();
       break;
     case "new_session_defaults":
@@ -8324,10 +8591,22 @@ window.addEventListener("message", (event) => {
       break;
     case "setup":
       sessionConnected = false;
+      workspaceRequired = false;
       clearStartupWait();
       setStatus("warn", msg.reason || t("Setup needed"));
       updateComposerActions();
       showSetup(msg.reason || t("Setup needed"), msg.hint || "", msg.picker || []);
+      if (!messagesEl.querySelector(".message")) emptyState();
+      break;
+    case "workspace_required":
+      workspaceRequired = msg.pathBlocked ? "path" : "folder";
+      lastSetup = null;
+      sessionConnected = false;
+      clearStartupWait();
+      hideSetup();
+      setConnStatus("warn", t(msg.pathBlocked ? "工作区路径需要确认" : "请先打开文件夹"));
+      updateComposerActions();
+      emptyState();
       break;
     case "ui_language":
       applyInterfaceLanguage(msg.language, msg.setting);
@@ -8377,6 +8656,7 @@ window.addEventListener("message", (event) => {
         }
         updateComposerActions();
       } else if (msg.status === "completedSuccess" || msg.status === "completedInterrupted") {
+        announce(msg.status === "completedInterrupted" ? t("已停止") : t("回复已完成"));
         const revealStart = msg.status === "completedSuccess" && revealAfterCompletionArmed && stickToBottom;
         if (currentSessionId) runningSessions.delete(currentSessionId);
         if (overlayMode === "sessions") rebuildOverlay(overlaySearch.value);
@@ -8408,6 +8688,7 @@ window.addEventListener("message", (event) => {
         settleReplyFooters();
         const text = msg.message || t("The model failed to complete this turn");
         setStatus("error", t(errorGuidance(text).title));
+        announce(t(errorGuidance(text).title));
         addErrorMessage(text);
       }
       break;
@@ -8417,7 +8698,7 @@ window.addEventListener("message", (event) => {
       else if (activityPhase === "sync") noteActivity("waiting");
       break;
     case "session_error":
-      if (holdStreams) break;
+      if (msg.sessionId && msg.sessionId !== currentSessionId) break;
       clearStartupWait();
       setGenerating(false);
       removePendingEditPens();
@@ -8426,6 +8707,7 @@ window.addEventListener("message", (event) => {
       {
         const text = msg.message || t("Session error");
         setStatus("error", t(errorGuidance(text).title));
+        announce(t(errorGuidance(text).title));
         addErrorMessage(text);
       }
       break;
@@ -8503,14 +8785,40 @@ window.addEventListener("message", (event) => {
       currentQueue = msg.items ?? [];
       syncQueuedMessages();
       break;
-    case "send_admitted":
-      if (msg.commandId) pendingInputs.delete(msg.commandId);
+    case "send_admitted": {
+      if (!msg.commandId) break;
+      const owner = pendingInputs.get(msg.commandId)?.sessionId || msg.sessionId;
+      pendingInputs.delete(msg.commandId);
+      if (owner) {
+        const key = submittedDraftKey(owner, msg.commandId);
+        if (takeSubmittedDraft(key)) renderUnconfirmedSends();
+      }
       break;
+    }
+    case "send_unconfirmed": {
+      if (msg.commandId) pendingInputs.delete(msg.commandId);
+      renderUnconfirmedSends();
+      if (holdStreams || msg.sessionId !== currentSessionId) break;
+      const message = msg.message || t("发送状态未确认，请先查看当前对话。");
+      if (isGenerating && !msg.running) {
+        setGenerating(false);
+        removePendingEditPens();
+        settleWorkFolds("interrupted");
+        settleReplyFooters();
+        setConnStatus("warn", message);
+      }
+      showToast(message);
+      break;
+    }
     case "send_rejected":
       if (msg.keepDraft === false) {
         if (!msg.sessionId || msg.sessionId === currentSessionId) showToast(msg.message || "");
         break;
       }
+      // A tracked submission can already have been restored or dismissed after
+      // a webview reload. A late rejection must not restore that content again.
+      if (msg.commandId && !pendingInputs.has(msg.commandId) &&
+          (!msg.sessionId || !submittedDrafts.has(submittedDraftKey(msg.sessionId, msg.commandId)))) break;
       const rejectedDraft = recoverInput(msg);
       if (!msg.sessionId || msg.sessionId === currentSessionId) {
         setGenerating(false);
@@ -8672,7 +8980,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") refreshEmptyGreeting();
   else clearGreetingTimer();
 });
-window.addEventListener("blur", persistComposerDraft);
+window.addEventListener("blur", () => persistComposerDraft());
 restoreComposerDraft(composerDrafts.get(draftSessionId));
 updateComposerActions();
 emptyState();

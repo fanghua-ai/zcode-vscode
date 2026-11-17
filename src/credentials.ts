@@ -1012,7 +1012,7 @@ export async function fetchPlanQuota(plan: {
     : `${host}/api/monitor/usage/quota/limit`;
   const resp = await httpGetJson(url, bizHeaders(apiKey, plan.team));
   if (!bizOk(resp)) {
-    throw new Error(`Failed to read plan quota: ${resp.msg ?? resp.code}`);
+    throw new PlanAuthError("quota", "rejected", { code: resp.code, success: resp.success, httpStatus: resp.httpStatus });
   }
   const data = resp.data as { limits?: unknown } | undefined;
   const limits = Array.isArray(data?.limits) ? data.limits : [];

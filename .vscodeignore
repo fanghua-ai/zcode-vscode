@@ -8,6 +8,7 @@
 !LICENSE
 !THIRD-PARTY-NOTICES.txt
 !media/icon-zcode-vscode.png
+!media/icon-zcode-sidebar.svg
 !dist/extension.js
 !dist/webview.js
 !dist/desktopPluginOverlayPreload.cjs

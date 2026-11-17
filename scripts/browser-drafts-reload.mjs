@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 
-// Reload the actual built webview three times with a persistent mock VS Code
+// Reload the actual built webview with a persistent mock VS Code
 // state bridge. No live account, conversation database, or app-server is used.
 const root = await mkdtemp(path.join(tmpdir(), "zcode-draft-reload-"));
 try {
@@ -64,11 +64,39 @@ try {
         check(input.value==='B retained draft','late failure changed active B draft');
         check(savedState.composerDrafts['reload-A'].text==='Newer A typing\\n\\nA draft with 哈哈','failure overwrote newer A typing');
         reload(3);
-      }else{
+      }else if(phase===3){
         ready('reload-B',1);check(input.value==='B retained draft','B draft lost after third reload');
         change('reload-A',2);check(input.value==='Newer A typing\\n\\nA draft with 哈哈','recovered draft lost after reload');
         check(savedState.composerDrafts['reload-A'].chips.length===1,'recovery duplicated references');
         check(savedState.composerDrafts['reload-A'].images[0].ref==='reload-ref','late rejection lost image after real reload');
+        document.getElementById('send-btn').click();const request=sent.find(m=>m.type==='send');
+        check(request.attachments[0].ref==='reload-ref','test send did not include the recovered image');
+        type('A text typed after sending');
+        change('reload-B',3);
+        emit({type:'send_unconfirmed',commandId:request.commandId,sessionId:'reload-A',running:false});
+        sessionStorage.setItem('request',JSON.stringify(request));
+        check(input.value==='B retained draft'&&document.getElementById('unconfirmed-sends').hidden,'unconfirmed A send appeared in B');
+        reload(4);
+      }else{
+        ready('reload-B',1);
+        check(document.getElementById('unconfirmed-sends').hidden,'unconfirmed A send appeared in B on reload');
+        change('reload-A',2);
+        check(input.value==='A text typed after sending','unconfirmed send was automatically restored into the composer');
+        const panel=document.getElementById('unconfirmed-sends');
+        check(!panel.hidden,'unconfirmed A send lost on reload');
+        panel.open=true;
+        const restore=panel.querySelector('button[data-action="restore"]');
+        restore.click();restore.click();
+        check(input.value==='A text typed after sending\\n\\nNewer A typing\\n\\nA draft with 哈哈','restore lost or duplicated text');
+        check(savedState.composerDrafts['reload-A'].chips.length===1,'unconfirmed restore lost selection');
+        check(savedState.composerDrafts['reload-A'].images[0].ref==='reload-ref','unconfirmed restore lost image');
+        check(panel.hidden&&!sent.some(m=>m.type==='send'||m.type==='retryLast'),'restoring an unconfirmed send sent it again');
+        const original=JSON.parse(sessionStorage.getItem('request'));
+        emit({type:'send_rejected',commandId:original.commandId,sessionId:'reload-A',text:original.text,attachments:original.attachments});
+        check(input.value==='A text typed after sending\\n\\nNewer A typing\\n\\nA draft with 哈哈','late rejection restored the same content twice');
+        document.getElementById('send-btn').click();const accepted=sent.find(m=>m.type==='send');
+        emit({type:'send_admitted',commandId:accepted.commandId,sessionId:'reload-A'});
+        check(Object.keys(savedState.submittedDrafts).length===0,'confirmed send left a recovery copy');
         check(errors.length===0,'browser errors');
         const pre=document.createElement('pre');pre.id='reload-results';pre.textContent=JSON.stringify({pass:true,checks:count});document.body.appendChild(pre);
       }
@@ -86,7 +114,7 @@ try {
   assert.ok(match, result.stdout.slice(-3000));
   const report = JSON.parse(match[1].replaceAll("&quot;", '"').replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&"));
   assert.equal(report.pass, true, report.error);
-  console.log(`Browser draft reload passed: 3 real page reloads, ${report.checks} checks.`);
+  console.log(`Browser draft reload passed: 4 real page reloads, ${report.checks} checks.`);
 } finally {
   await rm(root, { recursive: true, force: true });
 }

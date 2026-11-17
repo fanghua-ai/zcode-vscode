@@ -1,7 +1,7 @@
 import { allowedDesktopPlugins, DESKTOP_PLUGIN_CHOICES } from "./desktopPluginChoices";
 import { rankWorkspaceFiles, workspaceSearchPatterns } from "./fileSearch";
 import { existingWorkspaceFile, previewFileKind, previewFilesForReply } from "./filePreview";
-import { resolveFileTarget } from "./workspaceFiles";
+import { isPlainFilePath, resolveFileTarget } from "./workspaceFiles";
 import { prepareFileContext } from "./fileContext";
 import { decodeImage, imageMime } from "./imageAttachments";
 import { readImageAttachments, IMAGE_MAX_BYTES, type ImageAttachment } from "./attachmentTypes";
@@ -14,7 +14,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { ZCodeClient, ZCodeEvent, SessionSummary, isModelRegistryRejection, type AvailableModel } from "./zcodeClient";
+import { ZCodeClient, ZCodeEvent, SessionSummary, SendStatusUnknownError, isModelRegistryRejection, type AvailableModel } from "./zcodeClient";
 import { FileChange } from "./toolFiles";
 import {
   ContextChip,
@@ -53,7 +53,7 @@ import { DiffDocuments } from "./diffDocuments";
 import { sameWorkspacePath, preferredWorkspacePath } from "./workspacePath";
 import { normalizeNewSessionDefaults, type NewSessionDefaults, type SessionModelChoice } from "./newSessionDefaults";
 import { desktopLoginCredentialIssue, readConfiguredProviderApiKey, readV2Config, readV2Settings, setDesktopCredentialBinary, v2Dir } from "./credentials";
-import { buildQuotaAdapterRegistry, fetchQuotaAdapter, quotaSecretStorageKey, type QuotaAdapterConfig } from "./quotaAdapters";
+import { BUILTIN_QUOTA_ADAPTERS, buildQuotaAdapterRegistry, fetchQuotaAdapter, quotaSecretStorageKey, type QuotaAdapterConfig } from "./quotaAdapters";
 import {
   loadTaskFlags,
   loadSessionArchiveTimes,
@@ -89,20 +89,57 @@ function samePickerModel(left: SessionModelChoice, right: SessionModelChoice): b
     : left.providerId === right.providerId && left.modelId === right.modelId;
 }
 
-function configuredQuotaAdapters(): QuotaAdapterConfig[] {
-  const raw = vscode.workspace.getConfiguration("zcode").get<unknown>("quotaAdapters", []);
+/** Keep adapters scoped to the current VS Code profile's user settings. */
+export function configuredQuotaAdapters(config = vscode.workspace.getConfiguration("zcode")): QuotaAdapterConfig[] {
+  const inspected = config.inspect<unknown>("quotaAdapters");
+  const raw = inspected?.globalValue !== undefined ? inspected.globalValue : inspected?.defaultValue ?? [];
   return buildQuotaAdapterRegistry(raw);
 }
 
-async function fetchConfiguredProviderQuota(context: vscode.ExtensionContext, providerId: string) {
+type WorkspacePathResolution = { path: string; blocked?: never } | { path?: never; blocked: true };
+type WorkspacePathSettings = { globalValue?: unknown; workspaceValue?: unknown; workspaceFolderValue?: unknown };
+
+/** Project settings select a directory inside the folders the user opened. */
+export function resolveStartupWorkspacePath(
+  config: { inspect(section: string): WorkspacePathSettings | undefined },
+  folders: readonly { uri: { fsPath: string } }[] | undefined,
+  trusted: boolean,
+): WorkspacePathResolution {
+  const roots = folders?.map(folder => folder.uri.fsPath).filter(Boolean) ?? [];
+  const settings = config.inspect("workspacePath");
+  const settingPath = (value: unknown) => typeof value === "string" ? value.trim() : undefined;
+  const userPath = settingPath(settings?.globalValue) ?? "";
+  const projectPath = settingPath(settings?.workspaceFolderValue) ?? settingPath(settings?.workspaceValue);
+  if (projectPath === undefined) return { path: userPath || roots[0] || "" };
+  if (!projectPath) return { path: roots[0] || "" };
+
+  if (!trusted || !isPlainFilePath(projectPath) || (!roots.length && !path.isAbsolute(projectPath))) return { blocked: true };
+  const candidate = path.resolve(roots[0] ?? "", projectPath);
+  // Matching User Settings are explicit consent, including to an external directory.
+  if (path.isAbsolute(userPath) && sameWorkspacePath(candidate, path.resolve(userPath))) return { path: userPath };
+  try {
+    const target = resolveFileTarget(roots, candidate);
+    if (target?.insideWorkspace && fs.statSync(target.absolute).isDirectory()) {
+      // An explicitly opened root can itself be a link. Keep its spelling for existing session keys.
+      const openedRoot = roots.find(root => sameWorkspacePath(candidate, path.resolve(root)));
+      return { path: openedRoot ?? target.absolute };
+    }
+  } catch { /* Unreadable or missing paths require a user choice. */ }
+  return { blocked: true };
+}
+
+export async function fetchConfiguredProviderQuota(context: vscode.ExtensionContext, providerId: string) {
   const adapter = configuredQuotaAdapters().find(item => item.providerId === providerId);
   if (!adapter) return null;
   const picker = await readPickerResolution();
   if (!quotaProviderIsSelectable(providerId, picker)) return null;
   if (adapter.apiKeySource === "zcode") {
     const credential = await readConfiguredProviderApiKey(adapter.providerId, adapter.providerTemplateId);
-    if (!credential) return null;
-    return fetchQuotaAdapter(adapter, credential.apiKey, credential.baseURL ?? adapter.providerBaseURL);
+    const builtin = BUILTIN_QUOTA_ADAPTERS.find(item => item.id === adapter.id && item.providerId === adapter.providerId);
+    // Only packaged presets can supply a fixed host for legacy credentials without a base URL.
+    const baseURL = credential?.baseURL ?? builtin?.providerBaseURL;
+    if (!credential || !baseURL) return null;
+    return fetchQuotaAdapter(adapter, credential.apiKey, baseURL);
   }
   const secret = adapter.auth === "none" ? undefined : await context.secrets.get(quotaSecretStorageKey(adapter.id));
   return fetchQuotaAdapter(adapter, secret);
@@ -228,11 +265,12 @@ export function activate(context: vscode.ExtensionContext) {
       if (e.affectsConfiguration("zcode.language")) provider.pushLanguage();
       if (e.affectsConfiguration("zcode.formulaFonts")) provider.syncMathFonts();
       if (e.affectsConfiguration("zcode.quotaAdapters")) provider.refreshQuota();
-      if (["binaryPath", "nodePath", "workspacePath", "model", "allowedDesktopPlugins"].some(key => e.affectsConfiguration(`zcode.${key}`))) {
+      if (["binaryPath", "nodePath", "model", "allowedDesktopPlugins"].some(key => e.affectsConfiguration(`zcode.${key}`))) {
         logInfo("ZCode settings changed; restarting session");
         void provider.restart("Settings changed");
-      } else if (e.affectsConfiguration("zcode.showSuppressedPluginSkills")) {
-        provider.refreshListedSkills();
+      } else {
+        if (e.affectsConfiguration("zcode.workspacePath")) void provider.applyWorkspacePathSetting();
+        if (e.affectsConfiguration("zcode.showSuppressedPluginSkills")) provider.refreshListedSkills();
       }
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
@@ -258,11 +296,76 @@ export function deactivate() {
   // provider dispose is registered on activate
 }
 
+const DIRECTORY_WATCH_RETRY_MS = 2000;
+
+/** Retry directory watches that are missing or have failed, and dispose both the timer and the watcher. */
+export function createRetryingDirectoryWatch(deps: {
+  exists: () => boolean;
+  watch: (onError: (error: unknown) => void) => { close(): void };
+  schedule: (run: () => void, delayMs: number) => { cancel(): void };
+  log: (error: unknown) => void;
+  retryMs?: number;
+}): { dispose(): void } {
+  let current: { close(): void } | undefined;
+  let pending: { cancel(): void } | undefined;
+  let disposed = false;
+  const retryMs = deps.retryMs ?? DIRECTORY_WATCH_RETRY_MS;
+  const arm = () => {
+    if (disposed) return;
+    pending = undefined;
+    if (current) return;
+    if (!deps.exists()) {
+      pending = deps.schedule(arm, retryMs);
+      return;
+    }
+    try {
+      current = deps.watch((error) => {
+        deps.log(error);
+        const failed = current;
+        current = undefined;
+        try { failed?.close(); } catch { /* already closed */ }
+        if (!disposed) pending = deps.schedule(arm, retryMs);
+      });
+    } catch (error) {
+      deps.log(error);
+      pending = deps.schedule(arm, retryMs);
+    }
+  };
+  arm();
+  return {
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      pending?.cancel();
+      pending = undefined;
+      const open = current;
+      current = undefined;
+      if (!open) return;
+      try { open.close(); } catch { /* already closed */ }
+    },
+  };
+}
+
+function watchDirectory(dir: string, onName: (name: string) => void, logLabel: string): vscode.Disposable {
+  return createRetryingDirectoryWatch({
+    exists: () => fs.existsSync(dir),
+    watch: (onError) => {
+      const watcher = fs.watch(dir, (_event, filename) => onName(filename?.toString() ?? ""));
+      watcher.on("error", onError);
+      return watcher;
+    },
+    schedule: (run, delayMs) => {
+      const timer = setTimeout(run, delayMs);
+      return { cancel: () => clearTimeout(timer) };
+    },
+    log: (error) => logWarn(logLabel, error),
+  });
+}
+
 function watchDesktopFamily(onChange: () => void): vscode.Disposable {
   const dir = v2Dir();
   let last = desktopFamilyFingerprint();
   let timer: NodeJS.Timeout | undefined;
-  let watcher: fs.FSWatcher | undefined;
   const fire = () => {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
@@ -272,20 +375,13 @@ function watchDesktopFamily(onChange: () => void): vscode.Disposable {
       onChange();
     }, 400);
   };
-  try {
-    if (fs.existsSync(dir)) {
-      watcher = fs.watch(dir, (_event, filename) => {
-        const name = filename?.toString() ?? "";
-        if (!name || name === "setting.json" || name === "config.json") fire();
-      });
-    }
-  } catch (e) {
-    logWarn("Could not watch ZCode desktop settings", e);
-  }
+  const watching = watchDirectory(dir, (name) => {
+    if (!name || name === "setting.json" || name === "config.json") fire();
+  }, "Could not watch ZCode desktop settings");
   return {
     dispose: () => {
       if (timer) clearTimeout(timer);
-      watcher?.close();
+      watching.dispose();
     },
   };
 }
@@ -294,24 +390,16 @@ function watchDesktopFamily(onChange: () => void): vscode.Disposable {
 function watchDesktopProviderModels(onChange: () => void): vscode.Disposable {
   const dir = v2Dir();
   let timer: NodeJS.Timeout | undefined;
-  let watcher: fs.FSWatcher | undefined;
-  try {
-    if (fs.existsSync(dir)) {
-      watcher = fs.watch(dir, (_event, filename) => {
-        const name = filename?.toString() ?? "";
-        if (!name || name === "provider_config.json") {
-          if (timer) clearTimeout(timer);
-          timer = setTimeout(onChange, 350);
-        }
-      });
+  const watching = watchDirectory(dir, (name) => {
+    if (!name || name === "provider_config.json") {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(onChange, 350);
     }
-  } catch (e) {
-    logWarn("Could not watch ZCode provider shortcuts", e);
-  }
+  }, "Could not watch ZCode provider shortcuts");
   return {
     dispose: () => {
       if (timer) clearTimeout(timer);
-      watcher?.close();
+      watching.dispose();
     },
   };
 }
@@ -1116,6 +1204,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
             if (isCurrent()) this.indexCurrentSession();
           });
         } catch (error) {
+          if (error instanceof SendStatusUnknownError) {
+            this.sendTiming.end("timeout", timingId);
+            this.post({ type: "send_unconfirmed", commandId: msg.commandId, sessionId,
+              message: userFacingError(error), running: error.running });
+            break;
+          }
           this.sendTiming.end("rejected", timingId);
           logError("send message failed", error);
           const client = this.client;
@@ -1223,6 +1317,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
             if (activeClient === this.client && activeClient.currentSessionId === sessionId && ticket === this.switchTicket) this.indexCurrentSession();
           });
         } catch (error) {
+          if (error instanceof SendStatusUnknownError) {
+            this.post({ type: "send_unconfirmed", commandId: msg.commandId, sessionId,
+              message: userFacingError(error), running: error.running });
+            break;
+          }
           logError("retry last message failed", error);
           if (msg.planMode && !planModeApplied && client && client === this.client && client.currentSessionId === sessionId && ticket === this.switchTicket) {
             this.post({ type: "session_controls", ...client.confirmedControls() });
@@ -1241,6 +1340,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       }
       case "openRecoverySettings":
         if (msg.setting === "binaryPath" || msg.setting === "nodePath") await this.runRecoveryAction(msg.setting);
+        break;
+      case "openWorkspacePathSettings":
+        await this.openWorkspacePathSettings();
         break;
       case "promptDesktopPluginSkill": {
         const name = msg.text?.trim() || "";
@@ -1883,6 +1985,22 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     await this.startZCode({ force: true });
   }
 
+  private async openWorkspacePathSettings(): Promise<void> {
+    await vscode.commands.executeCommand("workbench.action.openGlobalSettings", { query: "@id:zcode.workspacePath" });
+  }
+
+  async applyWorkspacePathSetting(): Promise<void> {
+    const resolved = resolveStartupWorkspacePath(vscode.workspace.getConfiguration("zcode"), vscode.workspace.workspaceFolders, vscode.workspace.isTrusted);
+    if (this.client && resolved.blocked) {
+      const action = t("打开设置");
+      const picked = await vscode.window.showWarningMessage(t("请打开目标文件夹，或在用户设置中确认 ZCode 的工作区路径。"), action);
+      if (picked === action) await this.openWorkspacePathSettings();
+      return;
+    }
+    if (this.client && sameWorkspacePath(resolved.path ?? "", this.workspacePath)) return;
+    await this.restart("Workspace path changed");
+  }
+
   private sessionIsArchived(sessionId: string): boolean {
     const archiveTimes = loadSessionArchiveTimes([sessionId]);
     const archived = archiveTimes.has(sessionId) ? archiveTimes.get(sessionId)
@@ -2249,6 +2367,14 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     this.timing = timing;
     try {
     const config = vscode.workspace.getConfiguration("zcode");
+    const resolvedWorkspace = resolveStartupWorkspacePath(config, vscode.workspace.workspaceFolders, vscode.workspace.isTrusted);
+    let workspacePath = resolvedWorkspace.path;
+    if (!workspacePath) {
+      this.adoptWorkspace("");
+      this.clearStartupPhase();
+      this.post({ type: "workspace_required", ...(resolvedWorkspace.blocked ? { pathBlocked: true } : {}) });
+      return;
+    }
     let binaryPath: string;
     const locateStarted = Date.now();
     try {
@@ -2270,11 +2396,6 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     const nodePath = config.get<string>("nodePath") || "";
     const defaults = this.newSessionDefaults();
     const modelOverride = opts?.createNew && defaults.model ? "" : config.get<string>("model") || "";
-    let workspacePath = config.get<string>("workspacePath") || "";
-    if (!workspacePath) {
-      workspacePath =
-        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
-    }
     workspacePath = preferredWorkspacePath(workspacePath, readV2Settings()?.recentProjects);
     this.adoptWorkspace(workspacePath);
 

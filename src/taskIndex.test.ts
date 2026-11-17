@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
-import { saveSessionRestoreIntent, loadSessionExecutionState, persistEmptySessionMode, disposeSqliteSnapshots, listSessionQuestions, loadTaskFlags, setTaskArchived, setTaskDeleted } from "./taskIndex";
+import { saveSessionRestoreIntent, loadSessionExecutionState, persistEmptySessionMode, disposeSqliteSnapshots, listSessionQuestions, loadTaskFlags, setTaskArchived, setTaskDeleted, SessionSyncError } from "./taskIndex";
 
 const os = require("os") as typeof import("os");
 const loader = require("module") as { _load(name: string, ...args: unknown[]): unknown };
@@ -199,6 +199,17 @@ test("native SQLite preserves database lock errors instead of bypassing them wit
   writer.exec("ROLLBACK");
 });
 
+test("deleting a missing task is an error instead of a successful no-op", t => {
+  const f = fixture(t);
+  const db = tasks(f.index);
+  db.close();
+  assert.throws(() => setTaskDeleted("/project", "missing"), SessionSyncError);
+  const verify = new DatabaseSync(f.index);
+  try {
+    assert.equal((verify.prepare("SELECT deleted FROM tasks").get() as { deleted: number }).deleted, 0);
+  } finally { verify.close(); }
+});
+
 test("corrupt databases are rejected without constructing a misleading snapshot", t => {
   const f = fixture(t);
   fs.writeFileSync(f.index, "not a SQLite database");
@@ -209,6 +220,137 @@ test("corrupt databases are rejected without constructing a misleading snapshot"
   assert.throws(() => setTaskArchived("/project", "session", true), /not a database/i);
   assert.ok(opened.every(open => open.file === f.index));
   assert.deepEqual(fs.readdirSync(f.temp), []);
+});
+
+test("a WAL that cannot be checked is not replaced by the main database", readonlyPosix, t => {
+  let writer!: Database;
+  t.after(() => writer?.close());
+  const f = fixture(t);
+  const source = path.join(f.root, "source.sqlite");
+  writer = questions(source);
+  addQuestion(writer, "baseline", 1);
+  writer.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0");
+  addQuestion(writer, "wal-committed", 2);
+  const publish = () => {
+    fs.chmodSync(path.dirname(f.cli), 0o700);
+    for (const suffix of ["", "-wal"]) {
+      const file = f.cli + suffix;
+      if (fs.existsSync(file)) fs.chmodSync(file, 0o600);
+      fs.copyFileSync(source + suffix, file);
+    }
+    const wal = fs.readFileSync(f.cli + "-wal");
+    wal.writeUInt32BE(0, 0);
+    fs.writeFileSync(f.cli + "-wal", wal);
+    fs.chmodSync(f.cli, 0o400);
+    fs.chmodSync(f.cli + "-wal", 0o400);
+    fs.chmodSync(path.dirname(f.cli), 0o500);
+  };
+  publish();
+  assert.deepEqual(listSessionQuestions("session"), []);
+  assert.notDeepEqual(listSessionQuestions("session").map(question => question.text), ["baseline"]);
+});
+
+test("a read-only snapshot retains commits before a rolled-back WAL tail", readonlyPosix, t => {
+  let writer!: Database;
+  t.after(() => writer?.close());
+  const f = fixture(t);
+  const source = path.join(f.root, "source.sqlite");
+  writer = questions(source);
+  writer.exec("CREATE TABLE spill(payload BLOB)");
+  addQuestion(writer, "baseline", 1);
+  writer.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA cache_size=2");
+  addQuestion(writer, "before-rollback", 2);
+  writer.exec(`BEGIN;
+    WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<200)
+    INSERT INTO spill SELECT zeroblob(4096) FROM rows;
+    ROLLBACK;`);
+  addQuestion(writer, "after-rollback", 3);
+
+  const wal = fs.readFileSync(source + "-wal");
+  const frameSize = 24 + wal.readUInt32BE(8);
+  let lastCommit = 0;
+  for (let offset = 32; offset + frameSize <= wal.length; offset += frameSize) {
+    if (wal.readUInt32BE(offset + 4) !== 0) lastCommit = offset;
+  }
+  assert.ok(lastCommit >= 32 && lastCommit + 2 * frameSize <= wal.length, "SQLite did not leave complete frames after the last commit");
+  const tail = lastCommit + frameSize;
+  assert.ok(wal.subarray(16, 24).equals(wal.subarray(tail + 8, tail + 16)), "the tail must share the active generation's salt");
+  fs.copyFileSync(source, f.cli);
+  fs.writeFileSync(f.cli + "-wal", wal, { mode: 0o400 });
+  fs.chmodSync(f.cli, 0o400);
+  fs.chmodSync(path.dirname(f.cli), 0o500);
+
+  assert.deepEqual(listSessionQuestions("session").map(question => question.text), ["baseline", "before-rollback", "after-rollback"]);
+  assert.equal(fs.readdirSync(f.temp).length, 1, "did not exercise the read-only snapshot path");
+});
+
+test("a snapshot retries when the WAL changes during a failed read", readonlyPosix, t => {
+  let writer!: Database;
+  t.after(() => writer?.close());
+  const f = fixture(t);
+  const source = path.join(f.root, "source.sqlite");
+  writer = questions(source);
+  addQuestion(writer, "baseline", 1);
+  writer.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0");
+  addQuestion(writer, "committed", 2);
+  const walPath = f.cli + "-wal";
+  fs.copyFileSync(source, f.cli);
+  fs.copyFileSync(source + "-wal", walPath);
+  fs.chmodSync(f.cli, 0o400);
+  fs.chmodSync(walPath, 0o400);
+  fs.chmodSync(path.dirname(f.cli), 0o500);
+
+  const writableFs = require("node:fs") as typeof fs;
+  const original = writableFs.readFileSync;
+  let reads = 0;
+  writableFs.readFileSync = ((file, options) => {
+    const contents = Reflect.apply(original, writableFs, [file, options]) as string | Buffer;
+    if (file !== walPath || ++reads !== 1) return contents;
+    const next = new Date(Date.now() + 2000);
+    fs.utimesSync(walPath, next, next);
+    // Simulate an incomplete WAL read while the writer updates the source.
+    return Buffer.from(contents).subarray(0, 16);
+  }) as typeof fs.readFileSync;
+  t.after(() => { writableFs.readFileSync = original; });
+  assert.deepEqual(listSessionQuestions("session").map(question => question.text), ["baseline", "committed"]);
+  assert.equal(reads, 2);
+  assert.equal(fs.readdirSync(f.temp).length, 1);
+});
+
+test("a snapshot copy is redone once when the source changes during the write", readonlyPosix, t => {
+  let writer!: Database;
+  t.after(() => writer?.close());
+  const f = fixture(t);
+  const source = path.join(f.root, "source.sqlite");
+  writer = questions(source);
+  addQuestion(writer, "baseline", 1);
+  writer.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0");
+  addQuestion(writer, "wal-committed", 2);
+  fs.chmodSync(path.dirname(f.cli), 0o700);
+  for (const suffix of ["", "-wal"]) {
+    fs.copyFileSync(source + suffix, f.cli + suffix);
+    fs.chmodSync(f.cli + suffix, 0o400);
+  }
+  fs.chmodSync(path.dirname(f.cli), 0o500);
+  const writableFs = require("node:fs") as typeof fs;
+  const original = writableFs.writeFileSync;
+  let writes = 0;
+  writableFs.writeFileSync = ((file, data, options) => {
+    original.call(writableFs, file, data, options);
+    if (!String(file).includes("zcode-sqlite")) return;
+    writes += 1;
+    if (writes !== 1) return;
+    const wal = f.cli + "-wal";
+    writableFs.chmodSync(path.dirname(f.cli), 0o700);
+    writableFs.chmodSync(wal, 0o600);
+    const next = new Date(Date.now() + writes * 1000);
+    writableFs.utimesSync(wal, next, next);
+    writableFs.chmodSync(wal, 0o400);
+    writableFs.chmodSync(path.dirname(f.cli), 0o500);
+  }) as typeof fs.writeFileSync;
+  t.after(() => { writableFs.writeFileSync = original; });
+  assert.deepEqual(listSessionQuestions("session").map(question => question.text), ["baseline", "wal-committed"]);
+  assert.equal(writes, 2);
 });
 
 test("runtime without node:sqlite reports the runtime requirement and never loads WASM", t => {

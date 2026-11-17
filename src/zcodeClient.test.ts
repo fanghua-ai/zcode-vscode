@@ -3,7 +3,7 @@ import { ChildProcess } from "child_process";
 import test, { type TestContext } from "node:test";
 import * as fs from "fs";
 import * as path from "path";
-import { ZCodeClient, isModelRegistryRejection, type ZCodeEvent, type HistoryItem, type PermissionRequest, type UserInputRequest, type SessionControls } from "./zcodeClient";
+import { ZCodeClient, SendStatusUnknownError, isModelRegistryRejection, type ZCodeEvent, type ZCodeRequest, type HistoryItem, type PermissionRequest, type UserInputRequest, type SessionControls } from "./zcodeClient";
 import type { ResolvedRuntime } from "./desktop";
 import { ConversationReplica } from "./conversation";
 import { handoffScenario } from "./testSupport/handoffScenario";
@@ -33,8 +33,10 @@ interface Internals {
   historyCache: { sessionId: string; items: HistoryItem[] } | null;
   pendingPermissions: Map<string, PermissionRequest>;
   pendingUserInputs: Map<string, UserInputRequest>;
+  pending: Map<number | string, unknown>;
   sendRequest: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
   write: (message: unknown) => void;
+  handleLine: (line: string) => void;
   afterSessionAttached: () => Promise<void>;
   adoptResumedModel: () => Promise<void>;
   ensureSessionModel: (snapshot?: unknown) => Promise<void>;
@@ -2821,7 +2823,7 @@ test("submitting /goal uses the desktop goal command instead of a normal prompt"
 
 test("new sessions do not inherit plan or full-access controls, while switching back preserves session state", async () => {
   const {client,state} = fixture();
-  state.sendRequest = async method => method === "session/list" ? {sessions:[]} : {};
+  state.sendRequest = async method => method === "session/list" ? {sessions:[]} : method === "session/create" ? { session: { sessionId: "NEW" } } : {};
   await client.setMode("yolo"); await client.setMode("plan");
   state.afterSessionAttached = async () => {};
   state.adoptResumedModel = async () => {};
@@ -3399,4 +3401,219 @@ test("model stream delivers original tool input when scheduled events omit it", 
     assert.equal(JSON.parse((tools[0].data as {inputText:string}).inputText).command,"date");
     assert.equal((tools[2].data as {outputText:string}).outputText,"2026-11-04");
   } finally {client.dispose();}
+});
+
+test("an overlapping subscribe unsubscribes the superseded ack and does not publish an empty snapshot", async () => {
+  const { client, state, events } = fixture();
+  const calls: Array<{ method: string; subscriptionId?: string }> = [];
+  let releaseFirst: (value: unknown) => void = () => undefined;
+  const firstResponse = new Promise(resolve => { releaseFirst = resolve; });
+  let subscribes = 0;
+  state.sendRequest = async (method, params) => {
+    const body = params as { subscriptionId?: string } | undefined;
+    calls.push({ method, subscriptionId: body?.subscriptionId });
+    if (method === "v4/conversation/subscribe") {
+      subscribes += 1;
+      if (subscribes === 1) return firstResponse;
+      return { ack: { subscriptionId: "sub-2", logEpoch: "epoch-2" } };
+    }
+    return {};
+  };
+  try {
+    const first = state.subscribeConversation();
+    await new Promise(resolve => setImmediate(resolve));
+    const second = state.subscribeConversation();
+    await new Promise(resolve => setImmediate(resolve));
+    releaseFirst({ ack: { subscriptionId: "sub-1", logEpoch: "epoch-1" } });
+    await first;
+    assert.ok(calls.some(call => call.method === "v4/conversation/unsubscribe" && call.subscriptionId === "sub-1"));
+    assert.equal(events.some(event => event.type === "conversation_sync"), false);
+    client.dispose();
+    await second;
+    assert.equal(events.some(event => event.type === "conversation_sync"), false);
+  } finally { client.dispose(); }
+});
+
+for (const started of [undefined, { type: "turn.started", sessionId: "A" }, { type: "turn.started" }]) {
+  test(`legacy send timeout releases the session lock and reports backend activity (${started?.sessionId ?? (started ? "unscoped start" : "no start")})`, async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const { client, state } = fixture();
+    state.liveModelReady = true;
+    const requests: ZCodeRequest[] = [];
+    state.write = request => requests.push(request as ZCodeRequest);
+    try {
+      const sending = assert.rejects(client.sendMessage("hello"), error => {
+        assert.ok(error instanceof SendStatusUnknownError);
+        assert.equal(error.running, !!started);
+        return true;
+      });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(requests.map(request => request.method), ["session/send"]);
+      if (started) state.handleSessionEvent(started);
+      t.mock.timers.tick(14_999);
+      assert.ok(state.pending.has(requests[0].id));
+      t.mock.timers.tick(1);
+      await sending;
+      assert.equal(state.pending.size, 0);
+      state.handleLine(JSON.stringify({ id: requests[0].id, result: {} }));
+
+      const next = client.sendMessage("again");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(requests.map(request => request.method), ["session/send", "session/send"]);
+      state.handleLine(JSON.stringify({ id: requests[1].id, result: {} }));
+      await next;
+    } finally { client.dispose(); }
+  });
+}
+
+test("a failed stop does not continue into editUserQuery", async () => {
+  const { client, state } = fixture();
+  await attachRunningProjection(state);
+  state.liveModelReady = true;
+  const commands: string[] = [];
+  state.sendRequest = async (method, params) => {
+    const type = (params as { type?: string } | undefined)?.type;
+    if (method === "v4/command" && type) commands.push(type);
+    if (type === "stop") throw new Error("stop failed");
+    return { status: "accepted", result: { disposition: "rewind" } };
+  };
+  try {
+    await assert.rejects(client.editUserQuery({ rowId: 2, entityId: "user-1" }, "改过的问题", "preserve"), /编辑已取消/);
+    assert.deepEqual(commands, ["stop"]);
+  } finally { client.dispose(); }
+});
+
+test("a session created without an id throws instead of looking successful", async () => {
+  const { client, state, events } = fixture();
+  state.sessionId = null;
+  state.sendRequest = async () => ({});
+  try {
+    await assert.rejects(state.createSession(true), /没有返回会话编号/);
+    assert.equal(events.some(event => event.type === "session_error"), false);
+  } finally { client.dispose(); }
+});
+
+test("permission and input requests without a protocol session are not kept for the next session", async () => {
+  const { client, state, events } = fixture();
+  const replies: Array<{ id: string | number; result: { decision?: string; action?: string } }> = [];
+  state.write = (reply) => replies.push(reply as typeof replies[number]);
+  const line = state as unknown as { handleLine: (value: string) => void };
+  const ask = (id: number, method: string, params: unknown) => line.handleLine(JSON.stringify({ id, method, params }));
+  try {
+    ask(1, "interaction/requestPermission", { requestId: "inferred", toolName: "edit" });
+    ask(2, "interaction/requestUserInput", { requestId: "inferred-input", prompt: "which?" });
+    assert.equal(state.pendingPermissions.get("inferred")?.inferredSession, true);
+    assert.equal(state.pendingUserInputs.get("inferred-input")?.inferredSession, true);
+    assert.equal(events.filter(event => event.type === "permission_request" || event.type === "user_input_request").length, 2);
+    ask(3, "interaction/requestPermission", { requestId: "owned", sessionId: "B", toolName: "edit" });
+    assert.equal(state.pendingPermissions.get("owned")?.inferredSession, undefined);
+    state.sendRequest = async () => { throw new Error("resume failed"); };
+    await assert.rejects(client.resumeSession("B"), /resume failed/);
+    assert.equal(state.pendingPermissions.has("inferred"), false);
+    assert.equal(state.pendingUserInputs.has("inferred-input"), false);
+    assert.equal(state.pendingPermissions.has("owned"), true);
+    assert.ok(replies.some(reply => reply.id === 1 && reply.result.decision === "deny"));
+    assert.ok(replies.some(reply => reply.id === 2 && reply.result.action === "cancel"));
+    await client.prepareViewChange();
+    ask(4, "interaction/requestPermission", { requestId: "late", toolName: "edit" });
+    assert.equal(state.pendingPermissions.has("late"), false);
+    assert.ok(replies.some(reply => reply.id === 4 && reply.result.decision === "deny"));
+    assert.equal(events.filter(event => event.type === "permission_request" && (event.data as { requestId?: string }).requestId === "late").length, 0);
+  } finally { client.dispose(); }
+});
+
+test("resuming the same session replays pending legacy interactions without cancelling them", async () => {
+  const { client, state, events } = fixture();
+  const replies: unknown[] = [];
+  state.write = reply => replies.push(reply);
+  state.sendRequest = async () => ({});
+  state.afterSessionAttached = async () => {};
+  state.adoptResumedModel = async () => {};
+  try {
+    state.handleLine(JSON.stringify({ id: 1, method: "interaction/requestPermission", params: { requestId: "permission" } }));
+    state.handleLine(JSON.stringify({ id: 2, method: "interaction/requestUserInput", params: { requestId: "input" } }));
+    await client.prepareViewChange();
+    events.length = 0;
+    await client.resumeSession("A", { sessionId: "A", title: "Test" });
+    client.endViewChange();
+    assert.equal(state.pendingPermissions.get("permission")?.sessionId, "A");
+    assert.equal(state.pendingUserInputs.get("input")?.sessionId, "A");
+    assert.ok(events.some(event => event.type === "permission_request"));
+    assert.ok(events.some(event => event.type === "user_input_request"));
+    assert.deepEqual(replies, []);
+  } finally { client.dispose(); }
+});
+
+for (const synchronous of [true, false]) {
+  test(`stdin write failure rejects only the matching RPC (synchronous: ${synchronous})`, async () => {
+    const { client, state } = fixture();
+    const writes: ZCodeRequest[] = [];
+    let onWrite: ((error: Error) => void) | undefined;
+    const failure = Object.assign(new Error("broken pipe"), { code: "EPIPE" });
+    const stdin = {
+      write(payload: string, callback: (error: Error) => void) {
+        writes.push(JSON.parse(payload) as ZCodeRequest);
+        if (writes.length === 2) {
+          if (synchronous) throw failure;
+          onWrite = callback;
+        }
+        return true;
+      },
+      end() {},
+    };
+    (client as unknown as { proc: { stdin: typeof stdin; exitCode: null } | null }).proc = { stdin, exitCode: null };
+    try {
+      const delivered = state.sendRequest("session/list");
+      const rejected = assert.rejects(state.sendRequest("session/send"), error => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /ZCode 标准输入不可用/);
+        assert.ok(!(error instanceof SendStatusUnknownError));
+        return true;
+      });
+      onWrite?.(failure);
+      await rejected;
+      assert.ok(state.pending.has(writes[0].id));
+      assert.ok(!state.pending.has(writes[1].id));
+      state.handleLine(JSON.stringify({ id: writes[0].id, result: { sessions: [] } }));
+      assert.deepEqual(await delivered, { sessions: [] });
+      assert.equal(state.pending.size, 0);
+    } finally { client.dispose(); }
+  });
+}
+
+test("stdin errors and notification failures do not escape the read loop", () => {
+  const { client, state } = fixture();
+  const stdin = {
+    write(_payload: string, callback?: (error?: Error) => void) {
+      callback?.(Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+      return true;
+    },
+  };
+  (client as unknown as { proc: { stdin: typeof stdin } | null }).proc = { stdin };
+  assert.doesNotThrow(() => state.write({ id: 1, method: "session/send" }));
+  const internal = state as unknown as { handleNotification: () => void; handleLine: (value: string) => void };
+  internal.handleNotification = () => { throw new Error("boom"); };
+  assert.doesNotThrow(() => internal.handleLine(JSON.stringify({ method: "session/event", params: { type: "turn.started", sessionId: "A" } })));
+  assert.doesNotThrow(() => internal.handleLine("{"));
+  assert.doesNotThrow(() => internal.handleLine(JSON.stringify({ method: "session/event", params: { type: "turn.completed", sessionId: "A" } })));
+  client.dispose();
+});
+
+test("a second dispose does not cancel the pending SIGKILL", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { client } = fixture();
+  const signals: string[] = [];
+  const proc = {
+    pid: 4242,
+    exitCode: null as number | null,
+    signalCode: null as string | null,
+    stdin: { end() {} },
+    kill(signal?: string) { signals.push(signal ?? ""); return true; },
+  };
+  (client as unknown as { proc: typeof proc | null }).proc = proc;
+  client.dispose();
+  client.dispose();
+  assert.deepEqual(signals, ["SIGTERM"]);
+  t.mock.timers.tick(2000);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
 });

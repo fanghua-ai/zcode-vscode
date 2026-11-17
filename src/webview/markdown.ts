@@ -1,5 +1,5 @@
-import { formulaExtensions } from "../math";
-import { marked } from "marked";
+import { formulaExtensions, renderFormula, type FormulaToken } from "../math";
+import { marked, type Tokens } from "marked";
 import hljs from "highlight.js/lib/common";
 import DOMPurify from "dompurify";
 
@@ -103,15 +103,48 @@ renderer.code = (code) => renderCode(code, false);
 const streamingRenderer = new marked.Renderer();
 streamingRenderer.code = (code) => renderCode(code, true);
 
+const markdownSanitizer = {
+  ADD_ATTR: ["target", "rel", "data-copy", "class"],
+  ADD_TAGS: ["button"],
+  FORBID_TAGS: ["style"],
+  FORBID_ATTR: ["style"],
+};
+const markdownExtensions = marked.defaults.extensions!;
+
 export function renderMarkdown(text: string, streaming = false): string {
+  // Place generated formulas after cleaning user HTML so inline styles never
+  // acquire trust from a class or attribute supplied by the reply.
+  const formulas = new Map<string, FormulaToken>();
+  let nonce = "";
+  function formulaSlot(token: Tokens.Generic): string {
+    nonce ||= crypto.randomUUID();
+    const id = `${nonce}-${formulas.size}`;
+    formulas.set(id, token as FormulaToken);
+    return `<span data-zcode-formula="${id}"></span>`;
+  }
   const html = marked.parse(text, {
     async: false,
     renderer: streaming ? streamingRenderer : renderer,
-  }) as string;
-  return DOMPurify.sanitize(html, {
-    ADD_ATTR: ["target", "rel", "data-copy", "class"],
-    ADD_TAGS: ["button"],
+    extensions: {
+      ...markdownExtensions,
+      renderers: { ...markdownExtensions.renderers, formulaBlock: formulaSlot, formulaInline: formulaSlot },
+    },
   });
+  if (!formulas.size) return DOMPurify.sanitize(html, markdownSanitizer);
+
+  const fragment = DOMPurify.sanitize(html, { ...markdownSanitizer, RETURN_DOM_FRAGMENT: true });
+  for (const slot of Array.from(fragment.querySelectorAll("span[data-zcode-formula]"))) {
+    const formula = formulas.get(slot.getAttribute("data-zcode-formula") ?? "");
+    slot.removeAttribute("data-zcode-formula");
+    if (!formula) continue;
+    const rendered = DOMPurify.sanitize(renderFormula(formula), {
+      FORBID_TAGS: ["style"], RETURN_DOM_FRAGMENT: true,
+    });
+    slot.replaceWith(rendered);
+  }
+  const container = fragment.ownerDocument!.createElement("div");
+  container.append(fragment);
+  return container.innerHTML;
 }
 
 function escapeHtml(text: string): string {

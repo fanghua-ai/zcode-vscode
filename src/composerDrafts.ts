@@ -56,6 +56,21 @@ export class ComposerDrafts {
     return copy(this.drafts.get(id) ?? { text: "", chips: [] });
   }
 
+  keys(): IterableIterator<string> {
+    return this.drafts.keys();
+  }
+
+  has(id: string): boolean {
+    return this.drafts.has(id);
+  }
+
+  take(id: string): ComposerDraft | undefined {
+    const draft = this.drafts.get(id);
+    if (!draft) return;
+    this.drafts.delete(id);
+    return copy(draft);
+  }
+
   set(id: string, text: string, chips: ContextChip[], images: DraftImage[] = [], sessionRefs: SessionReference[] = [], skills: SkillReference[] = [], agents: AgentReference[] = [], planEnabled = false): void {
     const uniqueRefs = sessionRefs.filter((reference, index, all) =>
       /^sess_[A-Za-z0-9_-]+$/.test(reference.sessionId) && !!reference.title.trim() && all.findIndex(other => other.sessionId === reference.sessionId) === index

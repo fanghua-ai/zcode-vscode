@@ -1,5 +1,23 @@
 # 更新日志 / Changelog
 
+## 2.2.6 — 2026-11-17
+
+### 中文
+- 改善会话切换、新建、编辑和发送失败时的反馈，避免界面卡在等待状态。
+- 旧版协议未能确认发送结果时，可回到原会话手动恢复消息和附件。
+- 改善窄侧栏布局、键盘导航和屏幕阅读器提示。
+- 修复 VS Code 辅助侧栏仅显示图标时，ZCode 图标变成方块的问题。
+- 限制额度适配器的凭据使用范围，并过滤模型回复中的自定义样式。
+- 保留可信工作区内的有效路径设置。项目指定的路径超出已打开文件夹时，提示确认目标目录。空窗口未设置路径时，提示先打开文件夹。
+
+### English
+- Improve feedback when switching, creating, editing, or sending in a conversation fails.
+- Restore a message and its attachments from the original conversation when a legacy send cannot be confirmed.
+- Improve the narrow sidebar layout, keyboard navigation, and screen reader announcements.
+- Fix the ZCode icon appearing as a square when the VS Code Secondary Side Bar shows icons.
+- Limit how quota adapters use credentials and filter custom styles from model replies.
+- Keep valid workspace paths inside trusted workspaces. Ask users to confirm paths outside the open folders, or to open a folder when no path is set.
+
 ## 2.2.5 — 2026-11-15
 
 ### 中文

@@ -1561,6 +1561,27 @@ test("CLI synchronization updates or removes credentials for providers other tha
   }
 });
 
+test("plan quota failures keep the server message out of the error", async t => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+    "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:old:api-key": "TEST-STORED-LEGACY-KEY",
+  }));
+  fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({
+    providerFamilyDomain: "bigmodel",
+    providerFamilyConnectionSelections: { bigmodel: { kind: "individual-coding-plan" } },
+  }));
+  const api = mockPlanQuotaApi(t);
+  api.respond((requestPath) => requestPath.startsWith("/api/monitor/usage/quota/limit")
+    ? { payload: { code: 500, msg: "SECRET_SERVER_TEXT apiKey=LEAKED" } }
+    : undefined as unknown as { payload: unknown });
+  await assert.rejects(fetchPlanQuota({ family: "bigmodel", kind: "individual-coding-plan" }, "3.14.4"), (error: Error) => {
+    const rendered = `${error.message}\n${JSON.stringify(error)}`;
+    assert.match(error.message, /quota: rejected/);
+    assert.doesNotMatch(rendered, /SECRET_SERVER_TEXT|LEAKED/);
+    return true;
+  });
+});
+
 test("API-key mode selects the configured provider instance over the legacy alias", async t => {
   const dir = fixture(t);
   for (const family of ["bigmodel", "zai"]) {

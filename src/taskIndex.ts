@@ -288,20 +288,25 @@ function walChecksum(
   return [s1, s2];
 }
 
+function incompleteWal(): never {
+  throw new LocalizedError("会话数据库的增量记录无法完整校验，已停止读取以免漏掉已提交内容。");
+}
+
 /** Replay committed WAL frames into a rollback-journal copy that needs no shared-memory file. */
 function applyWal(main: Buffer, wal: Buffer): Buffer {
-  if (wal.length < 32) return Buffer.from(main);
+  if (wal.length === 0) return Buffer.from(main);
+  if (wal.length < 32) incompleteWal();
   const magic = wal.readUInt32BE(0);
   const little = magic === 0x377f0682;
-  if (magic !== 0x377f0682 && magic !== 0x377f0683) return Buffer.from(main);
-  if (wal.readUInt32BE(4) !== 3007000) return Buffer.from(main);
+  if (magic !== 0x377f0682 && magic !== 0x377f0683) incompleteWal();
+  if (wal.readUInt32BE(4) !== 3007000) incompleteWal();
   const walPageSize = wal.readUInt32BE(8);
   const pageSize = walPageSize || pageSizeFromHeader(main);
-  if (pageSize < 512 || (pageSize & (pageSize - 1)) !== 0) return Buffer.from(main);
+  if (pageSize < 512 || (pageSize & (pageSize - 1)) !== 0) incompleteWal();
   const salt1 = wal.readUInt32BE(16);
   const salt2 = wal.readUInt32BE(20);
   let [s1, s2] = walChecksum(wal, 0, 24, little, 0, 0);
-  if (s1 !== wal.readUInt32BE(24) || s2 !== wal.readUInt32BE(28)) return Buffer.from(main);
+  if (s1 !== wal.readUInt32BE(24) || s2 !== wal.readUInt32BE(28)) incompleteWal();
 
   const frameSize = 24 + pageSize;
   const frames: { page: number; dbPages: number; data: Buffer }[] = [];
@@ -311,11 +316,13 @@ function applyWal(main: Buffer, wal: Buffer): Buffer {
     const dbPages = wal.readUInt32BE(offset + 4);
     const fSalt1 = wal.readUInt32BE(offset + 8);
     const fSalt2 = wal.readUInt32BE(offset + 12);
+    // SQLite recovery stops at the first invalid frame and replays through the
+    // last valid commit. A rolled-back transaction can leave same-salt tail frames.
     if (fSalt1 !== salt1 || fSalt2 !== salt2) break;
     [s1, s2] = walChecksum(wal, offset, 8, little, s1, s2);
     [s1, s2] = walChecksum(wal, offset + 24, pageSize, little, s1, s2);
     if (s1 !== wal.readUInt32BE(offset + 16) || s2 !== wal.readUInt32BE(offset + 20)) break;
-    if (page === 0) break;
+    if (page === 0) incompleteWal();
     frames.push({
       page,
       dbPages,
@@ -343,26 +350,44 @@ function applyWal(main: Buffer, wal: Buffer): Buffer {
   return out;
 }
 
-function materializeRollbackCopy(dbPath: string): string {
+function rollbackImage(dbPath: string): Buffer {
   const main = fs.readFileSync(dbPath);
   if (main.length < 100 || main.subarray(0, 15).toString("utf8") !== "SQLite format 3") {
     throw new Error("not a sqlite database");
   }
-  let image: Buffer = Buffer.from(main);
   const walPath = dbPath + "-wal";
-  if (fs.existsSync(walPath)) {
-    image = Buffer.from(applyWal(main, fs.readFileSync(walPath)));
-  }
+  const image = fs.existsSync(walPath) ? applyWal(main, fs.readFileSync(walPath)) : main;
   if (image.length >= 20) {
     image[18] = 1;
     image[19] = 1;
   }
+  return image;
+}
+
+function writeRollbackCopy(image: Buffer): string {
   const dest = path.join(
     os.tmpdir(),
     `zcode-sqlite-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`
   );
   fs.writeFileSync(dest, image, { mode: 0o600, flag: "wx" });
   return dest;
+}
+
+function materializeRollbackCopy(dbPath: string): { dest: string; key: string } {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const key = snapshotKey(dbPath);
+    let image: Buffer;
+    try {
+      image = rollbackImage(dbPath);
+    } catch (error) {
+      if (snapshotKey(dbPath) === key) throw error;
+      continue;
+    }
+    const dest = writeRollbackCopy(image);
+    if (snapshotKey(dbPath) === key) return { dest, key };
+    try { fs.unlinkSync(dest); } catch { /* the retry writes a new file */ }
+  }
+  throw new LocalizedError("会话数据库在复制期间发生了变化，请重试。");
 }
 
 let nativeSqlite: boolean | undefined;
@@ -414,8 +439,8 @@ function snapshotFor(dbPath: string): { tempPath: string; reused: boolean } {
   const cached = snapshots.get(dbPath);
   if (cached?.key === key && fs.existsSync(cached.tempPath)) return { tempPath: cached.tempPath, reused: true };
   dropSnapshot(dbPath);
-  const tempPath = materializeRollbackCopy(dbPath);
-  snapshots.set(dbPath, { key, tempPath });
+  const { dest: tempPath, key: copiedKey } = materializeRollbackCopy(dbPath);
+  snapshots.set(dbPath, { key: copiedKey, tempPath });
   // Snapshots hold a full copy of the user's chats; remove them even if deactivate never runs.
   if (!exitCleanupRegistered) {
     exitCleanupRegistered = true;
@@ -904,13 +929,16 @@ export function setTaskDeleted(workspacePath: string, sessionId: string): void {
   if (!fs.existsSync(indexPath)) throw new LocalizedError("桌面会话索引不存在，无法删除会话。");
   if (fs.existsSync(indexPath)) {
     try {
+      let deleted = false;
       withWritableDb(indexPath, (db) => {
         const scope = workspacePredicate(db, workspacePath);
-        db.run(
+        const result = db.run(
           `UPDATE tasks SET deleted=1, archived=0, updated_at=? WHERE ${scope.sql} AND task_id=?`,
           [now, ...scope.values, sessionId]
         );
+        deleted = Number((result as { changes?: number | bigint } | null)?.changes ?? 0) > 0;
       });
+      if (!deleted) throw new SessionSyncError("没有找到要删除的会话。");
     } catch (e) {
       logWarn("Failed to mark desktop task deleted", e);
       throw e;

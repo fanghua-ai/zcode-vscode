@@ -1,7 +1,7 @@
 import katex from "katex";
 import type { TokenizerAndRendererExtension, Tokens } from "marked";
 
-interface FormulaToken extends Tokens.Generic { text: string; display: boolean }
+export interface FormulaToken extends Tokens.Generic { text: string; display: boolean }
 const cache = new Map<string, string>();
 
 /** Leave incomplete formulas alone while streaming. Never parse currency/code as math. */

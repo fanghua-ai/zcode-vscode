@@ -2,7 +2,7 @@
   "name": "zcode-desktop-chat",
   "displayName": "ZCode Chat",
   "description": "在 VS Code 右侧边栏里和 ZCode 智能体对话，复用桌面端的登录、模型和会话。Chat with the ZCode agent in the VS Code secondary side bar using the desktop app's account, models, and sessions.",
-  "version": "2.2.5",
+  "version": "2.2.6",
   "publisher": "fanghua",
   "author": "fanghua",
   "license": "MIT",
@@ -46,7 +46,7 @@
         {
           "id": "zcode-sidebar",
           "title": "ZCode",
-          "icon": "media/icon-zcode-vscode.png"
+          "icon": "media/icon-zcode-sidebar.svg"
         }
       ]
     },
@@ -280,7 +280,7 @@
         "zcode.workspacePath": {
           "type": "string",
           "default": "",
-          "description": "Workspace path for ZCode agent (defaults to first workspace folder)"
+          "description": "Workspace path for the ZCode agent. A trusted workspace can select an open folder or a directory inside it. Confirm an outside path in User Settings. When empty, ZCode uses the first folder in the window."
         },
         "zcode.model": {
           "type": "string",
@@ -294,6 +294,7 @@
         },
         "zcode.quotaAdapters": {
           "type": "array",
+          "scope": "window",
           "default": [],
           "description": "%config.quotaAdapters.description%",
           "items": {

@@ -9,7 +9,7 @@ const required = new Set([
   'package.json', 'README.md', 'CHANGELOG.md', 'docs/quota-adapters.md', 'LICENSE',
   'THIRD-PARTY-NOTICES.txt',
   'package.nls.json', 'package.nls.zh-cn.json', 'package.nls.zh-tw.json',
-  'media/icon-zcode-vscode.png',
+  'media/icon-zcode-vscode.png', 'media/icon-zcode-sidebar.svg',
   'dist/extension.js', 'dist/webview.js', 'dist/desktopPluginOverlayPreload.cjs',
   'dist/math/katex.min.css', 'dist/math/LICENSE',
 ]);

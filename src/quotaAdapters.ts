@@ -79,7 +79,7 @@ export interface QuotaAdapterConfig {
   providerId: string;
   /** Optional exact shortcut template id, used to avoid reusing an unrelated provider key. */
   providerTemplateId?: string;
-  /** Trusted provider origin used when ZCode stores no explicit API base URL. */
+  /** Fixed origin for packaged presets. Retained in custom settings for compatibility. */
   providerBaseURL?: string;
   displayName: string;
   endpoint?: string;
