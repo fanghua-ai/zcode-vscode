@@ -1085,9 +1085,17 @@ export async function readStartPlanAuth(family: PlanFamily): Promise<PlanAuth | 
   return jwt ? { apiKey: jwt } : null;
 }
 
-export async function readStartPlanAccess(family: PlanFamily, appVersion?: string | null): Promise<{
+type StartPlanAccess = {
   auth: PlanAuth; models: string[]; quota: PlanQuotaLimit[];
-} | null> {
+};
+
+export async function readStartPlanAccess(family: PlanFamily, appVersion?: string | null): Promise<StartPlanAccess | null> {
+  const result = await checkStartPlanAccess(family, appVersion);
+  return result === "unavailable" ? null : result;
+}
+
+/** Distinguish confirmed unavailability from a missing credential or inconclusive response. */
+export async function checkStartPlanAccess(family: PlanFamily, appVersion?: string | null): Promise<StartPlanAccess | "unavailable" | null> {
   let auth = await readStartPlanAuth(family);
   if (!auth) return null;
 
@@ -1132,7 +1140,8 @@ export async function readStartPlanAccess(family: PlanFamily, appVersion?: strin
     return null;
   }
 
-  const plans = Array.isArray(response.data?.plans) ? response.data.plans : [];
+  if (!Array.isArray(response.data?.plans)) return null;
+  const plans = response.data.plans;
   const now = finiteNonNegative(response.data?.server_time) ?? Date.now() / 1000;
   const activePlans = plans.filter((plan) => {
     const status = plan.status?.trim().toLowerCase();
@@ -1148,7 +1157,7 @@ export async function readStartPlanAccess(family: PlanFamily, appVersion?: strin
   if (activePlans.length === 0) {
     logInfo("No active Start Plan found", { family, planCount: plans.length });
     recordDiagnosticEvent("start_plan_unavailable", { family, reason: "no_active_plan", planCount: plans.length });
-    return null;
+    return "unavailable";
   }
 
   const balances = Array.isArray(response.data?.balances) ? response.data.balances : [];
@@ -1182,7 +1191,7 @@ export async function readStartPlanAccess(family: PlanFamily, appVersion?: strin
     ? plan.entitlements.map(entry => finitePositive(entry.effective_at)) : [finitePositive(plan.starts_at)]);
   if (!models.length && effectiveTimes.length && effectiveTimes.every(time => time !== null && time > now)) {
     recordDiagnosticEvent("start_plan_unavailable", { family, reason: "entitlements_not_effective" });
-    return null;
+    return "unavailable";
   }
   logDebug("Start Plan entitlement resolved", { stage: "start_plan_balance", family, code: resultCode(response.code),
     activePlanCount: activePlans.length, modelCount: models.length });

@@ -1362,7 +1362,8 @@ export function getWebviewHtml(
     font-size: 11px;
     font-weight: 650;
   }
-  .toolbar-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,.08)); color: var(--vscode-foreground); }
+  .toolbar-btn:enabled:hover { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,.08)); color: var(--vscode-foreground); }
+  #model-chip:disabled { cursor: default; }
   .toolbar-btn svg { color: var(--z-muted); }
   .context-meter {
     display: inline-flex;

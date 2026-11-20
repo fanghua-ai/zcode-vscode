@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { runtimeEnv, readConfiguredDefaultModel, readCliDefaultModel, syncCliConfig, type ResolvedRuntime } from "./desktop";
-import { cleanupOrphanedSqliteSnapshots, listWorkspacePathVariants, loadOverriddenTitles, upsertDesktopTask, loadTaskFlags, setTaskDeleted, setTaskArchived } from "./taskIndex";
+import { cleanupOrphanedSqliteSnapshots, indexListedDesktopTasks, listWorkspacePathVariants, loadOverriddenTitles, upsertDesktopTask, loadTaskFlags, setTaskDeleted, setTaskArchived } from "./taskIndex";
 import { ZCodeClient } from "./zcodeClient";
 import { activate, ZCodeViewProvider } from "./extension";
 import { setTestConfirmation, getRegisteredProvider } from "./testSupport/vscode";
@@ -35,6 +35,17 @@ function fixture(t: TestContext) {
   return { root, db };
 }
 
+function seedSavedSessions(root: string, ids: string[]): void {
+  const file = path.join(root, ".zcode/cli/db/db.sqlite");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const cli = new DatabaseSync(file);
+  try {
+    cli.exec("CREATE TABLE session(id TEXT PRIMARY KEY, time_archived INTEGER, time_updated INTEGER)");
+    const insert = cli.prepare("INSERT INTO session(id) VALUES(?)");
+    for (const id of ids) insert.run(id);
+  } finally { cli.close(); }
+}
+
 test("refreshing a paginated list keeps older and other-provider desktop tasks", async (t) => {
   const { db } = fixture(t);
   for (let i = 0; i < 82; i++) {
@@ -56,7 +67,11 @@ test("refreshing a paginated list keeps older and other-provider desktop tasks",
     dispose() {},
     listSessions: async () => Array.from({ length: 80 }, (_, i) => ({ sessionId: `s${i}`, title: `listed ${i}` })),
   };
+  db.exec("UPDATE tasks SET model='original/model', task_status='running' WHERE task_id='s1'");
+  Object.assign(provider, {runtime: { providerId: "current", modelId: "default" }});
   await provider.refreshSessions();
+  assert.deepEqual({...db.prepare("SELECT model,task_status FROM tasks WHERE task_id='s1'").get()},
+    {model:"original/model",task_status:"running"});
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM tasks").get().n, 82);
   assert.deepEqual({ ...db.prepare("SELECT title,pinned FROM tasks WHERE task_id='s80'").get() }, { title: "saved 80", pinned: 1 });
   assert.equal(db.prepare("SELECT provider FROM tasks WHERE task_id='s81'").get().provider, "other-agent");
@@ -64,7 +79,8 @@ test("refreshing a paginated list keeps older and other-provider desktop tasks",
 });
 
 test("native WAL writes remain durable", (t) => {
-  const { db } = fixture(t);
+  const { db, root } = fixture(t);
+  seedSavedSessions(root, ["native"]);
   db.exec("PRAGMA journal_mode=WAL");
   db.prepare("INSERT INTO tasks(workspace_key,task_id) VALUES(?,?)").run("/project", "native");
   setTaskArchived("/project", "native", true);
@@ -116,7 +132,8 @@ test("CLI sync does not restore providers or defaults removed from the authorita
 
 for (const scenario of ["active", "empty", "inactive", "switch", "failure"] as const) {
   test(`archive reconciles stale backend list with persisted flags (${scenario})`, async t => {
-    const { db } = fixture(t);
+    const { db, root } = fixture(t);
+    seedSavedSessions(root, ["A", "C"]);
     for (const [id, archived, deleted] of [["A", 0, 0], ["ARCHIVED", 1, 0], ["DELETED", 0, 1]] as const) {
       db.prepare("INSERT INTO tasks(workspace_key,task_id,title,archived,deleted) VALUES(?,?,?,?,?)").run("/project", id, id, archived, deleted);
     }
@@ -165,7 +182,8 @@ for (const scenario of ["active", "empty", "inactive", "switch", "failure"] as c
 
 for (const scenario of ["stale", "racing", "empty", "switch", "failure"] as const) {
   test(`delete reconciles stale backend list with persisted flags (${scenario})`, async t => {
-    const { db } = fixture(t);
+    const { db, root } = fixture(t);
+    seedSavedSessions(root, ["VALID"]);
     for (const [id, archived, deleted] of [["A", 1, 0], ["ARCHIVED", 1, 0], ["DELETED", 0, 1], ["VALID", 0, 0], ["OLDER", 0, 0]] as const) {
       db.prepare("INSERT INTO tasks(workspace_key,task_id,title,archived,deleted) VALUES(?,?,?,?,?)").run("/project", id, id, archived, deleted);
     }
@@ -349,7 +367,8 @@ function windowsPlatform(t: TestContext) {
 }
 
 test("Windows legacy workspace keys keep title and flags when synchronized for desktop", t => {
-  const { db } = fixture(t);
+  const { db, root } = fixture(t);
+  seedSavedSessions(root, ["old"]);
   windowsPlatform(t);
   const oldPath = "e:\\Projects\\项目", canonical = "E:\\Projects\\项目";
   db.prepare("INSERT INTO tasks (workspace_key, task_id, title, title_overridden, archived, pinned, mode, updated_at) VALUES (?, 'old', 'My title', 1, 1, 1, 'plan', 10)").run(oldPath);
@@ -364,6 +383,7 @@ test("Windows legacy workspace keys keep title and flags when synchronized for d
   assert.deepEqual(loadTaskFlags(oldPath), { archived: [], deleted: [] });
   assert.ok(upsertDesktopTask({workspacePath: canonical, sessionId: "old", title: "Renamed", overrideTitle: true}));
   assert.equal(db.prepare("SELECT title FROM tasks WHERE workspace_key=? AND task_id='old'").get(oldPath).title, "Renamed");
+  setTaskArchived(canonical, "old", true);
   setTaskDeleted(canonical, "old");
   assert.deepEqual(loadTaskFlags(oldPath), { archived: [], deleted: ["old"] });
   assert.ok(upsertDesktopTask({workspacePath: canonical, sessionId: "old", title: "Generated"}));
@@ -534,6 +554,9 @@ function sessionOperations(t: TestContext) {
     refreshSessions: (includeArchived?: boolean) => Promise<void>;
     applyRename: (id: string, title: string) => Promise<void>;
     archiveSession: (id: string, archived: boolean) => Promise<void>;
+    deleteSession: (id: string) => Promise<void>;
+    switchSession: (id: string) => Promise<void>;
+    renameSession: (id: string) => Promise<void>;
   };
   state.workspacePath = "/project";
   state.sessions = [{ sessionId: "A", title: "original" }];
@@ -623,7 +646,7 @@ for (const action of ["rename", "archive"] as const) {
 }
 
 for (const action of ["rename", "archive"] as const) {
-  test(`${action} reports a partial save when the second database fails and retry finishes synchronization`, async t => {
+  test(`${action} reports a second database failure and retry finishes synchronization`, async t => {
     const { state, posted, db, cliPath } = sessionOperations(t);
     const cli = new DatabaseSync(cliPath);
     try {
@@ -634,13 +657,13 @@ for (const action of ["rename", "archive"] as const) {
       await attempt();
       assert.equal(posted.length, 1);
       assert.equal(posted[0].type, "toast");
-      assert.match(posted[0].text!, /已保存.*同步失败.*重试/);
+      assert.match(posted[0].text!, action === "rename" ? /已保存.*同步失败.*重试/ : /未能完成/);
       assert.ok(!posted.some(message => message.type === "session_error" || message.type === "session_title"));
       if (action === "rename") {
         assert.equal(cli.prepare("SELECT title FROM session WHERE id='A'").get().title, "Saved name");
         assert.equal(db.prepare("SELECT title FROM tasks WHERE task_id='A'").get().title, "original");
       } else {
-        assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 1);
+        assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 0);
         assert.equal(cli.prepare("SELECT time_archived FROM session WHERE id='A'").get().time_archived, null);
       }
       failing.exec("DROP TRIGGER fail_sync");
@@ -698,4 +721,188 @@ test("automatic selection honors CLI archives before index refresh and explicit 
   assert.equal(choices.nextUsableSession(stale)?.sessionId, "A", "an explicit CLI restore overrides old wire archive metadata");
   assert.equal(choices.chooseStartupSession(stale, "A", new Set(["A"])), "B");
   cli.close();
+});
+
+test("list indexing yields to a desktop writer and retries once the lock clears", async t => {
+  const {db} = fixture(t);
+  db.exec("BEGIN IMMEDIATE");
+  const tasks = ["one","two"].map(sessionId => ({workspacePath:"/project",sessionId,title:sessionId}));
+  let released = false;
+  setTimeout(() => { db.exec("COMMIT"); released = true; }, 10);
+  assert.equal(await indexListedDesktopTasks(tasks, () => true), 2);
+  assert.equal(released, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM tasks").get().n, 2);
+});
+
+test("archiving and restoring a missing session both report failure", t => {
+  fixture(t);
+  for (const archive of [true,false]) assert.throws(() => setTaskArchived("/project","missing",archive), /未找到/);
+});
+
+test("an empty new chat cannot be archived in the desktop index alone", t => {
+  const { db } = fixture(t);
+  const live = { title: "Fresh chat", mode: "plan", baseMode: "edit", planEnabled: true };
+  const archive = () => setTaskArchived("/project", "fresh", true, live);
+  assert.throws(archive, /先发送一条消息/);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM tasks").get().n, 0);
+  db.exec("INSERT INTO tasks(workspace_key,task_id,title) VALUES('/project','fresh','Fresh chat')");
+  assert.throws(archive, /先发送一条消息/);
+  assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='fresh'").get().archived, 0);
+});
+
+test("archiving or restoring from a stale list cannot recreate a removed chat", async t => {
+  const { state, posted, db, cliPath } = sessionOperations(t);
+  const cli = new DatabaseSync(cliPath);
+  try {
+    cli.exec("DELETE FROM session");
+    db.exec("DELETE FROM tasks");
+    for (const archive of [true, false]) {
+      await state.archiveSession("A", archive);
+      assert.match(posted.at(-1)?.text || "", /未找到/);
+      assert.equal(db.prepare("SELECT count(*) AS n FROM tasks").get().n, 0);
+      assert.equal(cli.prepare("SELECT count(*) AS n FROM session").get().n, 0);
+    }
+  } finally { cli.close(); }
+});
+
+test("the archive action keeps a live empty chat open when its first CLI row cannot be saved", async t => {
+  const { state, posted, db, cliPath } = sessionOperations(t);
+  const cli = new DatabaseSync(cliPath);
+  try {
+    cli.exec("DELETE FROM session");
+    Object.assign(state.client, {
+      currentSessionId: "A", attachedNewSessionId: "A",
+      confirmedModel: () => undefined,
+      confirmedControls: () => ({ mode: "plan", baseMode: "edit", planEnabled: true }),
+    });
+    await state.archiveSession("A", true);
+    assert.equal(posted.length, 1);
+    assert.match(posted[0].text || "", /先发送一条消息/);
+    assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 0);
+    assert.equal(cli.prepare("SELECT count(*) AS n FROM session").get().n, 0);
+  } finally { cli.close(); }
+});
+
+test("retrying a live archive synchronizes both stores after a desktop index failure", t => {
+  const { db, cliPath } = sessionOperations(t);
+  const cli = new DatabaseSync(cliPath);
+  try {
+    db.exec("DELETE FROM tasks; CREATE TRIGGER fail_index BEFORE INSERT ON tasks BEGIN SELECT RAISE(ABORT,'test failure'); END");
+    const archive = () => setTaskArchived("/project", "A", true, {
+      title: "Fresh chat", mode: "plan", baseMode: "edit", planEnabled: true,
+    });
+    assert.throws(archive, /已保存.*同步失败/);
+    assert.ok(cli.prepare("SELECT time_archived FROM session WHERE id='A'").get().time_archived);
+    db.exec("DROP TRIGGER fail_index");
+    archive();
+    assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 1);
+    setTaskArchived("/project", "A", false);
+    assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 0);
+    assert.equal(cli.prepare("SELECT time_archived FROM session WHERE id='A'").get().time_archived, null);
+  } finally { cli.close(); }
+});
+
+test("archiving an inactive empty chat from the list needs a saved session, even after indexing", async t => {
+  const { state, db, cliPath, posted } = sessionOperations(t);
+  const cli = new DatabaseSync(cliPath);
+  try {
+    cli.exec("DELETE FROM session");
+    db.exec("DELETE FROM tasks");
+    await state.refreshSessions(false);
+    assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 0);
+    await state.archiveSession("A", true);
+    assert.match(posted.at(-1)?.text || "", /先发送一条消息/);
+    assert.equal(db.prepare("SELECT archived FROM tasks WHERE task_id='A'").get().archived, 0);
+    assert.equal(cli.prepare("SELECT count(*) AS n FROM session").get().n, 0);
+    cli.exec("INSERT INTO session(id) VALUES('A')");
+    await state.archiveSession("A", true);
+    assert.equal(posted.at(-1)?.text, "会话已归档");
+    assert.ok(cli.prepare("SELECT time_archived FROM session WHERE id='A'").get().time_archived);
+  } finally { cli.close(); }
+});
+
+for (const hasIndex of [true, false]) {
+  test(`a delayed list write preserves a concurrent restore (previously indexed: ${hasIndex})`, async t => {
+    const { db, cliPath } = sessionOperations(t);
+    const cli = new DatabaseSync(cliPath);
+    try {
+      cli.prepare("UPDATE session SET directory='/project', time_archived=1 WHERE id='A'").run();
+      if (hasIndex) db.exec("UPDATE tasks SET archived=1 WHERE task_id='A'");
+      else db.exec("DELETE FROM tasks");
+      db.exec("BEGIN IMMEDIATE");
+      const mirror = indexListedDesktopTasks([{workspacePath:"/project",sessionId:"A",title:"Refreshed",archived:true}], () => true);
+      db.exec("COMMIT");
+      setTaskArchived("/project", "A", false);
+      assert.equal(await mirror, 1);
+      assert.equal(cli.prepare("SELECT time_archived FROM session WHERE id='A'").get().time_archived, null);
+      assert.deepEqual({ ...db.prepare("SELECT archived,title FROM tasks WHERE task_id='A'").get() },
+        { archived: 0, title: "Refreshed" });
+    } finally { cli.close(); }
+  });
+}
+
+test("restoring a chat while its delete dialog is open keeps it in the active list", async t => {
+  const { state, db, posted } = sessionOperations(t);
+  setTaskArchived("/project", "A", true);
+  t.mock.method(vscode.window, "showWarningMessage", async () => {
+    setTaskArchived("/project", "A", false);
+    return "删除";
+  });
+  await state.deleteSession("A");
+  assert.deepEqual({ ...db.prepare("SELECT archived,deleted FROM tasks WHERE task_id='A'").get() },
+    { archived: 0, deleted: 0 });
+  assert.equal(posted.at(-1)?.text, "请先归档再删除");
+});
+
+test("a stale active list cannot reopen a chat already deleted by another window", async t => {
+  const { state, posted } = sessionOperations(t);
+  setTaskArchived("/project", "A", true);
+  setTaskDeleted("/project", "A");
+  await state.switchSession("A");
+  assert.equal(state.client.currentSessionId, "other");
+  assert.equal(posted.at(-1)?.text, "会话已删除");
+});
+
+for (const action of ["rename", "delete"] as const) {
+  test(`changing workspace while confirming ${action} leaves the original chat intact`, async t => {
+    const { state, db, cliPath, posted } = sessionOperations(t);
+    setTaskArchived("/project", "A", true);
+    if (action === "rename") {
+      t.mock.method(vscode.window, "showInputBox", async () => { state.workspacePath = "/other"; return "wrong title"; });
+      await state.renameSession("A");
+    } else {
+      t.mock.method(vscode.window, "showWarningMessage", async () => { state.workspacePath = "/other"; return "删除"; });
+      await state.deleteSession("A");
+    }
+    assert.equal(posted.at(-1)?.text, "工作区已切换，请在原工作区重试。");
+    assert.deepEqual({ ...db.prepare("SELECT title,deleted FROM tasks WHERE task_id='A'").get() },
+      { title: "original", deleted: 0 });
+    const cli = new DatabaseSync(cliPath);
+    try { assert.equal(cli.prepare("SELECT title FROM session WHERE id='A'").get().title, "original"); }
+    finally { cli.close(); }
+  });
+}
+
+test("failed resume reports the target and generation to the conversation that initiated the switch", async t => {
+  const { state, posted } = sessionOperations(t);
+  Object.assign(state.client, {
+    sessionAttached: false, setTiming() {}, clearTiming() {}, prepareViewChange() {}, endViewChange() {},
+    async switchSession(id: string) { state.client.currentSessionId = id; throw new Error("resume unavailable"); },
+  });
+  await assert.rejects(state.switchSession("A"), /resume unavailable/);
+  assert.deepEqual(posted, [
+    { type: "view_reset", targetSessionId: "A", viewGen: 1 },
+    { type: "session_error", message: "resume unavailable", failedSwitchTo: "A", viewGen: 1 },
+  ]);
+});
+
+test("returning to the source is honored while another chat is still opening", async t => {
+  const { state, posted } = sessionOperations(t);
+  Object.assign(state.client, {
+    currentSessionId: "A", sessionAttached: true, viewChanging: true,
+    setTiming() {}, clearTiming() {}, prepareViewChange() {}, endViewChange() {},
+    async switchSession() { throw new Error("return attempted"); },
+  });
+  await assert.rejects(state.switchSession("A"), /return attempted/);
+  assert.deepEqual(posted[0], { type: "view_reset", targetSessionId: "A", viewGen: 1 });
 });

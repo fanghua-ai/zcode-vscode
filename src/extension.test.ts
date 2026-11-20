@@ -86,7 +86,10 @@ function fixture() {
   };
   const setVisible = (visible: boolean) => { view.visible = visible; onVisibilityChange(); };
   const disposeView = () => onViewDispose();
-  return { state, posted, response, handler, switchToB, setVisible, disposeView, releasedListeners, provider, view, visibility, pollState, backgroundPolls: () => backgroundPolls, dispose };
+  const selectModelFromView = (model: { providerId: string; modelId: string }) => state.onWebviewMessage({
+    type: "selectModel", ...model, sessionId: state.client.currentSessionId, viewGen: state.switchTicket,
+  });
+  return { state, posted, response, handler, switchToB, setVisible, disposeView, releasedListeners, provider, view, visibility, pollState, backgroundPolls: () => backgroundPolls, dispose, selectModelFromView };
 }
 
 test("Explorer files wait for the composer and preserve unsaved text in a multi-selection", async t => {
@@ -341,9 +344,9 @@ test("Start Plan choices keep entitled models omitted by the session and hide st
   f.state.pushModels = async () => {};
   f.state.resolveSessionModelRuntime = async model => { switched.push(model.modelId); return false; };
   Object.assign(f.state.client, { isGenerating: () => false });
-  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
-  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "glm-5.3-flash" });
-  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "UNVERIFIED" });
+  await f.selectModelFromView({ providerId, modelId: "GLM-5.3" });
+  await f.selectModelFromView({ providerId, modelId: "glm-5.3-flash" });
+  await f.selectModelFromView({ providerId, modelId: "UNVERIFIED" });
   assert.deepEqual(switched, ["GLM-5.3", "glm-5.3-flash"]);
 
   Object.assign(f.state, { livePicker: null });
@@ -351,6 +354,44 @@ test("Start Plan choices keep entitled models omitted by the session and hide st
     ["builtin:bigmodel-start-plan", "GLM-5.3"], ["builtin:bigmodel-start-plan", "GLM-5.3-Flash"],
   ], "the plan list covers a catalog that has not loaded yet");
   f.dispose();
+});
+
+test("plan recovery keeps the API-key model choices when desktop and backend catalogs still list GLM", async t => {
+  const f = fixture();
+  t.after(f.dispose);
+  const personal: PickerModel = { providerId: "account:bigmodel-individual-coding-plan", providerName: "Personal",
+    modelId: "GLM-5.3", label: "GLM-5.3", kind: "anthropic", hasKey: true };
+  const deepseek: PickerModel = { providerId: "deepseek", providerName: "DeepSeek", modelId: "deepseek-v4-pro",
+    label: "deepseek-v4-pro", kind: "openai-compatible", hasKey: true, access: "api-key" };
+  const another: PickerModel = { ...deepseek, providerId: "another", providerName: "Another", modelId: "another-model" };
+  const state = f.state as typeof f.state & {
+    showLoginSetup: (result: import("./desktop").ResolveResult) => void;
+    setResolvedRuntime: (runtime: ResolvedRuntime) => void;
+    startZCode: (options: unknown) => Promise<void>;
+  };
+  const runtime = { providerId: deepseek.providerId, providerName: deepseek.providerName, modelId: deepseek.modelId,
+    models: { [deepseek.modelId]: {} }, kind: deepseek.kind, apiKey: "TEST-DEEPSEEK",
+    baseURL: "https://example.test", source: "vscode-override" as const };
+  const rows = [personal, deepseek, another];
+  state.picker = rows;
+  state.showLoginSetup({ ok: false, accountPlanUnavailable: true, planUnavailable: true, picker: rows });
+  assert.deepEqual(f.posted.find(msg => msg.type === "setup")?.picker, [deepseek, another]);
+
+  let startupOptions: unknown;
+  state.startZCode = async options => { startupOptions = options; state.setResolvedRuntime(runtime); };
+  await state.onWebviewMessage({ type: "selectModel", providerId: deepseek.providerId, modelId: deepseek.modelId, restart: true });
+  assert.deepEqual(startupOptions, { force: true, createNew: true, strictPreferredProvider: true,
+    preferredProviderId: deepseek.providerId, preferredModelId: deepseek.modelId });
+
+  // A metadata refresh rebuilds the local list even when the new backend still
+  // advertises an account model. Neither source should restore it.
+  state.picker = rows;
+  Object.assign(state, { livePicker: { client: state.client, sessionId: "A", models: [
+    { ...personal, providerId: "builtin:bigmodel-coding-plan" }, deepseek,
+  ] } });
+  assert.deepEqual(state.modelChoices().map(model => model.providerId), ["deepseek", "another"]);
+  state.setResolvedRuntime({ ...runtime, providerId: personal.providerId, modelId: personal.modelId, source: "desktop-personal-oauth" });
+  assert.ok(state.modelChoices().some(model => model.providerId === personal.providerId));
 });
 
 function startPlanFixture() {
@@ -395,7 +436,7 @@ test("sending applies a queued Start Plan selection after the catalog changes it
   f.state.resolveSessionModelRuntime = async () => null;
   const calls: unknown[][] = [];
   f.state.client.setModel = async (...args) => { calls.push(args); };
-  await f.state.onWebviewMessage({ type: "selectModel", providerId: builtin, modelId: "GLM-5.3" });
+  await f.selectModelFromView({ providerId: builtin, modelId: "GLM-5.3" });
   assert.equal(f.state.pendingModel?.providerId, builtin);
   f.state.client.readAvailableModels = async () => ({ known: true, available: [flash] });
   Object.assign(f.state, { livePicker: null });
@@ -442,7 +483,7 @@ test("account selection survives a later snapshot listing only the builtin alias
     sendMessage: async () => { calls.push("send"); },
   });
   f.state.resolveSessionModelRuntime = async () => null;
-  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  await f.selectModelFromView({ providerId, modelId: "GLM-5.3" });
   assert.equal(f.state.pendingModel?.providerId, providerId);
   f.state.client.readAvailableModels = async () => ({ known: true, available: [{ ...flash, providerId: builtin }] });
   await f.state.pushModels(true);
@@ -481,7 +522,7 @@ test("new account catalog arriving during credential lookup does not invalidate 
     await release.promise;
     return null;
   };
-  await f.state.onWebviewMessage({ type: "selectModel", providerId: builtin, modelId: "GLM-5.3" });
+  await f.selectModelFromView({ providerId: builtin, modelId: "GLM-5.3" });
   generating = false;
   const send = f.state.onWebviewMessage({ type: "send", sessionId: "A", text: "test" });
   await resolving.promise;
@@ -538,7 +579,7 @@ test("desktop refreshes and failed reads make the cached session catalog read ag
   const switched: string[] = [];
   f.state.resolveSessionModelRuntime = async model => { switched.push(model.modelId); return false; };
   Object.assign(f.state.client, { isGenerating: () => false });
-  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  await f.selectModelFromView({ providerId, modelId: "GLM-5.3" });
   assert.deepEqual(switched, ["GLM-5.3"], "an omitted model still reaches runtime resolution");
   assert.deepEqual(ids(), ["GLM-5.3", "GLM-5.3-Flash"]);
   f.switchToB();
@@ -560,15 +601,15 @@ test("only a Start Plan switch re-reads a missing or outdated session catalog fi
   f.state.resolveSessionModelRuntime = async model => { switched.push([model.modelId, reads]); return false; };
   Object.assign(f.state.client, { isGenerating: () => false });
 
-  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  await f.selectModelFromView({ providerId, modelId: "GLM-5.3" });
   assert.deepEqual(switched, [["GLM-5.3", 1]], "a catalog that never loaded is read before judging the switch");
   assert.equal(reads, 1);
   state.livePicker!.stale = true;
-  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3-Flash" });
+  await f.selectModelFromView({ providerId, modelId: "GLM-5.3-Flash" });
   assert.deepEqual(switched.at(-1), ["GLM-5.3-Flash", 2], "an outdated catalog is read again before judging the switch");
 
   state.livePicker!.stale = true;
-  await f.state.onWebviewMessage({ type: "selectModel", providerId: "custom", modelId: "custom-model" });
+  await f.selectModelFromView({ providerId: "custom", modelId: "custom-model" });
   assert.deepEqual(switched.at(-1), ["custom-model", 2], "another provider's switch does not wait for the session catalog");
   f.dispose();
 });
@@ -599,7 +640,7 @@ test("an unreadable catalog leaves Start Plan switches to the backend, whose reg
     setModel: async (...args: unknown[]) => { attempted.push(args); throw failure; },
   });
 
-  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  await f.selectModelFromView({ providerId, modelId: "GLM-5.3" });
   assert.deepEqual(attempted, [[providerId, "GLM-5.3"]], "an outdated list cannot prove the model is gone");
   assert.deepEqual(f.state.currentModel, confirmed);
   assert.match(warnings.at(-1) ?? "", /该模型已不可用|no longer available/);
@@ -619,7 +660,7 @@ test("an unreadable catalog leaves Start Plan switches to the backend, whose reg
 
   f.state.disabledModelKeys.add(`${providerId}\0GLM-5.3`);
   attempted.length = 0;
-  await f.state.onWebviewMessage({ type: "selectModel", providerId, modelId: "GLM-5.3" });
+  await f.selectModelFromView({ providerId, modelId: "GLM-5.3" });
   assert.equal(await state.applyPendingModel(f.state.client), false);
   assert.equal(state.pendingModel, null);
   assert.deepEqual(attempted, [], "an explicit disable still blocks direct and queued switches");
@@ -813,18 +854,53 @@ test("resolving a new view releases the previous view's listeners first", () => 
 
 test("every page load receives the session state, even without a new resolveWebviewView", async () => {
   const f = fixture();
-  const pushes: Array<{ forceHistory?: boolean } | undefined> = [];
+  const slashCommands = [{ name: "goal", description: "Set the session goal", inputHint: "/goal [objective]" }];
+  let historyReads = 0;
   const refreshed: string[] = [];
-  Object.assign(f.state.client, { refreshSkillCatalog: () => refreshed.push("skills"), refreshSubagentCatalog: () => refreshed.push("agents") });
-  f.state.pushSessionState = async opts => { pushes.push(opts); f.state.pushedEpoch = f.state.webviewEpoch; };
+  Object.assign(f.state.client, {
+    currentSlashCommands: slashCommands, historyDelivered: () => true,
+    loadHistory: async () => { historyReads++; return { items: [], truncated: false }; },
+    endViewChange: () => {}, emitSessionControls: async () => {},
+    refreshSkillCatalog: () => refreshed.push("skills"), refreshSubagentCatalog: () => refreshed.push("agents"),
+  });
+  Object.assign(f.provider, { refreshSessions: async () => {} });
   await f.state.onWebviewMessage({ type: "ready" });
-  assert.equal(pushes.length, 1);
-  assert.equal(pushes[0]?.forceHistory, true);
+  assert.equal(historyReads, 1);
   // Reload Webviews / renderer recovery: the same view posts "ready" again from a blank page.
   await f.state.onWebviewMessage({ type: "ready" });
-  assert.equal(pushes.length, 2, "a reloaded page stayed blank");
+  assert.equal(historyReads, 2, "a reloaded page stayed blank");
+  assert.deepEqual(f.posted.filter(message => message.type === "session_ready").map(message => message.slashCommands), [slashCommands, slashCommands]);
   assert.deepEqual(refreshed, ["skills", "agents", "skills", "agents"]);
   f.dispose();
+});
+
+test("reloading during a session switch restores its loading state", async () => {
+  const f = fixture();
+  const reset = { type: "view_reset", targetSessionId: "B", viewGen: 2 };
+  Object.assign(f.provider, { currentViewReset: reset, switchTicket: 2 });
+  Object.assign(f.state.client, { viewChanging: true, currentSessionId: "B" });
+  f.state.pushSessionState = async () => { assert.fail("partial session was treated as ready"); };
+  await f.state.onWebviewMessage({ type: "ready" });
+  const transitions = f.posted.filter(message => message.type === "view_reset" || message.type === "session_ready");
+  assert.deepEqual(transitions, [reset]);
+});
+
+test("a reloaded panel replays a failed handoff until the next session change", async () => {
+  const f = fixture();
+  const reset = { type: "view_reset", targetSessionId: "B", viewGen: 2 };
+  const failure = { type: "session_error", failedSwitchTo: "B", message: "resume unavailable", viewGen: 2 };
+  Object.assign(f.provider, { currentViewReset: reset, failedViewChange: failure, switchTicket: 2 });
+  Object.assign(f.state.client, { viewChanging: false, currentSessionId: "B", sessionAttached: false });
+  f.state.pushSessionState = async () => { assert.fail("failed switch was advertised as ready"); };
+  await f.state.onWebviewMessage({ type: "ready" });
+  const transitions = () => f.posted.filter(message => ["view_reset", "session_error", "session_ready"].includes(message.type));
+  assert.deepEqual(transitions(), [reset, failure]);
+  f.posted.length = 0;
+  const retry = { ...reset, viewGen: 3 };
+  Object.assign(f.provider, { currentViewReset: retry, switchTicket: 3 });
+  Object.assign(f.state.client, { viewChanging: true });
+  await f.state.onWebviewMessage({ type: "ready" });
+  assert.deepEqual(transitions(), [retry]);
 });
 
 test("webview session actions acknowledge only after their operation settles", async () => {
@@ -1201,6 +1277,132 @@ test("late accepted queue insert is acknowledged to its source session without r
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(f.posted, [{ type: "queue_admitted", commandId: "command-A", sessionId: "A" }]);
   f.dispose();
+});
+
+test("a queue acknowledgement timeout is unconfirmed in the source session", async () => {
+  const f = fixture();
+  f.handler({ type: "insert", sessionId: "A", text: "insert-A", queueItemId: "command-A" });
+  f.switchToB();
+  f.response.reject(new SendStatusUnknownError(true));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.posted.length, 1);
+  assert.deepEqual({ ...f.posted[0], message: undefined }, {
+    type: "send_unconfirmed", sessionId: "A", commandId: "command-A", running: true, insertion: true, message: undefined,
+  });
+});
+
+test("restart requests waiting on the same startup keep the next launch serialized", async () => {
+  const f = fixture();
+  const state = f.provider as unknown as {
+    startZCode: () => Promise<void>; startZCodeInner: () => Promise<unknown>; disposeClient: () => void;
+  };
+  const launches: ReturnType<typeof deferred>[] = [];
+  const tick = () => new Promise(resolve => setImmediate(resolve));
+  let resets = 0;
+  const disposeClient = state.disposeClient.bind(state);
+  state.disposeClient = () => { resets++; disposeClient(); };
+  state.startZCodeInner = () => {
+    const launch = deferred();
+    launches.push(launch);
+    return launch.promise;
+  };
+  const first = state.startZCode();
+  const one = f.provider.restart("one");
+  const two = f.provider.restart("two");
+  await tick();
+  assert.equal(launches.length, 1);
+  assert.equal(resets, 0);
+  launches[0].resolve();
+  await first;
+  await tick();
+  assert.equal(launches.length, 2);
+  assert.equal(resets, 1);
+  launches[1].resolve();
+  await one;
+  await tick();
+  assert.equal(launches.length, 3);
+  assert.equal(resets, 2);
+  launches[2].resolve();
+  await two;
+});
+
+for (const attached of [true, false]) test(`a new-chat request during cold startup is applied after startup settles (attached: ${attached})`, async () => {
+  const f = fixture();
+  const state = f.provider as unknown as {
+    client: object | null; runtime: ResolvedRuntime | null;
+    startZCode: () => Promise<void>; startZCodeInner: (options?: { createNew?: boolean }) => Promise<void>;
+  };
+  const launch = deferred();
+  const calls: string[] = [];
+  const client = Object.assign(f.state.client, {
+    sessionAttached: attached, prepareViewChange: async () => {}, endViewChange: () => {},
+    newSession: async () => { calls.push("create in attached client"); },
+  });
+  state.client = null;
+  // Allow the existing resolved runtime to be used with the fixture's empty login files.
+  state.runtime = { providerId: "fixture", modelId: "fixture" } as ResolvedRuntime;
+  f.state.pushSessionState = async () => {};
+  state.startZCodeInner = async options => {
+    if (options?.createNew) { calls.push("create in a new client"); return; }
+    calls.push("restore");
+    await launch.promise;
+    state.client = client;
+  };
+  const startup = state.startZCode();
+  const newChat = f.provider.newSession();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ["restore"]);
+  launch.resolve();
+  await Promise.all([startup, newChat]);
+  assert.deepEqual(calls, ["restore", attached ? "create in attached client" : "create in a new client"]);
+});
+
+test("a model pick must belong to the current visible attachment", async () => {
+  const f = fixture();
+  f.state.switchTicket = 3;
+  const selection = { type: "selectModel", providerId: "sample", modelId: "target" };
+  Object.assign(f.state.client, { isGenerating: () => true, viewChanging: true });
+  await f.selectModelFromView(selection);
+  Object.assign(f.state.client, { viewChanging: false });
+  await f.state.onWebviewMessage(selection);
+  await f.state.onWebviewMessage({ ...selection, sessionId: "old-chat", viewGen: 3 });
+  await f.state.onWebviewMessage({ ...selection, sessionId: "A", viewGen: 2 });
+  assert.equal(f.state.pendingModel ?? null, null);
+  await f.selectModelFromView(selection);
+  assert.deepEqual(f.state.pendingModel, { sessionId: "A", providerId: "sample", modelId: "target" });
+});
+
+test("a superseded attachment cannot select the visible chat or replace its slash commands", () => {
+  const f = fixture();
+  const state = f.provider as unknown as { handleZCodeEvent: (event: { type: "session_ready"; data: object }) => void };
+  f.state.switchTicket = 2;
+  const ready = (sessionId: string, viewGen: number) => state.handleZCodeEvent({
+    type: "session_ready", data: { sessionId, viewGen, kind: "resumed", slashCommands: [{ name: sessionId }] },
+  });
+  ready("B", 1);
+  assert.equal(f.posted.length, 0);
+  ready("C", 2);
+  const selected = f.posted.filter(message => message.type === "session_ready");
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].sessionId, "C");
+  assert.deepEqual(selected[0].slashCommands, [{ name: "C" }]);
+});
+
+test("a failed create without a session ID does not reconnect the previous composer", async () => {
+  const f = fixture();
+  Object.assign(f.state, { runtime: { providerId: "fixture", modelId: "fixture" } });
+  Object.assign(f.state.client, {
+    prepareViewChange: async () => {}, endViewChange: () => {},
+    newSession: async () => {
+      Object.assign(f.state.client, { currentSessionId: null });
+      throw new Error("session/create timed out");
+    },
+  });
+  await assert.rejects(f.provider.newSession(), /session\/create timed out/);
+  const reset = f.posted.find(message => message.type === "view_reset");
+  assert.ok(reset?.clear);
+  assert.ok(f.posted.some(message => message.type === "session_error" && message.failedCreate && message.viewGen === reset.viewGen));
+  assert.ok(!f.posted.some(message => message.type === "session_ready" || message.type === "stream_release"));
 });
 
 test("queued /plan switches its owning session before inserting the task body", async () => {
@@ -1811,6 +2013,36 @@ for (const phase of ["resolve", "switch"]) test(`model ${phase} failure restores
   f.dispose();
 });
 
+for (const unavailable of [true, false]) test(`a send waiting for a failed model selection keeps the message (unavailable: ${unavailable})`, async () => {
+  const f = fixture();
+  const resolving = deferred();
+  const checked = deferred();
+  let sends = 0;
+  Object.assign(f.state.client, {
+    isGenerating: () => false,
+    setModel: async () => { throw new Error("MODEL_REJECTED"); },
+    sendMessage: async () => { sends++; },
+  });
+  f.state.resolveSessionModelRuntime = async () => {
+    resolving.resolve();
+    await checked.promise;
+    return unavailable ? false : null;
+  };
+  const selection = f.selectModelFromView({ providerId: "sample", modelId: "target" });
+  await resolving.promise;
+  const message = { type: "send", sessionId: "A", text: "Keep this draft" };
+  const sending = f.state.onWebviewMessage({ ...message, commandId: "waiting" });
+  checked.resolve();
+  await Promise.all([selection, sending]);
+  assert.equal(sends, 0);
+  const rejection = f.posted.find(item => item.type === "send_rejected");
+  assert.equal(rejection?.commandId, "waiting");
+  assert.equal(rejection?.text, message.text);
+
+  await f.state.onWebviewMessage({ ...message, commandId: "manual-retry" });
+  assert.equal(sends, 1, "a failed selection must not block a later explicit send");
+});
+
 test("a queued model remains provisional if the registry rejects it and the catalog cannot be read", async () => {
   const { f, providerId } = startPlanFixture();
   const confirmed = { providerId, modelId: "GLM-5.3-Flash" };
@@ -1834,7 +2066,7 @@ test("a queued model remains provisional if the registry rejects it and the cata
   Object.assign(f.state, { client, currentModel: confirmed });
   f.state.resolveSessionModelRuntime = async () => null;
 
-  await f.state.onWebviewMessage({ type: "selectModel", ...target });
+  await f.selectModelFromView(target);
   assert.deepEqual(f.state.pendingModel, { sessionId: "A", ...target });
   assert.deepEqual(f.posted.filter(message => message.type === "models").at(-1)?.current, target);
   assert.deepEqual(client.confirmedModel(), confirmed);
@@ -1878,10 +2110,10 @@ for (const outcome of ["accepted", "rejected"]) test(`a queued model switch ${ou
   });
   f.state.currentModel = confirmed;
   f.state.resolveSessionModelRuntime = async () => null;
-  await f.state.onWebviewMessage({ type: "selectModel", ...first });
+  await f.selectModelFromView(first);
   const applying = state.applyPendingModel(f.state.client);
   await started.promise;
-  await f.state.onWebviewMessage({ type: "selectModel", ...latest });
+  await f.selectModelFromView(latest);
   if (outcome === "accepted") response.resolve();
   else response.reject(Object.assign(new Error("registry rejection"), { reasonCode: "provider.notInRegistry" }));
   assert.equal(await applying, outcome === "accepted");
@@ -1928,11 +2160,11 @@ test("send admits the message before a later direct model selection can apply", 
     return null;
   };
 
-  await f.state.onWebviewMessage({ type: "selectModel", ...first });
+  await f.selectModelFromView(first);
   generating = false;
   const send = f.state.onWebviewMessage({ type: "send", sessionId: "A", text: "test message" });
   await checking.promise;
-  const nextPick = f.state.onWebviewMessage({ type: "selectModel", ...latest });
+  const nextPick = f.selectModelFromView(latest);
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(operations, []);
   resume.resolve();

@@ -55,7 +55,9 @@ const FIELD_KINDS = {
 } as const satisfies { [K in keyof WebviewIn]-?: Kind };
 
 const MAX_STRING = 64 * 1024;
-const MAX_LONG_STRING = 16 * 1024 * 1024;
+export const MAX_MESSAGE_TEXT = 16 * 1024 * 1024;
+export const MAX_MESSAGE_REFERENCES = 100;
+const MAX_LONG_STRING = MAX_MESSAGE_TEXT;
 const MAX_PATH = 4096;
 const MAX_DATA_URL = Math.ceil(IMAGE_MAX_BYTES / 3) * 4 + 128;
 
@@ -145,10 +147,10 @@ function fieldOk(kind: Kind, value: unknown): boolean {
       return isRecord(value) && isPath(value.path) && ["edit", "write", "read"].includes(value.kind as string) &&
         optional(value.before, v => isBoundedString(v, MAX_LONG_STRING)) && optional(value.after, v => isBoundedString(v, MAX_LONG_STRING)) &&
         optional(value.added, isFiniteNumber) && optional(value.removed, isFiniteNumber);
-    case "chips": return Array.isArray(value) && value.length <= MAX_LIST && value.every(isChip);
+    case "chips": return Array.isArray(value) && value.length <= MAX_MESSAGE_REFERENCES && value.every(isChip);
     case "chip": return isChip(value);
     case "sessionRefs":
-      return Array.isArray(value) && value.length <= MAX_LIST &&
+      return Array.isArray(value) && value.length <= MAX_MESSAGE_REFERENCES &&
         value.every(ref => isRecord(ref) && isBoundedString(ref.sessionId, 256) && isBoundedString(ref.title));
     case "stringList": return Array.isArray(value) && value.length <= MAX_LIST && value.every(item => isBoundedString(item));
     case "string": return typeof value === "string" && value.length <= MAX_STRING;

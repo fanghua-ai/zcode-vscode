@@ -1,5 +1,6 @@
 let provider: unknown;
 let testFiles: string[] = [];
+export const version = "1.106.0";
 export class RelativePattern { constructor(public base: string, public pattern: string) {} }
 export const setTestFiles = (files: string[]) => { testFiles = files; };
 let languageSetting = "auto";
@@ -17,6 +18,7 @@ export function setConfigInspection(key: string, value: { globalValue?: unknown;
 const disposable = () => ({ dispose() {} });
 export const recoveryNotices: Array<{message:string;items:string[]}> = [];
 export const window = {
+  async showInputBox(_options?: unknown): Promise<string | undefined> { return undefined; },
   async showQuickPick(_items: unknown, _options?: unknown): Promise<any> { return undefined; },
   async showErrorMessage(message:string,...items:string[]){recoveryNotices.push({message,items});return undefined as string|undefined;},
   async showWarningMessage(_message: string, _options: unknown, ...items: string[]) { return confirmWarning ? items[0] : undefined; },

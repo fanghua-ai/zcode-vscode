@@ -50,6 +50,8 @@
   emit({type:'conversation_sync',sessionId:'A',editable:{target:{rowId:2,entityId:'preserved-editor-q'},text:'ORIGINAL_EDIT',attachments:images},turns:[]});
   messages.querySelector('.turn-edit-btn').click();
   const bubble=messages.querySelector('.message.user.editing'),editor=bubble.querySelector('.user-edit'),attempt=bubble.dataset.editRequestId;
+  emit({type:'image_failed',edit:true,sessionId:'A',editRequestId:attempt,imageId:'never-added',message:'Image exceeds size limit'});
+  check(document.getElementById('toast').textContent==='Image exceeds size limit','early edit attachment error was hidden');
   editor.value='UNSENT_EDIT_TEXT';editor.setSelectionRange(2,8);
   bubble.querySelector('.image-remove').click();
   emit({type:'image_pending',edit:true,sessionId:'A',editRequestId:attempt,imageId:'preserved-upload',fileName:'added.png'});
@@ -102,6 +104,51 @@
   emit({...second,type:'query_rewound'});check(editor.isConnected,'old submission from the same edit attempt closed the retry');
   emit({...retry,type:'query_rewound'});
   check(!messages.querySelector('.user-edit')&&messages.querySelector('.user-body').textContent==='NEW_UNSENT_EDIT','matching acknowledgement did not apply exact text');
+ });
+ await test('an edited question is not duplicated by a fast double submit and the following history',()=>{
+  reset();
+  emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'edit-dup-q',role:'user',text:'BEFORE_EDIT'},{id:'edit-dup-a',role:'assistant',text:'REPLY'}]});
+  emit({type:'conversation_sync',sessionId:'A',editable:{target:{rowId:1,entityId:'edit-dup-q'},text:'BEFORE_EDIT'},turns:[]});
+  messages.querySelector('.turn-edit-btn').click();
+  const editor=messages.querySelector('.message.user.editing');
+  editor.querySelector('.user-edit').value='AFTER_EDIT';
+  const button=editor.querySelector('[data-uedit="send"]');button.click();button.click();
+  const submissions=sent.filter(message=>message.type==='editLast');
+  check(submissions.length===1,'double edit click submitted twice');
+  emit({...submissions[0],type:'query_rewound',text:'AFTER_EDIT'});
+  check(messages.querySelectorAll('.message.user').length===1,'rewound edit duplicated the question');
+  emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'edit-dup-q-new',role:'user',text:'AFTER_EDIT'}]});
+  const questions=[...messages.querySelectorAll('.message.user')];
+  check(questions.length===1,'canonical history duplicated the edited question');
+  check(questions[0].querySelector('.user-body')?.textContent==='AFTER_EDIT','edited text lost after history');
+ });
+ await test('a rewind snapshot arriving before the edit acknowledgement keeps the previous question intact',()=>{
+  for(const accepted of [true,false]){
+   reset();
+   const past=[{id:'earlier',role:'user',text:'Previous question'},{id:'earlier-answer',role:'assistant',text:'Previous answer'}];
+   const history=items=>emit({type:'history',sessionId:'A',viewGen:gen,items});
+   const editable=(id,text,rowId)=>emit({type:'conversation_sync',sessionId:'A',editable:{target:{rowId,entityId:id},text},turns:[]});
+   history([...past,{id:'original',role:'user',text:'Original question'}]);
+   editable('original','Original question',3);
+   messages.querySelector('.turn-edit-btn').click();
+   const editor=messages.querySelector('.message.user.editing');
+   editor.querySelector('textarea').value='Revised question';
+   const button=editor.querySelector('[data-uedit="send"]');
+   button.click();button.click();
+   const submissions=sent.filter(msg=>msg.type==='editLast');
+   check(submissions.length===1,'second click sent another edit');
+   editable('earlier','Previous question',1);
+   history(past);
+   check(!messages.querySelector('.user-edit')&&input.value==='','rewind attached pending edit to previous question or composer');
+   if(accepted){
+    history([...past,{id:'replacement',role:'user',text:'Revised question'},{id:'reply',role:'assistant',text:'New reply'}]);
+    emit({...submissions[0],type:'query_rewound'});
+    check(messages.textContent.includes('Previous question')&&messages.textContent.includes('New reply')&&!messages.querySelector('.user-edit')&&input.value==='','late edit acknowledgement damaged the transcript');
+   }else{
+    emit({...submissions[0],type:'query_edit_rejected',message:'Edit failed'});
+    check(input.value==='Revised question','detached failed edit lost its draft');
+   }
+  }
  });
  await test('reasoning and tool-group choices survive both pagination and snapshot updates',()=>{
   reset();const items=[{id:'group-choice-q',role:'user',text:'GROUP_QUESTION'},{id:'group-choice-a',role:'assistant',text:'GROUP_REPLY',steps:[
@@ -564,6 +611,40 @@
   check(sent.some(message=>message.type==='retry')&&input.value==='Keep this draft','reconnect action erased the draft or was not sent');
  });
  await test('setup without usable credentials offers sign-in diagnostics and community recovery',()=>{reset();emit({type:'setup',reason:'No saved credentials',hint:'Original backend hint',picker:[]});const recovery=document.getElementById('setup-recovery');check(document.getElementById('setup-hint').textContent.length>20,'setup has no guidance');check(recovery.querySelector('details pre').textContent.includes('Original backend hint'),'setup lost original hint');recovery.querySelector('[data-act="community"]').click();recovery.querySelector('[data-act="copyDiagnostics"]').click();check(sent.some(message=>message.type==='openCommunity')&&sent.some(message=>message.type==='copyDiagnostics'),'setup recovery actions missing');recovery.querySelector('[data-act="retry"]').click();check(sent.some(message=>message.type==='retry'),'setup cannot reload sign-in');});
+ await test('unavailable plan recovery offers one API key entry with an explicit model choice',()=>{
+  reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});
+  const deepseek={providerId:'deepseek',providerName:'DeepSeek',modelId:'deepseek-flash',label:'deepseek-flash',hasKey:true,access:'api-key'};
+  const custom={providerId:'custom',providerName:'Custom',modelId:'custom-model',label:'custom-model',hasKey:true,access:'api-key'};
+  const disabled={...deepseek,modelId:'disabled-model',disabledReason:'Disabled'};
+  const personal={providerId:'account:bigmodel-individual-coding-plan',providerName:'Personal',modelId:'GLM-5.3',hasKey:true};
+  const picker=[deepseek,custom,disabled,personal];
+  emit({type:'setup',reason:'Original plan check',planUnavailable:true,picker});
+  const setup=document.getElementById('setup'), overlay=document.getElementById('overlay');
+  const useKey=()=>setup.querySelector('[data-act="useApiKey"]');
+  check(setup.querySelector('#setup-title').textContent==='当前套餐不可用','confirmed plan failure was shown as a login error');
+  check(useKey()?.textContent==='使用 API Key'&&!setup.querySelector('#setup-list .overlay-item'),'setup did not provide one generic API key action');
+  check(!sent.some(message=>message.type==='selectModel'),'setup switched providers automatically');
+  useKey().click();
+  check(overlay.classList.contains('open')&&!setup.classList.contains('open'),'API key action did not open the model chooser');
+  const entries=[...overlay.querySelectorAll('button.overlay-item')];
+  check(entries.length===2&&entries.some(item=>item.textContent.includes('deepseek-flash'))&&entries.some(item=>item.textContent.includes('custom-model')),'chooser did not retain the enabled API-key models');
+  check(overlay.textContent.includes('DeepSeek')&&overlay.textContent.includes('Custom'),'API-key providers were not identified');
+  emit({type:'ui_language',language:'en',setting:'en'});
+  check(overlay.querySelector('#overlay-title').textContent==='Use API Key','API-key chooser title did not relocalize');
+  window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
+  check(!overlay.classList.contains('open')&&setup.classList.contains('open')&&document.activeElement===useKey(),'closing the chooser did not return focus to setup');
+  check(setup.querySelector('#setup-title').textContent==='The current plan is unavailable'&&useKey().textContent==='Use API Key','setup did not relocalize while choosing an API key');
+  useKey().click();overlay.querySelector('button[data-item-id="custom/custom-model"]').click();
+  const chosen=sent.filter(message=>message.type==='selectModel');
+  check(chosen.length===1&&chosen[0].providerId==='custom'&&chosen[0].modelId==='custom-model'&&chosen[0].restart===true,'API-key choice did not restart with the explicitly selected model');
+  emit({type:'setup',reason:'Original plan check',planUnavailable:true,picker:[deepseek,disabled]});
+  useKey().click();
+  const single=sent.filter(message=>message.type==='selectModel').at(-1);
+  check(!overlay.classList.contains('open')&&single.providerId==='deepseek'&&single.modelId==='deepseek-flash'&&single.restart===true,'sole API-key model did not restart directly');
+  emit({type:'setup',reason:'Original plan check',planUnavailable:true,picker:[disabled]});
+  check(!useKey()&&setup.querySelector('[data-act="retry"]'),'setup offered an unavailable API-key action or lost retry');
+  setup.querySelector('[data-act="retry"]').click();
+ });
  await test('math renders securely outside code, updates after closure and loads bundled fonts',()=>{reset();emit({type:'assistant_text_delta',partId:'formula-stream',fullText:'Incomplete $x_1'});check(!messages.querySelector('.katex'),'unfinished formula rendered too early');const text=String.raw`Inline $x_1^2$ and \(\frac{1}{2}\).
 
 $$\begin{pmatrix}1&2\\3&4\end{pmatrix}$$
@@ -605,6 +686,26 @@ $\htmlStyle{position:fixed}{denied}$`;
   {id:'multi-insert-two',role:'user',turnId:'multi-insert-task',text:'MULTI_INSERT_TWO',createdAt:91000},
   {id:'multi-final',role:'assistant',turnId:'multi-insert-task',text:'MULTI_FINAL',createdAt:91000,endedAt:121000,workDurationMs:120000,steps:[{kind:'reasoning',text:'MULTI_FINAL_WORK'},{kind:'text',text:'MULTI_FINAL'}]}
  ]});const folds=[...messages.querySelectorAll('.work-fold')];check(folds.length===3,'two visible insertions did not produce exactly three work segments');check(folds.map(f=>Number(f.dataset.durationMs)).join(',')==='30000,60000,30000','segment clocks inherited the task-wide duration');check(folds.map(f=>f.querySelector('.work-fold-label').textContent).join('|')==='已工作 30 秒|已工作 1 分|已工作 30 秒','a continuation hid its independently calculated duration');});
+ await test('background completion starts a second reply below the finished answer during streaming and replay',()=>{
+  reset();
+  const question={id:'download',role:'user',text:'Progress?'};
+  const progress={role:'assistant',turnId:'first',text:'Progress reply',createdAt:5000,workDurationMs:5000,work:{text:'Checking progress'}};
+  const boundary={role:'assistant',turnId:'second',text:'',backgroundTurnStart:true,createdAt:10000};
+  const history=(items,activeSince=0)=>emit({type:'history',sessionId:'A',viewGen:gen,items,activeSince});
+  const answers=()=>[...messages.querySelectorAll(':scope > .message.assistant')].map(node=>node.textContent);
+  history([question,progress]);
+  history([question,progress,{...boundary,running:true}],10000);
+  emit({type:'assistant_reasoning_delta',partId:'verifying',fullText:'Checking result',authoritative:true});
+  emit({type:'tool_call',toolCallId:'verify',toolName:'Read',status:'running'});
+  const footers=()=>[...messages.querySelectorAll(':scope > .reply-meta')].map(node=>[node.dataset.copyText,Number(node.dataset.sentAt)]);
+  check(JSON.stringify(footers())===JSON.stringify([['Progress reply',5000]]),'live follow-up removed or changed the earlier footer');
+  const first=messages.querySelector(':scope > .message.assistant'),tool=document.getElementById('tool-verify');
+  check(first?.textContent.includes('Progress reply')&&!!(first.compareDocumentPosition(tool)&Node.DOCUMENT_POSITION_FOLLOWING),'live work appeared above the finished reply');
+  history([question,progress,boundary,{role:'assistant',turnId:'second',text:'Updated',createdAt:17000,work:{text:'Checking result'},workDurationMs:7000}]);
+  check(JSON.stringify(footers())===JSON.stringify([['Progress reply',5000],['Updated',17000]]),'reply copy text or timestamp crossed the background boundary');
+  check(answers().length===2&&answers()[0].includes('Progress reply')&&answers()[1].includes('Updated'),'history folded the earlier answer into later work');
+  check([...messages.querySelectorAll('.work-fold')].map(f=>f.dataset.durationMs).join(',')==='5000,7000','background turn inherited the previous clock');
+ });
  await test('backend hidden runtime rows across two turn IDs render one workbar for one visible prompt',()=>{reset();emit({type:'ui_language',language:'zh-CN',setting:'zh-CN'});emit({type:'history',sessionId:'A',viewGen:gen,items:window.workbarBackendHistory});const users=[...messages.querySelectorAll('.message.user:not(.queued)')];check(users.length===1&&users[0].dataset.rawText==='FIXTURE_QUESTION','hidden backend inputs appeared as visible questions');const folds=[...messages.querySelectorAll('.work-fold')];check(folds.length===1,'adjacent backend turns split one visible task into multiple workbars');check(folds[0].dataset.durationMs==='350000','merged workbar did not sum each backend turn duration exactly once');check(messages.textContent.includes('FIXTURE_THOUGHT_BEFORE')&&messages.textContent.includes('FIXTURE_INTERMEDIATE_REPLY')&&messages.textContent.includes('FIXTURE_THOUGHT_AFTER')&&messages.textContent.includes('FIXTURE_FINAL_REPLY'),'merging backend turns lost assistant output');check(!messages.textContent.includes('FIXTURE_HIDDEN_'),'hidden backend context leaked into transcript');});
  await test('active inserted task has only one running clock and stops all earlier segments',()=>{reset();const items=[{id:'active-root',role:'user',turnId:'active-task',text:'ACTIVE_ROOT'},{id:'active-old',role:'assistant',turnId:'active-task',running:true,createdAt:Date.now()-60000,text:'',steps:[{kind:'reasoning',text:'OLD_ACTIVE_PROCESS'}]},{id:'active-insert',role:'user',turnId:'active-task',text:'ACTIVE_INSERT'},{id:'active-tail',role:'assistant',turnId:'active-task',running:true,createdAt:Date.now()-60000,text:'',steps:[{kind:'reasoning',text:'CURRENT_ACTIVE_PROCESS'}]}];emit({type:'history',sessionId:'A',viewGen:gen,activeSince:Date.now()-60000,items});check(messages.querySelectorAll('.work-fold[data-state="running"]').length===1,'insertion left multiple running clocks');check(messages.querySelector('.work-fold').dataset.continuation==='1','earlier active segment still pretends to run');emit({type:'history',sessionId:'A',viewGen:gen,items:items.map(item=>({...item,running:false,workDurationMs:item.role==='assistant'?65000:undefined,endedAt:Date.now()}))});check(!messages.querySelector('.work-fold[data-state="running"]'),'completed task kept a running segment');check(messages.querySelectorAll('.work-fold[data-duration-ms="65000"]').length===1,'completed active task counted time twice');});
  await test('git cards stay with their original questions across repeated updates',()=>{reset();emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'git-owner-one',role:'user',text:'FIRST_GIT_TASK'},{id:'git-answer-one',role:'assistant',text:'FIRST_GIT_REPLY'},{id:'git-owner-two',role:'user',text:'SECOND_GIT_TASK'},{id:'git-answer-two',role:'assistant',text:'SECOND_GIT_REPLY'}]});const turn=(id,text,rowId)=>({turnId:id,userText:text,fileChanges:{target:{rowId,entityId:id},summary:{files:1,additions:2,deletions:1},canRewind:true}});for(let i=0;i<3;i++)emit({type:'conversation_sync',sessionId:'A',editable:null,turns:[turn('git-one','FIRST_GIT_TASK',1),turn('git-two','SECOND_GIT_TASK',2)]});const first=messages.querySelector('[data-turn-id="git-one"]');const secondUser=messages.querySelector('[data-jump="git-owner-two"]');check(!!(first.compareDocumentPosition(secondUser)&Node.DOCUMENT_POSITION_FOLLOWING),'first git card migrated to last task');check(messages.querySelectorAll('.git-changes').length===2,'git cards duplicated');});
@@ -1467,6 +1568,64 @@ $\htmlStyle{position:fixed}{denied}$`;
   verify('already-running',true);
   emit({type:'status',sessionId:'already-running',status:'completedSuccess'});
  });
+ await test('only a matching transcript command clears an unconfirmed send',()=>{
+  const sessionId='confirm-from-history',panel=document.getElementById('unconfirmed-sends');
+  reset(sessionId);type('MAY_HAVE_BEEN_SENT');sendBtn.click();
+  const request=sent.find(message=>message.type==='send');
+  const outcome={type:'send_unconfirmed',sessionId,commandId:request.commandId,running:false,message:'Acknowledgement missing'};
+  emit(outcome);check(!panel.hidden,'missing acknowledgement lost the draft');
+  const historicalQuestion={id:'historical-confirmed',role:'user',text:request.text,sourceCommandId:'another-command'};
+  emit({type:'history',sessionId,viewGen:gen,items:[historicalQuestion]});
+  check(!panel.hidden,'identical text cleared the wrong draft');
+  emit({type:'history',sessionId,viewGen:gen,items:[{...historicalQuestion,id:'the-confirmed-command',sourceCommandId:request.commandId}]});
+  check(panel.hidden&&!input.value,'confirmed message remained recoverable');
+  emit(outcome);check(panel.hidden,'a late timeout resurrected an already confirmed send');
+ });
+ await test('an unconfirmed queue submission preserves the draft until the server lists it',()=>{
+  const sessionId='confirm-from-queue',panel=document.getElementById('unconfirmed-sends');
+  reset(sessionId);emit({type:'status',sessionId,status:'running'});type('MAY_BE_QUEUED');sendBtn.click();
+  const request=sent.find(message=>message.type==='insert');
+  check(Object.values(savedState.submittedDrafts).some(draft=>draft.text===request.text),'queued input not persisted before admission');
+  emit({type:'send_unconfirmed',sessionId,commandId:request.queueItemId,insertion:true,running:true});
+  check(!panel.hidden&&!input.value&&!document.querySelector('#queue-zone .message.queued'),'uncertain queue card still claims it is pending');
+  check(!document.getElementById('stop-btn').hidden,'queue timeout stopped the active turn');
+  emit({type:'queue_sync',sessionId,items:[{queueItemId:'server-queue-id',text:request.text,sourceCommandId:request.queueItemId}]});
+  check(panel.hidden&&document.querySelector('#queue-zone .message.queued')?.textContent.includes(request.text),'late admission not reflected');
+ });
+ await test('file references stop at the host limit and the message stays intact',()=>{
+  const sessionId='reference-limit';reset(sessionId);type('DRAFT_AT_REFERENCE_LIMIT');
+  for(let i=0;i<=100;i++){
+   const file=`ref-${i}.ts`,chip={path:`/test/${file}`,relPath:file};
+   emit({type:i%2===0?'addChip':'file_added',sessionId,chip});
+  }
+  check(document.getElementById('toast').textContent.includes('100'),'the limit was not explained');
+  check(input.value==='DRAFT_AT_REFERENCE_LIMIT','adding a reference lost the draft');
+  sendBtn.click();const request=sent.find(message=>message.type==='send');
+  check(request?.chips.length===100&&request.text==='DRAFT_AT_REFERENCE_LIMIT','the outgoing request does not match the host limit');
+  emit({type:'send_admitted',sessionId,commandId:request.commandId});
+ });
+ await test('the shared send validator keeps a draft with an oversized file selection',()=>{
+  const sessionId='oversized-selection',text='KEEP_DRAFT_FOR_SMALLER_SELECTION';
+  reset(sessionId);emit({type:'ui_language',language:'en',setting:'en'});type(text);
+  emit({type:'addChip',chip:{path:'/test/large.txt',relPath:'large.txt',selectionStart:1,selectionEnd:2,selectedText:'x'.repeat(16*1024*1024+1)}});
+  sendBtn.click();
+  check(!sent.some(message=>message.type==='send')&&input.value===text,'invalid draft was consumed or sent');
+  check(document.getElementById('toast').textContent.includes('Shorten the selection'),'missing guidance to shrink the selection');
+  check(document.getElementById('stop-btn').hidden,'a rejected draft started a spinner');
+  document.querySelector('#attachments .ctx-chip button').click();sendBtn.click();
+  const request=sent.find(message=>message.type==='send');check(request?.text===text,'edited draft cannot be sent');
+  emit({type:'send_admitted',sessionId,commandId:request.commandId});
+ });
+ await test('a disconnect preserves the unconfirmed draft and offers reconnection without resending',()=>{
+  const sessionId='exit-before-ack',panel=document.getElementById('unconfirmed-sends');
+  reset(sessionId);type('VERIFY_BEFORE_SENDING_AGAIN');sendBtn.click();
+  const request=sent.find(message=>message.type==='send');
+  emit({type:'status',sessionId,status:'exited'});
+  emit({type:'send_unconfirmed',sessionId,commandId:request.commandId,running:false});
+  check(!panel.hidden&&!input.value&&sendBtn.disabled,'disconnect lost or automatically restored the draft');
+  check(!messages.querySelector('[data-act="retryLast"]'),'disconnected error card still offers an automatic resend');
+  check(messages.querySelector('[data-act="retry"]'),'disconnected error card has no reconnect action');
+ });
  await test('process grouping preserves tool identity, boundaries, errors and language',()=>{reset();const tool=(id,name,status='completed')=>emit({type:'tool_call',toolCallId:id,toolName:name,status,inputText:JSON.stringify({command:'git commit -m '+id}),outputText:'OUTPUT_'+id});tool('one','shell');tool('two','shell');let group=messages.querySelector('.process-group');check(group&&group.textContent.includes('2'),'consecutive terminal calls not grouped');check(document.getElementById('tool-one')&&document.getElementById('tool-two'),'tool identity lost');group.click();check(!document.getElementById('tool-two').classList.contains('group-hidden'),'cannot inspect grouped tool');tool('two','shell','error');group=messages.querySelector('.process-group');check(group.getAttribute('aria-expanded')==='true','group expansion lost after update');check(group.querySelector('.tool-status.error'),'group error hidden');emit({type:'assistant_reasoning_delta',partId:'boundary',authoritative:true,fullText:'THOUGHT'});tool('three','shell');check(messages.querySelectorAll('.process-group').length===1,'group crossed reasoning boundary');emit({type:'ui_language',language:'en',setting:'en'});check(group.textContent.includes('Terminal'),'group label did not switch language');check(document.getElementById('tool-one').dataset.toolName==='shell','raw tool name changed');check(document.getElementById('tool-two').textContent.includes('OUTPUT_two'),'details lost');});
  await test('web-reader and MCP tool results render readable summaries live and from history',()=>{
   reset();
@@ -2316,6 +2475,117 @@ $\htmlStyle{position:fixed}{denied}$`;
   [...document.querySelectorAll('#overlay-list .overlay-item')].find(el=>el.textContent.includes('另一会话')).click();
   check(sent.some(message=>message.type==='switchSession'&&message.sessionId==='B'),'another session did not switch');
  });
+ await test('a refused list switch keeps the title, transcript and next send in the source chat',()=>{
+  reset('A');
+  emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'original',role:'user',text:'SOURCE_HISTORY'}]});
+  document.getElementById('btn-sessions').click();
+  const rows=[{sessionId:'A',title:'Source'},{sessionId:'B',title:'Target'}];
+  emit({type:'sessions',currentId:'A',sessions:rows});
+  document.querySelector('#overlay-list [data-item-id="B"]').click();
+  check(sent.some(m=>m.type==='switchSession'&&m.sessionId==='B'),'target was not requested');
+  emit({type:'toast',text:'请先取消归档再打开'});
+  emit({type:'sessions',currentId:'B',sessions:rows});
+  check(document.getElementById('session-title').value==='Source'&&messages.textContent.includes('SOURCE_HISTORY'),'refused switch changed the visible chat');
+  type('SEND_TO_SOURCE');sendBtn.click();
+  check(sent.findLast(m=>m.type==='send')?.sessionId==='A','send was not scoped to the visible chat');
+  emit({type:'session_ready',sessionId:'B',viewGen:++gen,title:'Target'});
+  check(document.getElementById('session-title').value==='Target','confirmed switch did not update the title');
+ });
+ await test('selecting the original chat during a pending switch requests a return',()=>{
+  reset('A');
+  const rows=[{sessionId:'A',title:'Source'},{sessionId:'B',title:'Target'}];
+  const choose=id=>{
+   document.getElementById('btn-sessions').click();
+   emit({type:'sessions',currentId:'A',sessions:rows});
+   document.querySelector('#overlay-list [data-item-id="'+id+'"]').click();
+  };
+  choose('B');
+  emit({type:'view_reset',targetSessionId:'B',viewGen:++gen});
+  choose('A');
+  check(sent.filter(m=>m.type==='switchSession').map(m=>m.sessionId).join(',')==='B,A','the last selection was ignored');
+ });
+ await test('overlapping switches keep typing with each selected destination',()=>{
+  reset('switch-first');type('EXISTING_FIRST');
+  reset('switch-source');type('SOURCE_DRAFT');
+  emit({type:'view_reset',targetSessionId:'switch-first',viewGen:++gen});
+  type('FOR_FIRST');
+  emit({type:'view_reset',targetSessionId:'switch-last',viewGen:++gen});
+  check(input.value==='','first destination draft followed the second switch');
+  type('FOR_LAST');
+  input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(!sent.some(m=>m.type==='send'),'sent before the destination was ready');
+  emit({type:'session_ready',kind:'resumed',sessionId:'switch-last',viewGen:gen});
+  emit({type:'history',sessionId:'switch-last',viewGen:gen,items:[]});
+  sendBtn.click();
+  const sends=sent.filter(m=>m.type==='send');
+  check(sends.length===1&&sends[0].text==='FOR_LAST'&&sends[0].sessionId==='switch-last','sent draft to wrong chat');
+  emit({type:'view_reset',targetSessionId:'switch-first',viewGen:++gen});
+  emit({type:'session_ready',kind:'resumed',sessionId:'switch-first',viewGen:gen});
+  check(input.value==='EXISTING_FIRST\n\nFOR_FIRST'&&savedState.composerDrafts['switch-source'].text==='SOURCE_DRAFT','returning to the first destination lost a draft');
+ });
+ await test('a failed create keeps its draft through retry or a visit to the original chat',()=>{
+  for(const reopen of [false,true]){
+   const source='create-source-'+reopen, target='create-retry-'+reopen;
+   reset(source);type('OLD_DRAFT');
+   emit({type:'view_reset',clear:true,viewGen:++gen});type('NEW_DRAFT');
+   emit({type:'session_error',message:'session/create timed out',failedCreate:true,viewGen:gen});
+   check(input.value==='NEW_DRAFT'&&sendBtn.disabled,'failed create merged drafts or enabled send');
+   input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+   check(!sent.some(m=>m.type==='send'||m.type==='insert'),'failed create sent input');
+   type('EDITED_NEW_DRAFT');
+   if(reopen){
+    emit({type:'view_reset',viewGen:++gen});
+    emit({type:'session_ready',kind:'resumed',sessionId:source,viewGen:gen});
+    emit({type:'history',sessionId:source,viewGen:gen,items:[]});
+    check(input.value==='OLD_DRAFT'&&!sendBtn.disabled,'reopened chat received the new draft');
+   }
+   document.getElementById('btn-new').click();
+   check(sent.some(m=>m.type==='newSession'),'new chat retry unavailable');
+   emit({type:'view_reset',clear:true,viewGen:++gen});
+   check(input.value==='EDITED_NEW_DRAFT','retry lost edits made after failure');
+   emit({type:'session_ready',kind:'created',sessionId:target,viewGen:gen});
+   sendBtn.click();
+   const sends=sent.filter(m=>m.type==='send');
+   check(sends.length===1&&sends[0].sessionId===target&&sends[0].text==='EDITED_NEW_DRAFT','retry sent the wrong draft or used the wrong chat');
+   check(savedState.composerDrafts[source]?.text==='OLD_DRAFT','retry modified the source draft');
+  }
+ });
+ await test('a failed resume preserves both drafts and allows the source chat to be reopened',()=>{
+  reset('failed-source');type('SOURCE_DRAFT');
+  emit({type:'view_reset',viewGen:++gen});
+  type('TYPED_DURING_RESUME');
+  emit({type:'session_error',message:'resume unavailable',failedSwitchTo:'failed-target',viewGen:gen});
+  check(sendBtn.disabled&&input.value==='SOURCE_DRAFT','failed switch enabled sends or replaced the source draft');
+  check(messages.textContent.includes('resume unavailable'),'missing resume failure');
+  document.getElementById('btn-sessions').click();
+  emit({type:'sessions',sessions:[{sessionId:'failed-source',title:'Source'}]});
+  document.querySelector('#overlay-list [data-item-id="failed-source"]').click();
+  check(sent.some(m=>m.type==='switchSession'&&m.sessionId==='failed-source'),'source retry was swallowed');
+  emit({type:'view_reset',viewGen:++gen});
+  emit({type:'session_ready',sessionId:'failed-target',viewGen:gen,title:'Target'});
+  emit({type:'stream_release'});
+  check(input.value==='TYPED_DURING_RESUME'&&!sendBtn.disabled,'target lost its draft on retry');
+ });
+ await test('model selection waits for the new chat and sends its session and generation',()=>{
+  reset('model-source');
+  const chip=document.getElementById('model-chip'), pop=document.getElementById('popover');
+  const current={providerId:'current',modelId:'model-1'};
+  const other={providerId:'other',modelId:'model-2',label:'model-2',hasKey:true};
+  emit({type:'models',current,available:[other]});
+  chip.click();
+  const oldChoice=pop.querySelector('[data-item-id="other/model-2"]');
+  check(oldChoice&&pop.classList.contains('open'),'source menu never opened');
+  emit({type:'view_reset',targetSessionId:'model-target',viewGen:++gen});
+  oldChoice.click();chip.click();
+  check(chip.disabled&&!pop.classList.contains('open'),'model picker was available during the switch');
+  check(!sent.some(m=>m.type==='selectModel'),'model changed during the switch');
+  emit({type:'session_ready',kind:'resumed',sessionId:'model-target',viewGen:gen});
+  emit({type:'history',sessionId:'model-target',viewGen:gen,items:[]});
+  chip.click();
+  pop.querySelector('[data-item-id="other/model-2"]').click();
+  const selection=sent.find(m=>m.type==='selectModel');
+  check(selection?.sessionId==='model-target'&&selection.viewGen===gen&&selection.modelId==='model-2','model pick did not address the open chat');
+ });
  await test('model, permission and reasoning menus open beside their buttons', () => {
   const before = document.body.style.width;
   try {
@@ -2422,19 +2692,20 @@ $\htmlStyle{position:fixed}{denied}$`;
   check(head.top>=work.getBoundingClientRect().top-2,'expansion hid the clicked header');
  });
 
- await test('expanding a bottom tool group reveals its first tool',async()=>{
+ await test('expanding a bottom tool group reveals its latest tool',async()=>{
   for(const [toolName,parameters] of [['Bash',{command:'echo grouped'}],['Read',{file_path:'/workspace/a.ts'}]]){
-   reset();
-   emit({type:'assistant_reasoning_delta',partId:'group-thought',authoritative:true,fullText:'Earlier reasoning\n'.repeat(80)});
-   for(let i=0;i<3;i++)emit({type:'tool_call',toolCallId:'group-'+i,toolName,status:'running',inputText:JSON.stringify(parameters)});
-   const group=messages.querySelector('.process-group'),work=group.closest('.work-fold-body');
-   work.scrollTop=work.scrollHeight;messages.scrollTop=messages.scrollHeight;
-   group.click();
-   await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-   const first=group.nextElementSibling.getBoundingClientRect();
-   const bottom=Math.min(work.getBoundingClientRect().bottom,messages.getBoundingClientRect().bottom,document.querySelector('.composer-card').getBoundingClientRect().top);
-   check(first.top<bottom-10,toolName+' group left its first tool hidden');
-   check(group.getBoundingClientRect().top>=work.getBoundingClientRect().top-2,'group header left the work viewport');
+   for(const count of [2,18]){
+    reset();
+    emit({type:'assistant_reasoning_delta',partId:'group-thought',authoritative:true,fullText:'Earlier reasoning\n'.repeat(80)});
+    for(let i=0;i<count;i++)emit({type:'tool_call',toolCallId:'group-'+i,toolName,status:'running',inputText:JSON.stringify(parameters)});
+    const group=messages.querySelector('.process-group'),work=group.closest('.work-fold-body');
+    work.scrollTop=work.scrollHeight;messages.scrollTop=messages.scrollHeight;
+    group.click();
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    const latest=work.querySelectorAll('.group-detail')[count-1].querySelector('.tool-head').getBoundingClientRect();
+    const bottom=Math.min(work.getBoundingClientRect().bottom,messages.getBoundingClientRect().bottom,document.querySelector('.composer-card').getBoundingClientRect().top);
+    check(latest.bottom<=bottom+1&&latest.top>=work.getBoundingClientRect().top-1,toolName+' group left its latest tool clipped');
+   }
   }
  });
 
@@ -2909,6 +3180,35 @@ $\htmlStyle{position:fixed}{denied}$`;
   messages.dispatchEvent(new WheelEvent('wheel',{deltaY:-300,bubbles:true}));messages.scrollTop=Math.max(0,messages.scrollTop-300);messages.dispatchEvent(new Event('scroll'));const answer=messages.querySelector(':scope > .message.assistant'),top=answer.getBoundingClientRect().top;
   emit({type:'status',sessionId:'A',status:'completedSuccess'});check(Math.abs(answer.getBoundingClientRect().top-top)<2,'completion took over manual reading');
  });
+ for (const statusFirst of [false,true]) await test(`completion preserves the paragraph being read when ${statusFirst ? 'status' : 'final history'} arrives first`,async()=>{
+  reset();type('READING_WHILE_STREAMING');sendBtn.click();
+  const thought='Thinking through the request.\n'.repeat(40);
+  const reply=Array.from({length:45},(_,i)=>`Reading paragraph ${i}.`).join('\n\n');
+  emit({type:'assistant_reasoning_delta',partId:'reading-thought',fullText:thought});
+  emit({type:'assistant_text_delta',partId:'reading-answer',fullText:reply});
+  await new Promise(resolve=>setTimeout(resolve,80));
+  const paragraph=()=>messages.querySelectorAll(':scope > .message.assistant .md > p')[15];
+  const top=messages.getBoundingClientRect().top+140;
+  messages.dispatchEvent(new WheelEvent('wheel',{deltaY:-300,bubbles:true}));
+  messages.scrollTop+=paragraph().getBoundingClientRect().top-top;
+  await new Promise(resolve=>setTimeout(resolve,40));
+  check(messages.querySelector('.work-fold.open'),'live thinking fold was not expanded');
+  const before=paragraph().getBoundingClientRect().top;
+  check(Math.abs(before-top)<2,'fixture paragraph is outside the reading viewport');
+  if (statusFirst) emit({type:'status',sessionId:'A',status:'completedSuccess'});
+  emit({type:'history',sessionId:'A',viewGen:gen,renderSource:'transcript-sync',items:[
+   {id:'reading-question',role:'user',text:'READING_WHILE_STREAMING'},
+   {id:'reading-final',role:'assistant',text:reply,steps:[
+    {kind:'reasoning',partId:'reading-thought',text:thought},
+    {kind:'text',partId:statusFirst ? undefined : 'reading-answer',text:reply},
+   ]},
+  ]});
+  if (!statusFirst) emit({type:'status',sessionId:'A',status:'completedSuccess'});
+  await new Promise(resolve=>setTimeout(resolve,80));
+  check(!messages.querySelector('.work-fold.open'),'completed thinking fold stayed expanded');
+  const after=paragraph().getBoundingClientRect().top;
+  check(Math.abs(after-before)<2,`final transcript moved the paragraph from ${before} to ${after}`);
+ });
  await test('short replies and interrupted long replies do not jump to the beginning',async()=>{
   reset();type('SHORT_REPLY');sendBtn.click();emit({type:'assistant_text_delta',partId:'short-answer',fullText:'A short answer.'});
   await new Promise(resolve=>setTimeout(resolve,80));const top=messages.scrollTop;
@@ -2951,6 +3251,18 @@ $\htmlStyle{position:fixed}{denied}$`;
   const through=sent.find(m=>m.type==='loadThrough');check(through,'jump did not request missing history');
   emit({type:'history_load_failed',sessionId:'A',viewGen:gen,requestId:through.requestId,jumpId:'unloaded-review',message:'JUMP_RETRY'});
   clickJump();check(sent.filter(m=>m.type==='loadThrough').length===2,'failed jump cannot retry');
+ });
+ await test('editing a queued message keeps keyboard focus across queue and transcript updates',()=>{
+  reset();emit({type:'status',sessionId:'A',status:'running'});
+  const items=[{queueItemId:'focus-queue',text:'Edit me'}];
+  emit({type:'queue_sync',sessionId:'A',items});
+  const card=document.querySelector('[data-queue-id="focus-queue"]');
+  card.querySelector('[data-qact="edit"]').click();
+  const editor=card.querySelector('textarea');editor.setSelectionRange(2,4);
+  emit({type:'queue_sync',sessionId:'A',items:[...items,{queueItemId:'other',text:'Another'}]});
+  check(document.activeElement===editor,'queue refresh interrupted typing');
+  emit({type:'history',sessionId:'A',viewGen:gen,items:[{id:'q',role:'user',text:'Current question'}],queue:items});
+  check(document.activeElement===editor&&editor.selectionStart===2&&editor.selectionEnd===4,'transcript refresh interrupted editing');
  });
  await test('failed queue edits retain text and selection through refresh and allow one retry',()=>{
   reset();emit({type:'status',sessionId:'A',status:'running'});
@@ -3060,6 +3372,99 @@ await test('reply selections survive VS Code clipboard command focus recovery',(
  check(document.activeElement===input&&input.value.slice(input.selectionStart,input.selectionEnd)==='Composer','transcript focus interfered with input selection');
  getSelection().removeAllRanges();
 });
+ await test('an open work fold keeps its inner reading position across a running history refresh',async()=>{
+  reset();
+  const text=Array.from({length:100},(_,i)=>`Reasoning line ${i}`).join('\n');
+  const start=Date.now();
+  const history=t=>emit({type:'history',sessionId:'A',viewGen:gen,activeSince:start,renderSource:'transcript-sync',items:[
+   {id:'reason-q',role:'user',text:'Question'},{id:'reason-a',role:'assistant',text:'',running:true,steps:[{kind:'reasoning',partId:'reason-p',text:t}]}
+  ]});
+  history(text);await new Promise(resolve=>setTimeout(resolve,60));
+  const body=()=>messages.querySelector('.work-fold-body');
+  body().scrollTop=130;
+  const before=body().scrollTop;
+  check(before===130&&body().scrollHeight>body().clientHeight+200,'fixture reasoning did not overflow');
+  history(text+'\nNew reasoning');
+  const after=body().scrollTop;
+  check(Math.abs(before-after)<=1,`inner scroll reset from ${before} to ${after}`);
+  body().scrollTop=body().scrollHeight;
+  history(text+'\nMore reasoning');
+  check(body().scrollHeight-body().scrollTop-body().clientHeight<=1,'a following reader lost the latest thought');
+ });
+ await test('history sync keeps the text selected for copy',()=>{
+  reset();
+  const items=[{id:'select-q',role:'user',text:'Question'},{id:'select-a',role:'assistant',text:'Select this paragraph.',steps:[{kind:'text',partId:'select-p',text:'Select this paragraph.'}]}];
+  const sync=rows=>emit({type:'history',sessionId:'A',viewGen:gen,renderSource:'transcript-sync',items:rows});
+  sync(items);messages.focus();
+  const paragraph=messages.querySelector('.message.assistant .md p');
+  const selection=getSelection();selection.setBaseAndExtent(paragraph.firstChild, paragraph.textContent.length, paragraph.firstChild, 0);
+  check(selection.toString()==='Select this paragraph.','fixture selection missing');
+  sync([items[0],{...items[1],endedAt:Date.now()}]);
+  const actual=selection.toString(), anchorOffset=selection.anchorOffset, focusOffset=selection.focusOffset;
+  selection.removeAllRanges();
+  check(actual==='Select this paragraph.'&&anchorOffset>focusOffset,`selection after refresh: ${JSON.stringify(actual)}`);
+ });
+ await test('reply updates keep selected text while appended text arrives',()=>{
+  reset();type('COPY_DURING_REPLY');sendBtn.click();
+  const update=fullText=>emit({type:'assistant_text_delta',partId:'copy-during-reply',fullText});
+  update('Copy this first paragraph.');
+  const paragraph=messages.querySelector('.message.assistant .md p');
+  const selection=getSelection();
+  const range=document.createRange();
+  range.selectNodeContents(paragraph);
+  selection.removeAllRanges();selection.addRange(range);
+  update('Copy this first paragraph.\n\nNew text at the end.');
+  const streamingText=selection.toString();
+  emit({type:'status',sessionId:'A',status:'completedSuccess'});
+  const settledText=selection.toString();
+  selection.removeAllRanges();
+  check(streamingText==='Copy this first paragraph.'&&settledText===streamingText,'streaming or completion cleared the selection');
+ });
+ await test('a background activity update keeps a manually scrolled session list in place',async()=>{
+  reset();
+  document.getElementById('btn-sessions').click();
+  emit({type:'sessions',includeArchived:false,currentId:'A',sessions:[{sessionId:'A',title:'Current chat'},...Array.from({length:50},(_,i)=>({sessionId:`ux-session-${i}`,title:`Conversation ${i}`}))]});
+  const list=document.getElementById('overlay-list');
+  list.scrollTop=900;await new Promise(resolve=>setTimeout(resolve,30));
+  const before=list.scrollTop;
+  check(before>400,'fixture list did not scroll');
+  const listTop=list.getBoundingClientRect().top;
+  const row=[...list.querySelectorAll('.overlay-item')].find(el=>el.getBoundingClientRect().bottom>listTop);
+  const rowTop=row.getBoundingClientRect().top;
+  emit({type:'session_activity',sessionId:'ux-session-45',running:true});
+  const after=list.querySelector(`[data-item-id="${row.dataset.itemId}"]`).getBoundingClientRect().top;
+  window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
+  check(Math.abs(after-rowTop)<=1,`list row moved from ${rowTop} to ${after}`);
+ });
+ for (const statusFirst of [false,true]) await test(`reading the question above a collapsing fold stays in place with ${statusFirst ? 'status' : 'history'} first`,async()=>{
+  reset();
+  const past=[{id:'ux-p-q',role:'user',text:'Previous question'},{id:'ux-p-a',role:'assistant',text:'Previous reply.\n\n'.repeat(30)}];
+  const thought='First line about the current question.\nSecond line about its details.';
+  const reply='Current reply paragraph.\n\n'.repeat(40);
+  const question={id:'ux-current-q',role:'user',text:'Read this question above the thinking fold'};
+  const items=[...past,question,{id:'ux-current-a',role:'assistant',text:reply,steps:[
+   {kind:'reasoning',partId:'ux-reason',text:thought},{kind:'text',partId:'ux-answer',text:reply}
+  ]}];
+  const history=running=>emit({type:'history',sessionId:'A',viewGen:gen,renderSource:'transcript-sync',activeSince:running ? Date.now() : 0,
+   items:[...items.slice(0,-1),{...items.at(-1),running}]});
+  history(true);await new Promise(resolve=>setTimeout(resolve,60));
+  const current=()=>messages.querySelector('[data-jump="ux-current-q"]');
+  const headerBottom=document.getElementById('topbar').getBoundingClientRect().bottom;
+  messages.dispatchEvent(new WheelEvent('wheel',{deltaY:-180,bubbles:true}));
+  messages.scrollTop+=current().getBoundingClientRect().top-headerBottom-14;
+  await new Promise(resolve=>setTimeout(resolve,50));
+  const before=current().getBoundingClientRect().top;
+  const anchor=messages.querySelector(':scope > .message.assistant[data-part-id="ux-answer"]');
+  const fold=messages.querySelector('.work-fold.open');
+  const bottom=messages.getBoundingClientRect().bottom-Number.parseFloat(getComputedStyle(document.body).getPropertyValue('--z-messages-scroll-bottom'));
+  check(Math.abs(before-headerBottom-14)<2&&fold&&anchor.getBoundingClientRect().top<bottom,`fixture targets: question=${before}, answer=${anchor?.getBoundingClientRect().top}, bottom=${bottom}, fold height=${fold?.getBoundingClientRect().height}`);
+  if (statusFirst) emit({type:'status',sessionId:'A',status:'completedSuccess'});
+  history(false);
+  if (!statusFirst) emit({type:'status',sessionId:'A',status:'completedSuccess'});
+  const after=current().getBoundingClientRect().top;
+  check(!messages.querySelector('.work-fold.open'),'completed work did not collapse');
+  check(Math.abs(after-before)<=1,`question moved from ${before} to ${after}`);
+ });
  await new Promise(r=>setTimeout(r,30));
  clearInterval(window.auditFrameKeepAlive);
  const pre=document.createElement('pre');pre.id='audit-results';pre.textContent=JSON.stringify({tests,errors:window.browserErrors || []});document.body.appendChild(pre);if(tests.some(t=>!t.pass)) document.body.setAttribute('data-smoke','failed');

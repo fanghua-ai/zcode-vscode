@@ -11,6 +11,7 @@ import { ComposerDrafts, type ComposerDraft, type SkillReference, type AgentRefe
 import { renderMarkdown } from "./markdown";
 import { localMarkdownFileLink } from "../markdownFileLink";
 import { QuestionAnswers } from "../userInput";
+import { MAX_MESSAGE_REFERENCES, parseWebviewMessage } from "../webviewMessages";
 import type { FileChange } from "../toolFiles";
 import type { SubagentActivity, SubagentTimelineEntry, SubagentTool } from "../zcodeClient";
 import { sameSessionModel, type NewSessionDefaults, type SessionModelChoice } from "../newSessionDefaults";
@@ -62,6 +63,7 @@ type PickerModel = {
   providerName?: string;
   providerLabel?: string;
   hasKey?: boolean;
+  access?: "api-key";
   disabledReason?: string;
 };
 
@@ -269,7 +271,7 @@ const statusDot = document.getElementById("status-dot")!;
 const connStatus = document.getElementById("conn-status")!;
 const connLabel = document.getElementById("conn-label")!;
 const titleEl = document.getElementById("session-title") as HTMLInputElement;
-const modelChip = document.getElementById("model-chip")!;
+const modelChip = document.getElementById("model-chip") as HTMLButtonElement;
 const modeChip = document.getElementById("mode-chip")!;
 const thoughtChip = document.getElementById("thought-chip")!;
 const contextMeter = document.getElementById("context-meter")!;
@@ -301,13 +303,14 @@ let completionRevealRaf = 0;
 let holdStreams = false;
 let sessionConnected = false;
 let workspaceRequired: false | "folder" | "path" = false;
-let lastSetup: { reason: string; hint: string; picker: PickerModel[] } | null = null;
+let lastSetup: { reason: string; hint: string; picker: PickerModel[]; planUnavailable: boolean } | null = null;
 let viewGen = 0;
 let runningSessions = new Set<string>();
 let turnWorkStarted = 0;
 let workTicker = 0;
 let currentAssistantEl: HTMLElement | null = null;
-let overlayMode: "sessions" | "models" | "mode" | "thought" | null = null;
+type OverlayMode = "sessions" | "models" | "setup-models" | "mode" | "thought";
+let overlayMode: OverlayMode | null = null;
 let showArchived = false;
 let sessions: Session[] = [];
 let referenceSessions: SessionReference[] = [];
@@ -380,6 +383,12 @@ interface LocalFile {
 const composerDrafts = new ComposerDrafts(vscode.getState()?.composerDrafts);
 const submittedDrafts = new ComposerDrafts(vscode.getState()?.submittedDrafts);
 let draftSessionId = typeof vscode.getState()?.draftSessionId === "string" ? String(vscode.getState()!.draftSessionId) : "";
+// A new chat has no backend ID yet. Keep its draft separate from text typed
+// while opening an existing chat, including when the user leaves to retry later.
+const newChatDraftKey = "$newChat";
+const savedPendingKey = vscode.getState()?.pendingDraftKey;
+let pendingDraftKey = typeof savedPendingKey === "string" ? savedPendingKey : vscode.getState()?.draftForNewChat === true ? newChatDraftKey : "";
+function composerDraftKey(): string { return draftSessionId || (pendingDraftKey === newChatDraftKey ? newChatDraftKey : ""); }
 let draftPlanEnabled = false;
 let explicitChips: ContextChip[] = [];
 let explicitSessionRefs: SessionReference[] = [];
@@ -408,6 +417,20 @@ function takeSubmittedDraft(key: string): ComposerDraft | undefined {
   const draft = submittedDrafts.take(key);
   if (draft) persistSubmittedDrafts();
   return draft;
+}
+
+function confirmSubmittedSends(owner: string, items: readonly { sourceCommandId?: string }[]): void {
+  if (!owner || submittedDrafts.keys().next().done) return;
+  let changed = false;
+  for (const { sourceCommandId } of items) {
+    if (!sourceCommandId || !submittedDrafts.take(submittedDraftKey(owner, sourceCommandId))) continue;
+    if (pendingInputs.get(sourceCommandId)?.sessionId === owner) pendingInputs.delete(sourceCommandId);
+    changed = true;
+  }
+  if (changed) {
+    persistSubmittedDrafts();
+    renderUnconfirmedSends();
+  }
 }
 
 function renderUnconfirmedSends(): void {
@@ -451,8 +474,8 @@ function renderUnconfirmedSends(): void {
 
 function persistComposerDraft(includeSubmitted = false): void {
   const text = activeCommand ? `/${activeCommand} ${input.value}` : input.value;
-  composerDrafts.set(draftSessionId, text, explicitChips, imageDrafts, explicitSessionRefs, selectedSkills, selectedAgents, draftPlanEnabled);
-  vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId,
+  composerDrafts.set(composerDraftKey(), text, explicitChips, imageDrafts, explicitSessionRefs, selectedSkills, selectedAgents, draftPlanEnabled);
+  vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize(), draftSessionId, pendingDraftKey,
     ...(includeSubmitted ? { submittedDrafts: submittedDrafts.serialize() } : {}) });
 }
 
@@ -483,9 +506,17 @@ function restoreComposerDraft(draft: ComposerDraft): void {
   updateComposerActions();
 }
 
-function attachComposerDraft(sessionId: string): void {
+function saveDraftBeforeHandoff(): void {
+  persistComposerDraft();
+  // Another selection can end a switch before its ready event arrives.
+  if (!draftSessionId && pendingDraftKey && pendingDraftKey !== newChatDraftKey) composerDrafts.takePending(pendingDraftKey);
+}
+
+function attachComposerDraft(sessionId: string, created = false): void {
   if (sessionId !== draftSessionId) {
-    persistComposerDraft();
+    saveDraftBeforeHandoff();
+    if (created) composerDrafts.takePending(sessionId, newChatDraftKey);
+    pendingDraftKey = "";
     draftSessionId = sessionId;
     restoreComposerDraft(composerDrafts.takePending(sessionId));
     persistComposerDraft();
@@ -493,7 +524,7 @@ function attachComposerDraft(sessionId: string): void {
   renderUnconfirmedSends();
 }
 
-function prepareComposerSwitch(): void {
+function prepareComposerSwitch(targetDraftKey: string): void {
   clearMessageThumbnailLoads();
   mentions.close();
   previewRequest = "";
@@ -501,10 +532,11 @@ function prepareComposerSwitch(): void {
   thumbnailRequests.clear();
   closeImagePreview();
   // Repeated reset notifications must not erase typing during the handoff.
-  if (holdStreams && draftSessionId === "") return;
-  persistComposerDraft();
+  if (holdStreams && !draftSessionId && pendingDraftKey === targetDraftKey) return;
+  saveDraftBeforeHandoff();
   draftSessionId = "";
-  restoreComposerDraft(composerDrafts.get(""));
+  pendingDraftKey = targetDraftKey;
+  restoreComposerDraft(composerDrafts.get(composerDraftKey()));
   persistComposerDraft();
   renderUnconfirmedSends();
 }
@@ -1042,7 +1074,7 @@ function setGenerating(generating: boolean, preserveCompletionReveal = false): v
     releaseCompletedReveal();
     revealAfterCompletionArmed = true;
     if (!wasGenerating) {
-      for (const el of groupTurns().at(-1) ?? []) {
+      for (const el of groupTurns(true).at(-1) ?? []) {
         if (el.classList.contains("reply-meta")) el.remove();
         else el.querySelectorAll(".reply-meta").forEach(meta => meta.remove());
       }
@@ -1097,6 +1129,8 @@ function updateComposerActions(): void {
   sendBtn.title = sendTitle;
   sendBtn.setAttribute("aria-label", sendTitle);
   sendBtn.disabled = holdStreams || !sessionConnected;
+  modelChip.disabled = (holdStreams || !sessionConnected) && !lastSetup;
+  if (modelChip.disabled && overlayMode === "models") closePicker();
   stopBtn.hidden = !isGenerating;
   stopBtn.disabled = holdStreams || connLabel.textContent === t("正在停止");
   stopBtn.innerHTML = ICON_STOP;
@@ -1488,12 +1522,12 @@ function refreshEmptyGreeting(): void {
 }
 
 function reopenSetup(): void {
-  if (!lastSetup || setupEl.classList.contains("open")) return;
-  showSetup(lastSetup.reason, lastSetup.hint, lastSetup.picker);
+  if (!lastSetup || setupEl.classList.contains("open") || overlayMode === "setup-models") return;
+  showSetup(lastSetup.reason, lastSetup.hint, lastSetup.picker, lastSetup.planUnavailable);
 }
 
 function syncConnAction(): void {
-  const reopen = !!lastSetup && !setupEl.classList.contains("open");
+  const reopen = !!lastSetup && !setupEl.classList.contains("open") && overlayMode !== "setup-models";
   connStatus.classList.toggle("actionable", reopen);
   if (reopen) {
     connStatus.tabIndex = 0;
@@ -1844,12 +1878,18 @@ function isTurnPiece(el: HTMLElement): boolean {
   );
 }
 
-function groupTurns(): HTMLElement[][] {
+function groupTurns(splitBackgroundReplies = false): HTMLElement[][] {
   const turns: HTMLElement[][] = [];
   let turn: HTMLElement[] | null = null;
   const leading: HTMLElement[] = [];
   for (const node of messagesEl.children) {
-    if (!(node instanceof HTMLElement) || !isTurnPiece(node)) continue;
+    if (!(node instanceof HTMLElement)) continue;
+    if (splitBackgroundReplies && node.classList.contains("background-reply-boundary")) {
+      turn = [];
+      turns.push(turn);
+      continue;
+    }
+    if (!isTurnPiece(node)) continue;
     const isUser =
       node.classList.contains("message") &&
       node.classList.contains("user") &&
@@ -2095,16 +2135,16 @@ function toggleAllTurns(): void {
   });
 }
 
-function errorActions(text: string): Array<{ act: string; label: string }> {
+function errorActions(text: string, allowRetryLast: boolean): Array<{ act: string; label: string }> {
   const guidance = errorGuidance(text);
   const actions: Array<{ act:string; label:string }> = [{ act: guidance.action, label: guidance.label }];
-  if (sentQuestions().at(-1)) actions.push({ act: "retryLast", label: "重试" });
+  if (allowRetryLast && sentQuestions().at(-1)) actions.push({ act: "retryLast", label: "重试" });
   if (guidance.action !== "retry") actions.push({ act: "retry", label: guidance.category === "model" || guidance.category === "general" ? "重新读取登录" : "重新连接" });
   actions.push({ act: "showLog", label: "打开日志" }, { act: "copyDiagnostics", label: "复制诊断信息" }, { act: "community", label: "社区提问" });
   return actions;
 }
 
-function addErrorMessage(text: string, rejectedDraft?: ComposerDraft): void {
+function addErrorMessage(text: string, rejectedDraft?: ComposerDraft, allowRetryLast = true): void {
   const question = sentQuestions().at(-1);
   const ownerSessionId = currentSessionId;
   const ownerViewGen = viewGen;
@@ -2117,7 +2157,7 @@ function addErrorMessage(text: string, rejectedDraft?: ComposerDraft): void {
   el.className = "message error";
   el.dataset.sessionId = ownerSessionId;
   const guidance = errorGuidance(text);
-  const actions = errorActions(text)
+  const actions = errorActions(text, allowRetryLast)
     .map(
       (a) =>
         `<button type="button" data-act="${escapeText(a.act)}" ${uiLabelAttributes(a.label)}>${escapeText(t(a.label))}</button>`
@@ -2132,10 +2172,13 @@ function addErrorMessage(text: string, rejectedDraft?: ComposerDraft): void {
       if (currentSessionId !== ownerSessionId || viewGen !== ownerViewGen) return;
       const act = btn.dataset.act;
       if (act === "retryLast" && question && (failedPrompt || readImageAttachments(JSON.parse(question.dataset.images || "[]")).length)) {
-        if (holdStreams || isGenerating) return;
-        btn.disabled = true;
+        if (holdStreams || isGenerating || !sessionConnected) return;
         const images = readImageAttachments(JSON.parse(question?.dataset.images || "[]"));
         const commandId = crypto.randomUUID();
+        const request = { type: "retryLast", commandId, sessionId: ownerSessionId, text: failedPrompt || "", chips: [], attachments: images,
+          ...(rejectedDraft ? { recoveryText: rejectedDraft.text, ...(rejectedDraft.planEnabled ? { planMode: true } : {}) } : {}) };
+        if (!validateSendRequest(request)) return;
+        btn.disabled = true;
         const { text: retryText, skills } = extractLeadingSkills(failedPrompt || "");
         const draft = rejectedDraft ?? {
           ...extractLeadingAgents(retryText), skills, chips: [],
@@ -2151,8 +2194,7 @@ function addErrorMessage(text: string, rejectedDraft?: ComposerDraft): void {
         }
         addUserMessage(failedPrompt || "", [], false, undefined, undefined, undefined, undefined, images);
         setGenerating(true);
-        post({ type: "retryLast", commandId, sessionId: ownerSessionId, text: failedPrompt || "", chips: [], attachments: images,
-          ...(rejectedDraft ? { recoveryText: rejectedDraft.text, ...(rejectedDraft.planEnabled ? { planMode: true } : {}) } : {}) });
+        post(request);
       } else if (act === "showLog") post({ type: "showLog" });
       else if (act === "retry") post({ type: "retry" });
       else if (act === "pickModel") openOverlay("models");
@@ -2372,9 +2414,8 @@ function syncEditButton(
   const last = users[users.length - 1];
   for (const el of users) {
     if (el.querySelector(".user-edit")) {
-      if (editable && el === last) {
+      if (editable && el === last && el.dataset.entityId === editable.target.entityId) {
         el.dataset.rowId = String(editable.target.rowId);
-        el.dataset.entityId = editable.target.entityId;
         el.dataset.serverText = editable.text;
       }
       continue;
@@ -2604,7 +2645,10 @@ function applyEditImageMessage(msg: { type?: string; edit?: boolean; sessionId?:
     return true;
   }
   const chip = msg.imageId ? editImageChip(msg.imageId) : null;
-  if (!chip) return !!msg.edit;
+  if (!chip) {
+    if (msg.edit && msg.type === "image_failed") showToast(msg.message || t("图片添加失败，请重新添加。"));
+    return !!msg.edit;
+  }
   if (msg.type === "image_failed") {
     chip.dataset.status = "error";
     showToast(msg.message || t("图片添加失败，请重新添加。"));
@@ -2799,10 +2843,12 @@ function submitUserEdit(el: HTMLElement, workspaceMode: "preserve" | "rewind"): 
     if (Array.isArray(saved)) sessionRefs = saved.filter((item): item is SessionReference => !!item && typeof item.sessionId === "string" && typeof item.title === "string");
   } catch { /* Treat malformed DOM state as no references. */ }
   const commandId = crypto.randomUUID();
+  const request = { type: "editLast", sessionId: el.dataset.sessionId, viewGen, editRequestId: el.dataset.editRequestId, commandId,
+    text, sessionRefs, rowId, entityId, workspaceMode, attachments };
+  if (!validateSendRequest(request)) return;
   el.dataset.editSubmissionId = commandId;
   setEditSubmitting(el, true);
-  post({ type: "editLast", sessionId: el.dataset.sessionId, viewGen, editRequestId: el.dataset.editRequestId, commandId,
-    text, sessionRefs, rowId, entityId, workspaceMode, attachments });
+  post(request);
 }
 
 function applyQueryRewind(el: HTMLElement, text: string, attachments: ImageAttachment[]): void {
@@ -3368,10 +3414,12 @@ function beginQueuedEdit(el: HTMLElement): void {
           const next = ta.value.trim();
           if (!next && !readImageAttachments(JSON.parse(el.dataset.images || "[]")).length) return;
           if (draft.requestId) return;
+          const request = { type: "queueEdit", sessionId, queueItemId: id, text: next, requestId: crypto.randomUUID(), viewGen };
+          if (!validateSendRequest(request)) return;
           draft.text = ta.value;
-          draft.requestId = crypto.randomUUID();
+          draft.requestId = request.requestId;
           paintQueuedEdit(el);
-          post({ type: "queueEdit", sessionId, queueItemId: id, text: next, requestId: draft.requestId, viewGen });
+          post(request);
         } else {
           if (draft.requestId) return;
           queuedEditDrafts.delete(key);
@@ -3535,6 +3583,8 @@ function compactStatusLabel(status: string, origin?: string): string {
 }
 
 const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssistantBody(el: HTMLElement, text: string, settled: boolean, liveAnswer = false, streaming = false): void {
+  const restoreSelection = captureMessageSelection(node => el.contains(node)
+    ? { before: el, after: () => el } : undefined);
   el.dataset.streamText = text;
   el.toggleAttribute("data-streaming-markdown", streaming);
   const parts = splitZaiBuiltin(text);
@@ -3579,6 +3629,7 @@ const builtinWork = new WeakMap<HTMLElement, HTMLElement>();function renderAssis
   el.dataset.copyText=parts.filter(part=>part.kind==="text").map(part=>part.text.trim()).filter(Boolean).join("\n\n");
   if (settled && !el.hidden) syncReplyFooter(el,true);
   wireCopyButtons(el); if (work) wireCopyButtons(work);
+  restoreSelection?.();
 }
 
 function finalizeAssistantMessage(): void {
@@ -4082,6 +4133,8 @@ function capturePostFoldAnchor(folds: HTMLElement[]): { element: HTMLElement; to
   const children = [...messagesEl.children].filter((node): node is HTMLElement => node instanceof HTMLElement);
   const firstFoldIndex = Math.min(...folds.map(fold => children.indexOf(fold)).filter(index => index >= 0));
   if (!Number.isFinite(firstFoldIndex)) return undefined;
+  const reading = firstVisibleHistoryMessage();
+  if (reading && children.indexOf(reading) < firstFoldIndex) return undefined;
   const viewport = messagesEl.getBoundingClientRect();
   const candidates = children.slice(firstFoldIndex + 1).filter(node =>
     !folds.some(fold => fold === node || fold.contains(node)) &&
@@ -4427,20 +4480,28 @@ function fillPlanCardEl(
   }
 }
 
-function revealToolDetails(header: HTMLElement, firstTool?: HTMLElement): void {
+function revealToolDetails(header: HTMLElement, latestTool?: HTMLElement): void {
   requestAnimationFrame(() => {
-    if (!header.isConnected || header.getAttribute("aria-expanded") !== "true") return;
-    const details = firstTool ?? header.parentElement?.querySelector<HTMLElement>(":scope > .tool-body");
+    if (latestTool ? latestTool.classList.contains("group-hidden") : !header.isConnected || header.getAttribute("aria-expanded") !== "true") return;
+    const details = latestTool?.querySelector<HTMLElement>(":scope > .tool-head") ?? header.parentElement?.querySelector<HTMLElement>(":scope > .tool-body");
     if (!details?.isConnected) return;
     // Reveal the command's beginning through both scrollports. Long output
     // must not push the clicked header out of view or scroll its own contents.
-    const work = header.closest<HTMLElement>(".work-fold-body");
+    const work = details.closest<HTMLElement>(".work-fold-body");
     for (const viewport of [work, messagesEl]) {
       if (!viewport) continue;
       const bounds = viewport.getBoundingClientRect();
       const top = bounds.top + (viewport === messagesEl ? messagesChromeTop() : 0);
       const inputTop = (!questionRail.hidden ? questionRail : composerEl.querySelector(".composer-card") ?? composerEl).getBoundingClientRect().top;
       const bottom = Math.min(bounds.bottom, inputTop) - 8;
+      if (latestTool) {
+        // Expose the last command row. The outer transcript can then reveal
+        // the work viewport if it extends behind the composer.
+        const limit = viewport === work ? bounds.bottom - 2 : bottom;
+        const overflow = details.getBoundingClientRect().bottom - limit;
+        if (overflow > 0) viewport.scrollTop += overflow;
+        continue;
+      }
       const headerTop = header.getBoundingClientRect().top;
       const detailRect = details.getBoundingClientRect();
       if (detailRect.top < bottom - 32) continue;
@@ -4977,7 +5038,7 @@ function refreshProcessGroups(parent: HTMLElement | null): void {
       const open = first.dataset.groupToggle !== "open";
       first.dataset.groupToggle = open ? "open" : "closed";
       paint();
-      if (open) revealToolDetails(button, first);
+      if (open) revealToolDetails(button, group[group.length - 1]);
     });
     first.before(button);
     paint();
@@ -5057,18 +5118,16 @@ function questionFoldStateKey(question: HTMLElement, occurrences: Map<string, nu
   return `${base}\u0000${occurrence}`;
 }
 
+function isReplyBoundary(node: HTMLElement): boolean {
+  return node.matches(".message.user:not(.queued), .background-reply-boundary");
+}
+
 function replyFooterNear(anchor: HTMLElement): HTMLElement | null {
   for (const dir of ["previousElementSibling", "nextElementSibling"] as const) {
     let node: Element | null = anchor[dir];
     while (node instanceof HTMLElement) {
       if (node.classList.contains("reply-meta")) return node;
-      if (
-        node.classList.contains("message") &&
-        node.classList.contains("user") &&
-        !node.classList.contains("queued")
-      ) {
-        break;
-      }
+      if (isReplyBoundary(node)) break;
       node = node[dir];
     }
   }
@@ -5079,13 +5138,7 @@ function replyEnd(anchor: HTMLElement): HTMLElement {
   let end = anchor;
   let node = anchor.nextElementSibling;
   while (node instanceof HTMLElement) {
-    if (
-      node.classList.contains("message") &&
-      node.classList.contains("user") &&
-      !node.classList.contains("queued")
-    ) {
-      break;
-    }
+    if (isReplyBoundary(node)) break;
     // Timeline separators begin the next visual event. Keep this reply's
     // copy/time footer above them rather than letting it drift below a switch.
     if (node.classList.contains("timeline-mark")) break;
@@ -5099,13 +5152,7 @@ function replyProse(footer: HTMLElement): string {
   const chunks: string[] = [];
   let node = footer.previousElementSibling;
   while (node instanceof HTMLElement) {
-    if (
-      node.classList.contains("message") &&
-      node.classList.contains("user") &&
-      !node.classList.contains("queued")
-    ) {
-      break;
-    }
+    if (isReplyBoundary(node)) break;
     const prose = node.classList.contains("assistant")
       ? [node]
       : [...node.querySelectorAll<HTMLElement>(".message.assistant")];
@@ -5120,13 +5167,7 @@ function turnStartedAt(anchor: HTMLElement): number | undefined {
   let node: Element | null = anchor;
   let found: number | undefined;
   while (node instanceof HTMLElement) {
-    if (
-      node.classList.contains("message") &&
-      node.classList.contains("user") &&
-      !node.classList.contains("queued")
-    ) {
-      break;
-    }
+    if (isReplyBoundary(node)) break;
     const sent = Number(node.dataset.sentAt);
     if (node.classList.contains("assistant") && Number.isFinite(sent) && sent > 0) found = sent;
     node = node.previousElementSibling;
@@ -5144,7 +5185,7 @@ function syncReplyFooter(anchor: HTMLElement, force: boolean): void {
 }
 
 function settleReplyFooters(tailRunning = false): void {
-  const turns = groupTurns();
+  const turns = groupTurns(true);
   if (tailRunning) turns.pop();
   for (const turn of turns) {
     let anchor: HTMLElement | null = null;
@@ -5182,8 +5223,7 @@ function mathFontHintKey(): string | undefined {
 function replyHasFormula(meta: HTMLElement): boolean {
   let node = meta.previousElementSibling;
   while (node instanceof HTMLElement) {
-    if (node.classList.contains("timeline-mark")) return false;
-    if (node.classList.contains("message") && node.classList.contains("user") && !node.classList.contains("queued")) return false;
+    if (node.classList.contains("timeline-mark") || isReplyBoundary(node)) return false;
     if (node.querySelector(".katex")) return true;
     node = node.previousElementSibling;
   }
@@ -5542,24 +5582,30 @@ function onOverlayKeydown(event: KeyboardEvent): void {
   moveOverlayItem(event.key === "ArrowDown" ? 1 : -1);
 }
 
-function openOverlay(mode: "sessions" | "models" | "mode" | "thought"): void {
+function openOverlay(mode: OverlayMode): void {
   hideTooltip();
   rememberOverlayTrigger();
-  if (mode === "sessions") {
+  if (mode === "sessions" || mode === "setup-models") {
     closePicker();
     overlayMode = mode;
     overlay.classList.add("open");
-    overlayTitle.textContent = t("Sessions in this workspace");
+    const sessionList = mode === "sessions";
+    setUiLabel(overlayTitle, sessionList ? "Sessions in this workspace" : "使用 API Key");
     overlaySearch.value = "";
-    overlaySearch.placeholder = t("Filter sessions…");
+    overlaySearch.placeholder = t(sessionList ? "Filter sessions…" : "Filter…");
     const tabs = document.getElementById("session-tabs");
-    tabs?.classList.add("show");
-    showArchived = false;
-    document.getElementById("tab-active")?.classList.add("active");
-    document.getElementById("tab-archived")?.classList.remove("active");
-    if (isGenerating && currentSessionId) runningSessions.add(currentSessionId);
-    post({ type: "listSessions", includeArchived: false, listVisible: true });
-    rebuildOverlay("");
+    tabs?.classList.toggle("show", sessionList);
+    if (sessionList) {
+      showArchived = false;
+      document.getElementById("tab-active")?.classList.add("active");
+      document.getElementById("tab-archived")?.classList.remove("active");
+      if (isGenerating && currentSessionId) runningSessions.add(currentSessionId);
+      post({ type: "listSessions", includeArchived: false, listVisible: true });
+    } else {
+      setupEl.classList.remove("open");
+      syncConnAction();
+    }
+    rebuildOverlay("", true);
     overlaySearch.focus();
     return;
   }
@@ -5612,6 +5658,7 @@ function placePicker(): void {
 }
 
 function openPicker(mode: "models" | "mode" | "thought"): void {
+  if (mode === "models" && modelChip.disabled) return;
   // Opening a menu from the hovered chip must dismiss its hover card, or the
   // card sits on top of the menu the user is trying to read.
   hideTooltip();
@@ -5639,30 +5686,45 @@ function closePicker(): void {
   setPickerExpanded(null);
 }
 
-function closeOverlay(opts?: { restoreTrigger?: boolean }): void {
+function closeOverlay(opts?: { restoreTrigger?: boolean; dismissSetup?: boolean }): void {
+  const returnToSetup = overlayMode === "setup-models" && !opts?.dismissSetup && !!lastSetup;
   overlay.classList.remove("open");
   closePicker();
   overlayMode = null;
-  if (opts?.restoreTrigger) restoreOverlayTrigger();
+  if (returnToSetup) {
+    setupEl.classList.add("open");
+    syncConnAction();
+    document.querySelector<HTMLElement>('#setup-recovery [data-act="useApiKey"]')?.focus();
+    overlayReturn = null;
+  } else if (opts?.restoreTrigger) restoreOverlayTrigger();
   else {
     overlayReturn = null;
     input.focus();
   }
 }
 
-function rebuildOverlay(query: string): void {
+function rebuildOverlay(query: string, resetScroll = false): void {
   const q = query.trim().toLowerCase();
   overlayItems = [];
-  const listEl =
-    overlayMode === "sessions" ? overlayList : popoverList;
+  const inSheet = overlayMode === "sessions" || overlayMode === "setup-models";
+  const showingModels = overlayMode === "models" || overlayMode === "setup-models";
+  const listEl = inSheet ? overlayList : popoverList;
+  const keepSessionScroll = overlayMode === "sessions" && !resetScroll && !!listEl.querySelector(".overlay-item");
+  const listTop = listEl.getBoundingClientRect().top;
+  const previousScroll = listEl.scrollTop;
+  const firstVisibleRow = keepSessionScroll && previousScroll > 0
+    ? [...listEl.querySelectorAll<HTMLElement>(".overlay-item")].find(row => row.getBoundingClientRect().bottom > listTop)
+    : undefined;
+  const firstVisibleId = firstVisibleRow?.dataset.itemId;
+  const firstVisibleOffset = firstVisibleRow ? firstVisibleRow.getBoundingClientRect().top - listTop : 0;
   const focused = document.activeElement as HTMLElement | null;
   const focusedRow = focused?.closest<HTMLButtonElement>(".overlay-item[data-item-id]");
   const focusedId = focusedRow?.parentElement === listEl ? focusedRow.dataset.itemId : undefined;
   const focusedAction = focused?.dataset?.act;
   const restoreFallbackFocus = () => {
     if (focusedId === undefined) return;
-    if (overlayMode === "sessions") overlaySearch.focus();
-    else if (overlayMode) pickerAnchor(overlayMode).focus();
+    if (inSheet) overlaySearch.focus();
+    else if (overlayMode === "models" || overlayMode === "mode" || overlayMode === "thought") pickerAnchor(overlayMode).focus();
   };
   listEl.innerHTML = "";
   paintSessionListNotice();
@@ -5682,8 +5744,9 @@ function rebuildOverlay(query: string): void {
         running: sessionIsRunning(s),
         payload: s.sessionId,
       }));
-  } else if (overlayMode === "models") {
-    overlayItems = models
+  } else if (showingModels) {
+    const choices = overlayMode === "setup-models" ? setupApiModels(lastSetup?.picker ?? []) : models;
+    overlayItems = choices
       .filter(
         (m) =>
           !q ||
@@ -5744,7 +5807,7 @@ function rebuildOverlay(query: string): void {
 
   let lastGroup = "";
   overlayItems.forEach((item, idx) => {
-    if (overlayMode === "models") {
+    if (showingModels) {
       const group = item.sub ?? "";
       if (group && group !== lastGroup) {
         const header = document.createElement("div");
@@ -5767,7 +5830,7 @@ function rebuildOverlay(query: string): void {
         ? " active"
         : "");
     const body =
-      overlayMode === "models"
+      showingModels
         ? `<div class="oi-title">${escapeText(item.title)}</div>`
         : `<div class="oi-title">${escapeText(item.title)}${
             item.running ? `<span class="oi-live">${t("运行中")}</span>` : ""
@@ -5824,8 +5887,14 @@ function rebuildOverlay(query: string): void {
       target.focus({ preventScroll: true });
       target.scrollIntoView({ block: "nearest" });
     } else restoreFallbackFocus();
-  } else {
+  } else if (keepSessionScroll) {
+    const row = [...listEl.querySelectorAll<HTMLElement>(".overlay-item")].find(item => item.dataset.itemId === firstVisibleId);
+    listEl.scrollTop = row ? listEl.scrollTop + row.getBoundingClientRect().top - listEl.getBoundingClientRect().top - firstVisibleOffset
+      : previousScroll;
+  } else if (!q) {
     listEl.querySelector<HTMLElement>(".overlay-item.active")?.scrollIntoView({ block: "nearest" });
+  } else if (resetScroll) {
+    listEl.scrollTop = 0;
   }
 }
 
@@ -5840,22 +5909,30 @@ function selectOverlay(idx: number): void {
     }
     const next = String(item.payload);
     // The open conversation is already on screen. Closing the list is enough.
-    if (next === currentSessionId) {
+    if (next === currentSessionId && sessionConnected && !holdStreams) {
       closeOverlay();
       return;
     }
     if (isGenerating && currentSessionId) {
       runningSessions.add(currentSessionId);
     }
-    currentSessionId = next;
-    setSessionTitle(item.title);
-    post({ type: "switchSession", sessionId: item.payload });
+    post({ type: "switchSession", sessionId: next });
+  } else if (overlayMode === "setup-models") {
+    closeOverlay({ dismissSetup: true });
+    selectSetupModel(item.payload as PickerModel);
+    return;
   } else if (overlayMode === "models") {
     const m = item.payload as PickerModel;
+    if (!sessionConnected && lastSetup && m.access === "api-key") {
+      selectSetupModel(m);
+      closeOverlay();
+      return;
+    }
+    if (modelChip.disabled || holdStreams || !sessionConnected || !currentSessionId) return;
     currentModelLabel = `${m.providerId}/${m.modelId}`;
     modelChip.textContent = m.modelId;
     modelChip.title = `${providerGroup(m)} / ${m.modelId}`;
-    post({ type: "selectModel", providerId: m.providerId, modelId: m.modelId });
+    post({ type: "selectModel", providerId: m.providerId, modelId: m.modelId, sessionId: currentSessionId, viewGen });
   } else if (overlayMode === "mode") {
     const picked = String(item.payload);
     if (picked === "plan") {
@@ -5885,51 +5962,54 @@ function selectOverlay(idx: number): void {
   closeOverlay();
 }
 
-function showSetup(reason: string, hint: string, picker: PickerModel[]): void {
-  lastSetup = { reason, hint, picker: picker.slice() };
+function setupApiModels(picker: PickerModel[]): PickerModel[] {
+  return picker.filter(model => model.access === "api-key" && model.hasKey !== false && !model.disabledReason);
+}
+
+function selectSetupModel(model: PickerModel): void {
+  setupEl.classList.remove("open");
+  syncConnAction();
+  post({ type: "selectModel", providerId: model.providerId, modelId: model.modelId, restart: true });
+}
+
+function showSetup(reason: string, hint: string, picker: PickerModel[], planUnavailable = false): void {
+  if (overlayMode === "setup-models") closeOverlay({ dismissSetup: true });
+  lastSetup = { reason, hint, picker: picker.slice(), planUnavailable };
   workspaceRequired = false;
   setupEl.classList.add("open");
   syncConnAction();
+  const apiModels = setupApiModels(picker);
   const guidance = errorGuidance(reason || hint);
-  setUiLabel(setupTitle, guidance.title);
-  setUiLabel(setupHint, guidance.hint);
+  setUiLabel(setupTitle, planUnavailable ? "当前套餐不可用" : guidance.title);
+  setUiLabel(setupHint, planUnavailable
+    ? apiModels.length
+      ? "可以使用已配置的 API Key，或在 ZCode 桌面端选用可用套餐后重新读取登录。"
+      : "请在 ZCode 桌面端选用可用套餐或配置 API Key，再重新读取登录。"
+    : guidance.hint);
   const recovery = document.getElementById("setup-recovery")!;
+  const actions = [["retry", "重新读取登录"], ["copyDiagnostics", "复制诊断信息"], ["showLog", "打开日志"], ["community", "社区提问"]];
+  if (apiModels.length) actions.unshift(["useApiKey", "使用 API Key"]);
   recovery.innerHTML = `<details class="error-details"><summary ${uiLabelAttributes("错误详情")}>${t("错误详情")}</summary><pre>${escapeText([reason,hint].filter(Boolean).join("\n"))}</pre></details>
-    <div class="err-actions">${[ ["retry","重新读取登录"], ["copyDiagnostics","复制诊断信息"], ["showLog","打开日志"], ["community","社区提问"] ].map(([act,label])=>`<button type="button" data-act="${act}" ${uiLabelAttributes(label)}>${t(label)}</button>`).join("")}</div>`;
+    <div class="err-actions">${actions.map(([act,label])=>`<button type="button" data-act="${act}" ${uiLabelAttributes(label)}>${t(label)}</button>`).join("")}</div>`;
   recovery.querySelectorAll<HTMLButtonElement>("button").forEach(button => button.addEventListener("click",()=>{
     const act=button.dataset.act;
     if(act==="retry"){hideSetup();post({type:"retry"});}
     else if(act==="community")post({type:"openCommunity"});
     else if(act==="showLog")post({type:"showLog"});
     else if(act==="copyDiagnostics")post({type:"copyDiagnostics"});
+    else if (act === "useApiKey") {
+      if (apiModels.length === 1) selectSetupModel(apiModels[0]);
+      else openOverlay("setup-models");
+    }
   }));
   setupList.innerHTML = "";
-  const usable = picker.filter((p) => p.hasKey !== false && !p.disabledReason);
-  if (usable.length === 0) {
+  if (!apiModels.length && !planUnavailable) {
     setupList.innerHTML = `<div class="overlay-empty">${t("No saved API keys found. Open the ZCode desktop app and sign in, then click Retry.")}</div>`;
-    return;
   }
-  usable.forEach((m) => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "overlay-item";
-    btn.innerHTML = `<div class="oi-title">${escapeText(m.modelId || m.label)}</div><div class="oi-sub">${escapeText(
-      providerGroup(m)
-    )}</div>`;
-    btn.addEventListener("click", () => {
-      setupEl.classList.remove("open");
-      post({
-        type: "selectModel",
-        providerId: m.providerId,
-        modelId: m.modelId,
-        restart: true,
-      });
-    });
-    setupList.appendChild(btn);
-  });
 }
 
 function hideSetup(): void {
+  if (overlayMode === "setup-models") closeOverlay({ dismissSetup: true });
   const wasOpen = setupEl.classList.contains("open");
   setupEl.classList.remove("open");
   syncConnAction();
@@ -5937,6 +6017,7 @@ function hideSetup(): void {
 }
 
 type HistoryViewItem = {
+  backgroundTurnStart?: true;
   turnId?: string;
   rowId?: number;
   logEpoch?: string;
@@ -6040,10 +6121,17 @@ function renderHistoryItems(items: HistoryViewItem[], activeSince = 0, carriedWo
       // question. The transcript row has to live on its own attribute.
       if (bubble && item.rowId !== undefined) bubble.dataset.transcriptRow = String(item.rowId);
     } else {
-      // Backend turn IDs can advance for hidden runtime work (for example a
-      // todo reminder or background result) without a new visible user prompt.
-      // Keep adjacent assistant output in one displayed work segment; visible
-      // user messages above remain the boundary that starts a new segment.
+      // A completed background task starts a new reply without a visible question.
+      // Ordinary hidden reminders still belong to the surrounding reply.
+      if (item.backgroundTurnStart) {
+        flush(false);
+        const boundary = document.createElement("div");
+        boundary.className = "background-reply-boundary";
+        boundary.hidden = true;
+        attachMessage(boundary);
+        segmentQuestion = undefined;
+        restartAt = 0;
+      }
       group.push(item);
     }
   }
@@ -6130,14 +6218,14 @@ function renderAssistantTurn(items: HistoryViewItem[], activeSince = 0, continua
   if (running) {
     // Keep the visible clock's exact start across a live redraw. Server row
     // timestamps are used only when restoring a turn without a local fold.
-    const runningStartedAt = liveStartAt > 0 ? Math.max(liveStartAt, restartAt) : clock;
+    const runningStartedAt = items[0].backgroundTurnStart && started ? started : liveStartAt > 0 ? Math.max(liveStartAt, restartAt) : clock;
     // The answer still being written stays below the fold, as it does during
     // live deltas. Text already followed by later reasoning belongs inside.
     const streamingAnswer = !!answer.trim() && after.length === 0;
     const runningWork = streamingAnswer ? beforeWork : pieces.filter(piece => !isTimelinePiece(piece));
     const runningMarks = streamingAnswer ? beforeMarks : pieces.filter(isTimelinePiece);
     // Compact (and other timeline separators) must not open an empty work fold.
-    if (runningWork.length || (!streamingAnswer && !!answer.trim())) {
+    if (runningWork.length || (!streamingAnswer && (!!answer.trim() || items[0].backgroundTurnStart))) {
       const fold = createWorkFold("running", runningStartedAt || undefined);
       fold.dataset.startedAt = String(runningStartedAt || Date.now());
       turnWorkStarted = Number(fold.dataset.startedAt);
@@ -6524,17 +6612,22 @@ function captureHistoryEditors() {
   }));
 }
 
+// A rewind can remove the old question before the edit RPC returns.
+const detachedEditDrafts = new Map<string, Parameters<typeof recoverInput>[0]>();
+
 function restoreHistoryEditors(editors: ReturnType<typeof captureHistoryEditors>): void {
   for (const saved of editors) {
     if (saved.owner !== currentSessionId || !saved.jump) continue;
     const fresh = sentQuestions().find(node => node.dataset.sessionId === saved.owner && (
       node.dataset.jump === saved.jump || saved.entityId && (node.dataset.jump === saved.entityId || node.dataset.entityId === saved.entityId)));
-    if (!fresh) {
+    if (!fresh || saved.node.dataset.editSubmissionId && fresh.dataset.rawText !== saved.node.dataset.rawText) {
       // A rewrite may actually remove the target. Keep its unsubmitted input in
       // the source chat's composer rather than attaching it to another question.
       const text = saved.node.querySelector<HTMLTextAreaElement>(".user-edit")?.value ?? "";
-      recoverInput({ sessionId: saved.owner, text, attachments: editRemainingAttachments(saved.node),
-        sessionRefs: parsePromptDisplay(saved.node.dataset.serverText || "").sessionRefs });
+      const draft = { sessionId: saved.owner, text, attachments: editRemainingAttachments(saved.node),
+        sessionRefs: parsePromptDisplay(saved.node.dataset.serverText || "").sessionRefs };
+      if (saved.node.dataset.editSubmissionId) detachedEditDrafts.set(saved.node.dataset.editSubmissionId, draft);
+      else recoverInput(draft);
       continue;
     }
     const freshMeta = messageMeta(fresh);
@@ -6563,6 +6656,95 @@ function nextWorkQuestion(fold: HTMLElement): string {
   return "";
 }
 
+const historyMessageSelector = ".message.user:not(.queued), .message.assistant";
+
+function firstVisibleHistoryMessage(): HTMLElement | undefined {
+  const edge = questionReadingEdge();
+  const bottomInset = Number.parseFloat(getComputedStyle(document.body).getPropertyValue("--z-messages-scroll-bottom")) || 120;
+  const bottom = messagesEl.getBoundingClientRect().bottom - bottomInset;
+  return [...messagesEl.children].find((node): node is HTMLElement => {
+    if (!(node instanceof HTMLElement) || !node.matches(historyMessageSelector)) return false;
+    if (node.classList.contains("assistant") && !node.dataset.copyText?.trim()) return false;
+    const rect = node.getBoundingClientRect();
+    return rect.height > 0 && rect.bottom > edge && rect.top < bottom;
+  });
+}
+
+function matchHistoryMessage(message: HTMLElement, items: HistoryViewItem[]): () => HTMLElement | undefined {
+  const { partId, copyText } = message.dataset;
+  let question: Element | null = message;
+  while (question && !question.matches(".message.user:not(.queued)")) question = question.previousElementSibling;
+  const matchingQuestions = question instanceof HTMLElement
+    ? items.filter(item => item.role === "user" && sameWorkQuestion(question, item)) : [];
+  const questionId = matchingQuestions.length === 1 ? matchingQuestions[0].id : undefined;
+  return () => {
+    const owner = questionId ? sentQuestions().find(node => node.dataset.jump === questionId) : undefined;
+    if (message === question) return owner;
+    const byPart = partId && [...messagesEl.querySelectorAll<HTMLElement>(":scope > .message.assistant[data-part-id]")]
+      .find(node => node.dataset.partId === partId && node.getClientRects().length);
+    if (byPart) return byPart;
+    if (!owner || !copyText) return undefined;
+    // Older snapshots may omit part IDs. Match growing prose within its question.
+    const candidates: HTMLElement[] = [];
+    for (let node = owner.nextElementSibling; node; node = node.nextElementSibling) {
+      if (node.matches(".message.user:not(.queued)")) break;
+      if (node instanceof HTMLElement && node.matches(".message.assistant") &&
+          node.dataset.copyText?.startsWith(copyText) && node.getClientRects().length) {
+        candidates.push(node);
+      }
+    }
+    return candidates.length === 1 ? candidates[0] : undefined;
+  };
+}
+
+function textBoundary(root: HTMLElement, offset: number): { node: Node; offset: number } | undefined {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const length = node.textContent?.length ?? 0;
+    if (offset <= length) return { node, offset };
+    offset -= length;
+  }
+  return undefined;
+}
+
+function captureMessageSelection(
+  match: (node: Node) => { before: HTMLElement; after: () => HTMLElement | undefined } | undefined,
+): (() => void) | undefined {
+  const selection = document.getSelection();
+  if (!selection?.anchorNode || !selection.focusNode || selection.isCollapsed) return;
+  const boundary = (node: Node, offset: number) => {
+    const roots = match(node);
+    if (!roots) return undefined;
+    const range = document.createRange();
+    range.setStart(roots.before, 0);
+    range.setEnd(node, offset);
+    const textOffset = range.toString().length;
+    return () => {
+      const root = roots.after();
+      return root?.getClientRects().length ? textBoundary(root, textOffset) : undefined;
+    };
+  };
+  const anchor = boundary(selection.anchorNode, selection.anchorOffset);
+  const focus = boundary(selection.focusNode, selection.focusOffset);
+  if (!anchor || !focus) return;
+  const text = selection.getRangeAt(0).toString();
+  if (!text) return;
+  return () => {
+    const start = anchor();
+    const end = focus();
+    if (!start || !end) return;
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset);
+    if (range.collapsed) {
+      range.setStart(end.node, end.offset);
+      range.setEnd(start.node, start.offset);
+    }
+    // Restore only when these offsets still point to the selected text.
+    if (range.toString() === text) selection.setBaseAndExtent(start.node, start.offset, end.node, end.offset);
+  };
+}
+
 function renderHistory(
   items: HistoryViewItem[],
   truncated = false,
@@ -6582,10 +6764,12 @@ function renderHistory(
   const itemCount = items.length;
   if (renderSource === "transcript-sync" && reconcileAppendedQuestion(items, truncated, activeSince, renderStarted, previousDomRows)) return;
   const historyEditors = captureHistoryEditors();
-  const workChoices = new Map([...workFoldKeys()].map(([key, fold]) => [key, {
-    toggle: fold.dataset.userToggle,
-    nextQuestion: nextWorkQuestion(fold),
-  }]));
+  const workChoices = new Map([...workFoldKeys()].map(([key, fold]) => {
+    const body = workBody(fold);
+    const following = body.scrollHeight - body.scrollTop - body.clientHeight <= 24;
+    const scroll = fold.classList.contains("open") ? { top: body.scrollTop, following } : undefined;
+    return [key, { toggle: fold.dataset.userToggle, nextQuestion: nextWorkQuestion(fold), scroll }] as const;
+  }));
   const subagentChoices = new Map([...messagesEl.querySelectorAll<HTMLElement>(".subagent-activity")]
     .filter(card => card.dataset.childSessionId)
     .map(card => [card.dataset.childSessionId!, card.dataset.userToggle]));
@@ -6606,6 +6790,15 @@ function renderHistory(
   }
   const previousTop = messagesEl.scrollTop;
   const follow = stickToBottom;
+  const readingMessage = !follow && !completionRevealPending ? firstVisibleHistoryMessage() : undefined;
+  const readingTop = readingMessage?.getBoundingClientRect().top ?? 0;
+  const findReadingMessage = readingMessage && matchHistoryMessage(readingMessage, items);
+  const restoreSelection = captureMessageSelection(node => {
+    const element = node instanceof Element ? node : node.parentElement;
+    const message = element?.closest<HTMLElement>(historyMessageSelector);
+    if (message?.parentElement === messagesEl) return { before: message, after: matchHistoryMessage(message, items) };
+    return undefined;
+  });
   const liveStartAt = Number(runningWorkFold()?.dataset.startedAt) || 0;
   let liveQuestion = (runningWorkFold() ?? currentTurnFold())?.previousElementSibling;
   while (liveQuestion && !liveQuestion.matches(".message.user:not(.queued)")) liveQuestion = liveQuestion.previousElementSibling;
@@ -6620,20 +6813,24 @@ function renderHistory(
   pendingJump = "";
   suspendScroll = true;
   const queued = queueCards();
+  // Pending sends stay in the transcript until the server confirms their queue identity.
+  // Confirmed cards already live in the queue editor outside the transcript.
+  const transcriptCards = queued.filter(card => card.parentElement === messagesEl || card.dataset.queuePending === "1");
   clearMessages();
   turnWorkStarted = 0;
   if (!items.length) {
     suspendScroll = false;
     emptyState();
     if (queued.length) { messagesEl.querySelector(".empty")?.remove(); clearGreetingTimer(); }
-    for (const card of queued) attachMessage(card);
+    for (const card of transcriptCards) attachMessage(card);
     syncQueuedMessages();
     restoreHistoryEditors(historyEditors);
     reportHistoryRenderTiming(renderStarted, performance.now() - renderStarted, renderSource, itemCount, previousDomRows, messagesEl.children.length, truncated);
     return;
   }
   renderHistoryItems(items, activeSince, carriedWorkMs, liveStartAt, liveQuestion instanceof HTMLElement ? liveQuestion : null);
-  for (const [key, fold] of workFoldKeys()) {
+  const restoredWorkFolds = workFoldKeys();
+  for (const [key, fold] of restoredWorkFolds) {
     const previous = workChoices.get(key);
     // A newly inserted question ends the old segment; keep its default collapse.
     if (!previous?.toggle || previous.nextQuestion !== nextWorkQuestion(fold)) continue;
@@ -6669,6 +6866,12 @@ function renderHistory(
     header.setAttribute("aria-expanded", String(!hidden));
   }
   for (const body of messagesEl.querySelectorAll<HTMLElement>(".work-fold-body")) refreshProcessGroups(body);
+  for (const [key, fold] of restoredWorkFolds) {
+    const scroll = workChoices.get(key)?.scroll;
+    if (!scroll || !fold.classList.contains("open")) continue;
+    const body = workBody(fold);
+    body.scrollTop = scroll.following ? body.scrollHeight : scroll.top;
+  }
   restoreHistoryEditors(historyEditors);
   const nextQuestionOccurrences = new Map<string, number>();
   for (const node of sentQuestions()) {
@@ -6676,7 +6879,7 @@ function renderHistory(
     if (opened !== undefined) node.dataset.turnOpen = opened;
     syncQuestionFoldControl(node, expandedQuestions.get(questionFoldStateKey(node, nextQuestionOccurrences)) === true);
   }
-  for (const card of queued) attachMessage(card);
+  for (const card of transcriptCards) attachMessage(card);
   syncQueuedMessages();
   suspendScroll = false;
   ensureHistoryMore(truncated);
@@ -6695,15 +6898,23 @@ function renderHistory(
   settleReplyFooters(activeSince > 0 || tailStillRunning(items));
   // The redraw wiped the spinner; a live turn still needs it at the tail.
   if (isGenerating) ensureWorkingIndicator();
+  restoreSelection?.();
   if (!completionRevealPending) {
     if (follow) scrollToBottom(true);
-    else messagesEl.scrollTop = previousTop;
+    else {
+      // The final transcript can collapse an open work fold during the
+      // redraw. Preserve the reply's viewport position across the new DOM.
+      const element = findReadingMessage?.();
+      if (element?.getClientRects().length) restorePostFoldAnchor({ element, top: readingTop });
+      else messagesEl.scrollTop = previousTop;
+    }
   }
   reconcileCompletedReveal();
   reportHistoryRenderTiming(renderStarted, performance.now() - renderStarted, renderSource, itemCount, previousDomRows, messagesEl.children.length, truncated);
 }
 
 function syncQueuedMessages(): void {
+  confirmSubmittedSends(currentSessionId, currentQueue ?? []);
   for (const node of queueCards()) {
     if (node.dataset.sessionId !== currentSessionId) node.remove();
   }
@@ -6733,9 +6944,19 @@ function syncQueuedMessages(): void {
     node.querySelectorAll<HTMLButtonElement>("button").forEach(button => { button.disabled = false; });
     paintQueuedEdit(node);
   }
-  for (const item of currentQueue ?? []) {
-    const node = queueCards().find(card => card.dataset.queueId === item.queueItemId);
-    if (node) queueZoneEl.append(node);
+  // Keep already ordered queue cards mounted so background updates cannot
+  // blur an active editor. The confirmed queue follows any optimistic cards.
+  const focused = document.activeElement;
+  let next: HTMLElement | null = null;
+  const cards = queueCards();
+  for (const item of [...(currentQueue ?? [])].reverse()) {
+    const node = cards.find(card => card.dataset.queueId === item.queueItemId);
+    if (!node) continue;
+    if (node.parentElement !== queueZoneEl || node.nextElementSibling !== next) queueZoneEl.insertBefore(node, next);
+    next = node;
+  }
+  if (focused instanceof HTMLElement && queueZoneEl.contains(focused) && document.activeElement !== focused) {
+    focused.focus({ preventScroll: true });
   }
   queueZoneEl.hidden = !queueZoneEl.querySelector(".message.queued");
   if (currentQueue) {
@@ -6755,6 +6976,7 @@ function prependHistory(items: HistoryViewItem[], more: boolean): void {
     ensureHistoryMore(historyTruncated);
     return;
   }
+  confirmSubmittedSends(currentSessionId, items);
   if (!items.length) {
     historyTruncated = more;
     ensureHistoryMore(more);
@@ -6917,24 +7139,43 @@ ${dirty ? t("包含未保存修改") : chip.selectionStart ? "" : t("引用已�
   return el;
 }
 
-function addExplicitChip(chip: ContextChip): void {
+function addExplicitChip(chip: ContextChip): boolean {
   const next = { ...chip, implicit: false };
-  explicitChips = explicitChips.filter((c) => chipKey(c) !== chipKey(next));
-  explicitChips.push(next);
+  const remaining = explicitChips.filter((c) => chipKey(c) !== chipKey(next));
+  if (remaining.length >= MAX_MESSAGE_REFERENCES) {
+    showToast(t("每条消息最多添加 {0} 个文件引用。", { 0: MAX_MESSAGE_REFERENCES }));
+    return false;
+  }
+  explicitChips = [...remaining, next];
   renderComposerChips();
   persistComposerDraft();
+  return true;
 }
 
 function addExplicitSessionReference(reference: SessionReference): void {
   if (referenceSessions.some(session => session.sessionId === reference.sessionId)) {
-    explicitSessionRefs = explicitSessionRefs.filter(item => item.sessionId !== reference.sessionId);
-    explicitSessionRefs.push({ sessionId: reference.sessionId, title: reference.title });
+    const remaining = explicitSessionRefs.filter(item => item.sessionId !== reference.sessionId);
+    if (remaining.length >= MAX_MESSAGE_REFERENCES) { showToast(t("每条消息最多添加 {0} 个会话引用。", { 0: MAX_MESSAGE_REFERENCES })); return; }
+    explicitSessionRefs = [...remaining, { sessionId: reference.sessionId, title: reference.title }];
     renderComposerChips();
     persistComposerDraft();
   }
 }
 
 function activeChips(): ContextChip[] { return [...explicitChips]; }
+
+function validateSendRequest(request: { type: string; chips?: ContextChip[]; sessionRefs?: SessionReference[] }): boolean {
+  const parsed = parseWebviewMessage(request);
+  if (parsed.ok) return true;
+  const field = parsed.rejection.field;
+  const limit = MAX_MESSAGE_REFERENCES;
+  if (field === "text" || field === "recoveryText") showToast(t("消息过长，请缩短后再发送。"));
+  else if (field === "chips" && (request.chips?.length ?? 0) > limit) showToast(t("每条消息最多添加 {0} 个文件引用。", { 0: limit }));
+  else if (field === "sessionRefs" && (request.sessionRefs?.length ?? 0) > limit) showToast(t("每条消息最多添加 {0} 个会话引用。", { 0: limit }));
+  else if (field === "chips") showToast(t("文件引用过长或无效，请缩小选区或移除该引用。"));
+  else showToast(t("无法提交，请检查消息中的引用和附件。"));
+  return false;
+}
 
 function sendMessage(immediate = false): void {
   if (holdStreams || !sessionConnected) return;
@@ -6958,9 +7199,13 @@ function sendMessage(immediate = false): void {
   const refs = explicitSessionRefs.map(reference => ({ ...reference }));
   const commandId = crypto.randomUUID();
   const recoveryText = prompt;
+  const content = { text, chips, sessionRefs: refs, attachments, sessionId: draftSessionId, ...(planShortcut ? { planMode: true, recoveryText } : {}) };
+  const request = isGenerating ? { type: "insert", ...content, immediate, queueItemId: commandId }
+    : { type: "send", ...content, commandId, sentAt: Date.now() };
+  if (!validateSendRequest(request)) return;
   const draft = { text: recoveryText, ...(planShortcut ? { planEnabled: true } : {}), chips: explicitChips.map(chip => ({ ...chip })), sessionRefs: refs, images, skills: selectedSkills.map(skill => ({ ...skill })), agents: selectedAgents.map(agent => ({ ...agent })) };
   pendingInputs.set(commandId, { sessionId: draftSessionId, draft });
-  if (!isGenerating) rememberSubmittedDraft(draftSessionId, commandId, draft);
+  rememberSubmittedDraft(draftSessionId, commandId, draft);
   draftPlanEnabled = false;
   input.value = "";
   clearActiveCommand();
@@ -6981,7 +7226,7 @@ function sendMessage(immediate = false): void {
       node.dataset.queuePending = "1";
       node.querySelectorAll<HTMLButtonElement>("button").forEach(button => { button.disabled = true; });
     }
-    post({ type: "insert", text, chips, sessionRefs: refs, attachments, immediate, queueItemId, sessionId: draftSessionId, ...(planShortcut ? { planMode: true, recoveryText } : {}) });
+    post(request);
     showToast(immediate ? t("已立即发送") : t("已排队，当前回复结束后发送"));
     updateComposerActions();
     return;
@@ -6992,7 +7237,7 @@ function sendMessage(immediate = false): void {
     ensureTurnWorkFold();
     scrollToBottom(true);
   }
-  post({ type: "send", text, chips, sessionRefs: refs, attachments, commandId, sessionId: draftSessionId, sentAt: Date.now(), ...(planShortcut ? { planMode: true, recoveryText } : {}) });
+  post(request);
 }
 
 // Two animation frames acknowledge a paint opportunity after updating the DOM,
@@ -8093,7 +8338,7 @@ function applyInterfaceLanguage(language: string, setting: LanguageSetting): voi
       if (value) node.setAttribute(attr, relocalizeUiText(value));
     }
   }
-  for (const node of document.querySelectorAll<HTMLElement>(".git-title[data-i18n-key],.perm-title[data-i18n-key],.tool-status[data-i18n-key],.tool-name[data-i18n-key],.reasoning-head [data-i18n-key],.process-group [data-i18n-key],.tool-section-label[data-i18n-key],.ask-summary [data-i18n-key],.message.error [data-i18n-key],#setup-title[data-i18n-key],#setup-hint[data-i18n-key],#setup-recovery [data-i18n-key],.math-font-hint[data-i18n-key]")) {
+  for (const node of document.querySelectorAll<HTMLElement>(".git-title[data-i18n-key],.perm-title[data-i18n-key],.tool-status[data-i18n-key],.tool-name[data-i18n-key],.reasoning-head [data-i18n-key],.process-group [data-i18n-key],.tool-section-label[data-i18n-key],.ask-summary [data-i18n-key],.message.error [data-i18n-key],#overlay-title[data-i18n-key],#setup-title[data-i18n-key],#setup-hint[data-i18n-key],#setup-recovery [data-i18n-key],.math-font-hint[data-i18n-key]")) {
     if (node.closest(".md,.work-note,.message.user,.tool-body,.ask-q,.perm-reason") && !node.classList.contains("tool-section-label") && node.dataset.i18nKey !== "分析图片") continue;
     node.textContent = t(node.dataset.i18nKey!, JSON.parse(node.dataset.i18nValues || "{}"));
   }
@@ -8122,12 +8367,14 @@ document.getElementById("btn-sessions")!.addEventListener("click", () => {
   openOverlay("sessions");
 });
 document.getElementById("tab-active")?.addEventListener("click", () => {
+  if (showArchived) overlayList.scrollTop = 0;
   showArchived = false;
   document.getElementById("tab-active")?.classList.add("active");
   document.getElementById("tab-archived")?.classList.remove("active");
   post({ type: "listSessions", includeArchived: false, listVisible: true });
 });
 document.getElementById("tab-archived")?.addEventListener("click", () => {
+  if (!showArchived) overlayList.scrollTop = 0;
   showArchived = true;
   document.getElementById("tab-archived")?.classList.add("active");
   document.getElementById("tab-active")?.classList.remove("active");
@@ -8168,7 +8415,7 @@ document.querySelector("#session-list-notice button")?.addEventListener("click",
 overlay.addEventListener("click", (e) => {
   if (e.target === overlay) closeOverlay();
 });
-overlaySearch.addEventListener("input", () => rebuildOverlay(overlaySearch.value));
+overlaySearch.addEventListener("input", () => rebuildOverlay(overlaySearch.value, true));
 overlaySearch.addEventListener("keydown", (e) => {
   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
     e.preventDefault();
@@ -8237,11 +8484,14 @@ window.addEventListener("message", (event) => {
         localTurnFiles.clear();
       }
       if (msg.sessionId) conversationSessionId = msg.sessionId;
-      if (msg.kind === "created" || msg.sessionId !== currentSessionId) { modelMarks = []; clearActiveCommand(); applyGoalState(null); }
+      if (msg.kind === "created" || msg.sessionId !== currentSessionId) {
+        modelMarks = [];
+        applyGoalState(null);
+      }
       if (Array.isArray(msg.slashCommands)) {
         slashCommands = msg.slashCommands.filter((command: { name?: string }) => typeof command?.name === "string" && command.name);
       }
-      attachComposerDraft(msg.sessionId ?? "");
+      attachComposerDraft(msg.sessionId ?? "", msg.kind === "created");
       currentSessionId = msg.sessionId ?? "";
       if (msg.title) setSessionTitle(msg.title);
       if (msg.kind === "created") holdStreams = false;
@@ -8356,7 +8606,7 @@ window.addEventListener("message", (event) => {
       referenceSessions = msg.referenceSessions ?? [];
       if (msg.notice === "initial" || msg.notice === "stale" || msg.notice === "ready") sessionListNotice = msg.notice;
       mentions.refresh();
-      currentSessionId = msg.currentId || currentSessionId;
+      // Only session_ready moves the composer and transcript to another session.
       {
         const current = sessions.find((s) => s.sessionId === currentSessionId);
         if (current?.title) setSessionTitle(current.title);
@@ -8369,6 +8619,7 @@ window.addEventListener("message", (event) => {
     case "history":
       if (msg.sessionId && msg.sessionId !== currentSessionId) break;
       if (typeof msg.viewGen === "number" && msg.viewGen !== viewGen) break;
+      confirmSubmittedSends(currentSessionId, msg.items ?? []);
       holdStreams = false;
       if (Array.isArray(msg.queue)) currentQueue = msg.queue;
       {
@@ -8461,11 +8712,20 @@ window.addEventListener("message", (event) => {
       if (!holdStreams) applyStoredConversation();
       break;
     case "query_rewound": {
+      detachedEditDrafts.delete(msg.commandId);
       const editor = submittedEditor(msg);
       if (editor && editor === sentQuestions().at(-1)) applyQueryRewind(editor, msg.text || "", readImageAttachments(msg.attachments));
+      else if (editor) cancelUserEdit(editor);
       break;
     }
     case "query_edit_rejected": {
+      const detached = detachedEditDrafts.get(msg.commandId);
+      if (detached) {
+        detachedEditDrafts.delete(msg.commandId);
+        recoverInput(detached);
+        showToast(msg.message || t("发送失败，内容已保留到草稿。"));
+        break;
+      }
       const editor = submittedEditor(msg);
       if (editor) {
         delete editor.dataset.editSubmissionId;
@@ -8485,6 +8745,7 @@ window.addEventListener("message", (event) => {
     case "user_input_echo":
       break;
     case "view_reset":
+      detachedEditDrafts.clear();
       sessionListRequestId = "";
       paintSessionListNotice();
       messageEpoch++;
@@ -8498,7 +8759,7 @@ window.addEventListener("message", (event) => {
       loadedHistory = [];
       historyTruncated = false;
       historyActiveSince = 0;
-      prepareComposerSwitch();
+      prepareComposerSwitch(msg.clear ? newChatDraftKey : msg.targetSessionId ?? "");
       currentQueue = undefined;
       queueZoneEl.replaceChildren();
       queueZoneEl.hidden = true;
@@ -8590,12 +8851,13 @@ window.addEventListener("message", (event) => {
       renderNewSessionSettings();
       break;
     case "setup":
+      if (typeof msg.viewGen === "number") viewGen = msg.viewGen;
       sessionConnected = false;
       workspaceRequired = false;
       clearStartupWait();
-      setStatus("warn", msg.reason || t("Setup needed"));
+      setStatus("warn", msg.planUnavailable ? t("当前套餐不可用") : msg.reason || t("Setup needed"));
+      showSetup(msg.reason || t("Setup needed"), msg.hint || "", msg.picker || [], msg.planUnavailable === true);
       updateComposerActions();
-      showSetup(msg.reason || t("Setup needed"), msg.hint || "", msg.picker || []);
       if (!messagesEl.querySelector(".message")) emptyState();
       break;
     case "workspace_required":
@@ -8679,7 +8941,7 @@ window.addEventListener("message", (event) => {
         settleWorkFolds("interrupted");
         settleReplyFooters();
         setStatus("error", t("ZCode process exited"));
-        if (!messagesEl.lastElementChild?.classList.contains("error")) addErrorMessage(msg.message || "ZCode process exited");
+        if (!messagesEl.lastElementChild?.classList.contains("error")) addErrorMessage(msg.message || "ZCode process exited", undefined, false);
       } else if (msg.status === "error") {
         clearStartupWait();
         setGenerating(false);
@@ -8698,7 +8960,25 @@ window.addEventListener("message", (event) => {
       else if (activityPhase === "sync") noteActivity("waiting");
       break;
     case "session_error":
+      if (typeof msg.viewGen === "number" && msg.viewGen !== viewGen) break;
       if (msg.sessionId && msg.sessionId !== currentSessionId) break;
+      if (msg.failedCreate || msg.failedSwitchTo) {
+        sessionConnected = false;
+        holdStreams = false;
+        if (msg.failedCreate) {
+          currentSessionId = "";
+        } else if (!draftSessionId) {
+          // Text typed during the handoff belongs to the requested session.
+          persistComposerDraft();
+          composerDrafts.takePending(msg.failedSwitchTo);
+          pendingDraftKey = "";
+          draftSessionId = currentSessionId;
+          restoreComposerDraft(composerDrafts.get(currentSessionId));
+          persistComposerDraft();
+          renderUnconfirmedSends();
+        }
+        updateComposerActions();
+      }
       clearStartupWait();
       setGenerating(false);
       removePendingEditPens();
@@ -8708,7 +8988,7 @@ window.addEventListener("message", (event) => {
         const text = msg.message || t("Session error");
         setStatus("error", t(errorGuidance(text).title));
         announce(t(errorGuidance(text).title));
-        addErrorMessage(text);
+        addErrorMessage(text, undefined, !msg.failedCreate && !msg.failedSwitchTo);
       }
       break;
     case "copied":
@@ -8733,7 +9013,12 @@ window.addEventListener("message", (event) => {
     }
     case "file_added": {
       persistComposerDraft(); const draft = composerDrafts.get(msg.sessionId);
-      if (!draft.chips.some(chip => chip.path === msg.chip.path)) draft.chips.push(msg.chip);
+      if (draft.chips.some(chip => chip.path === msg.chip.path)) break;
+      if (draft.chips.length >= MAX_MESSAGE_REFERENCES) {
+        if (msg.sessionId === draftSessionId) showToast(t("每条消息最多添加 {0} 个文件引用。", { 0: MAX_MESSAGE_REFERENCES }));
+        break;
+      }
+      draft.chips.push(msg.chip);
       composerDrafts.set(msg.sessionId, draft.text, draft.chips, draft.images, draft.sessionRefs, draft.skills, draft.agents, draft.planEnabled);
       if (msg.sessionId === draftSessionId) { explicitChips = draft.chips; renderComposerChips(); }
       vscode.setState({ ...(vscode.getState() ?? {}), composerDrafts: composerDrafts.serialize() }); break;
@@ -8796,11 +9081,17 @@ window.addEventListener("message", (event) => {
       break;
     }
     case "send_unconfirmed": {
+      if (msg.commandId && !pendingInputs.has(msg.commandId) &&
+          (!msg.sessionId || !submittedDrafts.has(submittedDraftKey(msg.sessionId, msg.commandId)))) break;
       if (msg.commandId) pendingInputs.delete(msg.commandId);
       renderUnconfirmedSends();
       if (holdStreams || msg.sessionId !== currentSessionId) break;
       const message = msg.message || t("发送状态未确认，请先查看当前对话。");
-      if (isGenerating && !msg.running) {
+      if (msg.insertion) {
+        queueCards().find(node => node.dataset.sourceCommandId === msg.commandId && node.dataset.queuePending === "1")?.remove();
+        queueZoneEl.hidden = !queueCards().length;
+        updateComposerActions();
+      } else if (isGenerating && !msg.running) {
         setGenerating(false);
         removePendingEditPens();
         settleWorkFolds("interrupted");
@@ -8830,14 +9121,21 @@ window.addEventListener("message", (event) => {
         showToast(t("发送失败，内容已保留到草稿。"));
       }
       break;
-    case "queue_admitted":
-      if (msg.commandId) pendingInputs.delete(msg.commandId);
+    case "queue_admitted": {
+      if (msg.commandId) {
+        const owner = pendingInputs.get(msg.commandId)?.sessionId || msg.sessionId;
+        pendingInputs.delete(msg.commandId);
+        if (owner && takeSubmittedDraft(submittedDraftKey(owner, msg.commandId))) renderUnconfirmedSends();
+      }
       if (msg.sessionId && msg.sessionId !== currentSessionId) break;
       for (const node of queueCards()) {
         if (node.dataset.sourceCommandId === msg.commandId) node.dataset.queuePending = "0";
       }
       break;
+    }
     case "queue_rejected": {
+      if (msg.keepDraft !== false && msg.commandId && !pendingInputs.has(msg.commandId) &&
+          (!msg.sessionId || !submittedDrafts.has(submittedDraftKey(msg.sessionId, msg.commandId)))) break;
       const node = [...queueCards(), ...messagesEl.querySelectorAll<HTMLElement>(".message.user")].find(node => node.dataset.sourceCommandId === msg.commandId);
       if (msg.keepDraft !== false) recoverInput(msg);
       if (node) node.remove();
@@ -8861,8 +9159,7 @@ window.addEventListener("message", (event) => {
       break;
     case "editorContext": break; // Context is now always explicitly selected.
     case "addChip":
-      if (msg.chip) {
-        addExplicitChip(msg.chip);
+      if (msg.chip && addExplicitChip(msg.chip)) {
         input.focus();
         showToast(t("已附加到对话"));
       }
@@ -8981,7 +9278,7 @@ document.addEventListener("visibilitychange", () => {
   else clearGreetingTimer();
 });
 window.addEventListener("blur", () => persistComposerDraft());
-restoreComposerDraft(composerDrafts.get(draftSessionId));
+restoreComposerDraft(composerDrafts.get(composerDraftKey()));
 updateComposerActions();
 emptyState();
 applySessionControls({ mode: currentMode });

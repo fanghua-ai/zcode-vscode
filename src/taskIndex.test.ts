@@ -102,6 +102,7 @@ function digest(file: string): string {
 test("native SQLite reads and durably updates ordinary task databases without snapshots", t => {
   const f = fixture(t), db = tasks(f.index);
   db.close();
+  questions(f.cli).close();
   const opened = observeNative(t);
   assert.deepEqual(loadTaskFlags("/project"), { archived: [], deleted: [] });
   setTaskArchived("/project", "session", true);
@@ -112,7 +113,7 @@ test("native SQLite reads and durably updates ordinary task databases without sn
     assert.deepEqual({ ...verify.prepare("SELECT archived,deleted FROM tasks").get() }, { archived: 0, deleted: 1 });
   } finally { verify.close(); }
   assert.ok(opened.length >= 4);
-  assert.ok(opened.every(open => open.file === f.index));
+  assert.ok(opened.every(open => open.file === f.index || open.file === f.cli));
   assert.deepEqual(fs.readdirSync(f.temp), []);
 });
 

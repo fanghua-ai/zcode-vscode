@@ -238,13 +238,14 @@ function writable(files: any) {
     setSessionDisplayTitle('/fixture', 's1', 'Renamed');
     if (!upsertDesktopTask({ workspacePath: '/fixture', sessionId: 'new-session', title: 'New session' }))
         throw new Error('upsert rejected');
+    setTaskArchived('/fixture', 's1', true);
     setTaskDeleted('/fixture', 's1');
     const index = new DatabaseSync(files.indexPath), cli = new DatabaseSync(files.cliPath);
     try {
         const row = index.prepare("SELECT deleted,archived,title FROM tasks WHERE task_id='s1'").get();
         const session = cli.prepare("SELECT title,time_archived FROM session WHERE id='s1'").get();
         const created = index.prepare("SELECT count(*) AS n FROM tasks WHERE task_id='new-session'").get();
-        if (!(row.deleted === 1 && row.archived === 0 && row.title === 'Renamed' && session.title === 'Renamed' && session.time_archived === null && created.n === 1))
+        if (!(row.deleted === 1 && row.archived === 0 && row.title === 'Renamed' && session.title === 'Renamed' && session.time_archived > 0 && created.n === 1))
             throw new Error('write persistence mismatch');
     }
     finally {

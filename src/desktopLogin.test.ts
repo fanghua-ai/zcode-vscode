@@ -6,6 +6,7 @@ import {
   localLoginCanOverlapSpawn,
   mergePickerModels,
   readPlanSelection,
+  desktopFamilyFingerprint,
   resolvePickerModels,
   sameDesktopLogin,
 } from "./desktop";
@@ -370,4 +371,12 @@ test("desktop inventory keeps its last verified state during failed reads and re
     os.homedir = () => path.join(home,"other");
     assert.equal((await readPickerResolution()).providerInventoryAuthoritative,false);
   } finally {os.homedir=original;fs.rmSync(home,{recursive:true,force:true});}
+});
+
+test("desktop selection changes with the plan, team project and legacy selected key", () => {
+  const fingerprint = (selection: {kind: string; projectId?: string}) =>
+    desktopFamilyFingerprint({ providerFamilyDomain: "bigmodel", providerFamilyConnectionSelections: { bigmodel: selection } });
+  assert.equal(new Set([fingerprint({kind:"start-plan"}), fingerprint({kind:"individual-coding-plan"}),
+    fingerprint({kind:"team-coding-plan",projectId:"A"}), fingerprint({kind:"team-coding-plan",projectId:"B"})]).size, 4);
+  assert.notEqual(desktopFamilyFingerprint(teamSettings), desktopFamilyFingerprint({...teamSettings, modelProviderFamilySelectedKeys:{bigmodel:"legacy-key"}}));
 });

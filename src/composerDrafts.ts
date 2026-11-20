@@ -113,13 +113,9 @@ export class ComposerDrafts {
     return this.get(id);
   }
 
-  takePending(id: string): ComposerDraft {
-    if (id) {
-      const pending = this.get("");
-      this.drafts.delete("");
-      if (pending.planEnabled || pending.text || pending.chips.length || pending.sessionRefs?.length || pending.images?.length || pending.skills?.length || pending.agents?.length) this.recover(id, pending);
-    }
-    return this.get(id);
+  takePending(id: string, pendingId = ""): ComposerDraft {
+    const pending = id && id !== pendingId ? this.take(pendingId) : undefined;
+    return pending ? this.recover(id, pending) : this.get(id);
   }
 
   serialize(): Record<string, ComposerDraft> {

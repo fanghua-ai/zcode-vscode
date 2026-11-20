@@ -77,7 +77,7 @@ try {
         sessionStorage.setItem('request',JSON.stringify(request));
         check(input.value==='B retained draft'&&document.getElementById('unconfirmed-sends').hidden,'unconfirmed A send appeared in B');
         reload(4);
-      }else{
+      }else if(phase===4){
         ready('reload-B',1);
         check(document.getElementById('unconfirmed-sends').hidden,'unconfirmed A send appeared in B on reload');
         change('reload-A',2);
@@ -97,6 +97,18 @@ try {
         document.getElementById('send-btn').click();const accepted=sent.find(m=>m.type==='send');
         emit({type:'send_admitted',commandId:accepted.commandId,sessionId:'reload-A'});
         check(Object.keys(savedState.submittedDrafts).length===0,'confirmed send left a recovery copy');
+        emit({type:'session_ready',sessionId:'reload-A',slashCommands:[{name:'goal',description:'Goal'}]});
+        input.focus();type('/go');
+        input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+        type('Finish the release');
+        check(savedState.composerDrafts['reload-A'].text==='/goal Finish the release','goal was not saved in the draft');
+        reload(5);
+      }else{
+        ready('reload-A',1);
+        check(!document.getElementById('active-command').hidden,'session readiness cleared the restored command');
+        document.getElementById('send-btn').click();
+        const sends=sent.filter(m=>m.type==='send');
+        check(sends.length===1&&sends[0].sessionId==='reload-A'&&sends[0].text==='/goal Finish the release','restored goal was sent as plain text');
         check(errors.length===0,'browser errors');
         const pre=document.createElement('pre');pre.id='reload-results';pre.textContent=JSON.stringify({pass:true,checks:count});document.body.appendChild(pre);
       }
@@ -114,7 +126,7 @@ try {
   assert.ok(match, result.stdout.slice(-3000));
   const report = JSON.parse(match[1].replaceAll("&quot;", '"').replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&"));
   assert.equal(report.pass, true, report.error);
-  console.log(`Browser draft reload passed: 4 real page reloads, ${report.checks} checks.`);
+  console.log(`Browser draft reload passed: 5 real page reloads, ${report.checks} checks.`);
 } finally {
   await rm(root, { recursive: true, force: true });
 }

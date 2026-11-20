@@ -35,6 +35,7 @@ interface Internals {
   pendingUserInputs: Map<string, UserInputRequest>;
   pending: Map<number | string, unknown>;
   sendRequest: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
+  failPending: (error: Error) => void;
   write: (message: unknown) => void;
   handleLine: (line: string) => void;
   afterSessionAttached: () => Promise<void>;
@@ -44,7 +45,8 @@ interface Internals {
   handleConversationFrame: (event: unknown) => void;
   handleStateUpdated: (event: unknown) => void;
   subscribeConversation: () => Promise<void>;
-  createSession: (applyModel: boolean) => Promise<void>;
+  createSession: (applyModel: boolean, defaults?: import("./newSessionDefaults").NewSessionDefaults,
+    requiredModel?: import("./newSessionDefaults").SessionModelChoice) => Promise<void>;
   applyNewSessionDefaults: (defaults: NewSessionDefaults) => Promise<void>;
   setModel: (providerId: string, modelId: string) => Promise<void>;
   openStartupSession: (opts?: {
@@ -1309,8 +1311,9 @@ test("session_ready carries the snapshot's builtin and custom slash commands", a
     return { sessions: [], messages: [] };
   };
   try {
-    await state.createSession(true);
+    await client.newSession(undefined, undefined, 10);
     const ready = events.find(event => event.type === "session_ready");
+    assert.equal((ready?.data as { viewGen?: number }).viewGen, 10);
     assert.deepEqual(client.confirmedModel(), { providerId: "test-provider", modelId: "test-model" });
     assert.deepEqual((ready?.data as { slashCommands?: unknown }).slashCommands, [
       { name: "goal", description: "Show or set the current session goal.", inputHint: "/goal [objective]" },
@@ -2710,6 +2713,39 @@ for (const availableStart of [true, false]) {
   });
 }
 
+for (const accepted of [true, false]) {
+  for (const subsequent of [false, true]) {
+    test(`API-key recovery requires its selected model (subsequent=${subsequent}, accepted=${accepted})`, async () => {
+      const { client, state, events } = fixture();
+      const desired = { providerId: "deepseek", modelId: "deepseek-v4-pro" };
+      const stale = subsequent ? { providerId: "other-paid", modelId: "other-model" } : { providerId: "account:bigmodel-individual-coding-plan", modelId: "GLM-5.3" };
+      client.setDefaultRuntime({ ...desired, providerName: "DeepSeek", kind: "openai-compatible",
+        baseURL: "https://example.test", apiKey: "TEST-DEEPSEEK", models: { [desired.modelId]: {} }, source: "vscode-override" });
+      state.subscribeConversation = async () => {};
+      const selections: unknown[] = [];
+      state.sendRequest = async (method, params) => {
+        if (method === "session/create") return { session: { sessionId: "NEW_RECOVERY" } };
+        if (method === "session/subscribe") return { snapshot: { settings: { model: { current: stale, available: subsequent ? [{ref: stale}] : [] } } } };
+        if (method === "v4/command") {
+          const { provider, model } = (params as { payload: { provider: string; model: string } }).payload;
+          selections.push({ providerId: provider, modelId: model });
+          if (!accepted) throw new Error("Requested API-key model is unavailable");
+          return { status: "accepted" };
+        }
+        return {};
+      };
+      try {
+        const operation = subsequent ? client.newSession({ model: desired }, desired) : state.createSession(true, { model: desired }, desired);
+        if (accepted) await operation;
+        else await assert.rejects(operation, /Requested API-key model is unavailable/);
+        assert.deepEqual(selections, [desired]);
+        assert.equal(events.some(event => event.type === "session_ready"), accepted);
+        if (accepted) assert.deepEqual(client.confirmedModel(), desired);
+      } finally { client.dispose(); }
+    });
+  }
+}
+
 for (const current of [true, false]) {
   test(`new account session uses workspace registry instead of absent builtin provider (${current ? "current" : "available"})`, async () => {
     const {client,state,events}=fixture();
@@ -3465,6 +3501,47 @@ for (const started of [undefined, { type: "turn.started", sessionId: "A" }, { ty
     } finally { client.dispose(); }
   });
 }
+
+for (const queued of [false, true]) test(`v4 ${queued ? "queued" : "immediate"} send preserves the UI command ID and distinguishes a missing acknowledgement`, async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { client, state } = fixture();
+  const requests: ZCodeRequest[] = [];
+  state.liveModelReady = true;
+  Object.assign(state, { replica: { topic: "conversation/A", seq: 1 } });
+  state.write = request => requests.push(request as ZCodeRequest);
+  try {
+    const sending = assert.rejects(queued
+      ? client.insertQueuedMessage("hello", { commandId: "ui-send" })
+      : client.sendMessage("hello", [], "ui-send"), SendStatusUnknownError);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].method, "v4/command");
+    assert.equal((requests[0].params as { commandId: string }).commandId, "ui-send");
+    t.mock.timers.tick(30_000);
+    await sending;
+    state.handleLine(JSON.stringify({ id: requests[0].id, result: { status: "accepted" } }));
+    assert.equal(requests.length, 1);
+  } finally { client.dispose(); }
+});
+
+for (const reason of ["exit", "dispose"]) test(`disconnect before acknowledgement is unconfirmed (${reason})`, async () => {
+  const { client, state } = fixture();
+  const writes: ZCodeRequest[] = [];
+  state.write = request => writes.push(request as ZCodeRequest);
+  try {
+    const legacySend = assert.rejects(state.sendRequest("session/send", { sessionId: "A" }), SendStatusUnknownError);
+    const v4Send = assert.rejects(state.sendRequest("v4/command", { type: "sendText", sessionId: "A" }), SendStatusUnknownError);
+    const metadata = assert.rejects(state.sendRequest("v4/command", { type: "switchModelConfig", sessionId: "A" }), error => {
+      assert.ok(error instanceof Error && !(error instanceof SendStatusUnknownError));
+      return true;
+    });
+    assert.equal(writes.length, 3);
+    if (reason === "dispose") client.dispose();
+    else state.failPending(new Error("ZCode process exited"));
+    await Promise.all([legacySend, v4Send, metadata]);
+    assert.equal(state.pending.size, 0);
+  } finally { if (reason !== "dispose") client.dispose(); }
+});
 
 test("a failed stop does not continue into editUserQuery", async () => {
   const { client, state } = fixture();

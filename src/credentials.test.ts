@@ -5,8 +5,10 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { type V2Provider, usesProjectTokens, usesLegacyPlanKeys, tryPlanOAuth, fetchPlanQuota, readStartPlanAccess, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey, pickOrgAndProject, planAuthErrorDetails } from "./credentials";
 import { readDesktopJsonWithRetry } from "./desktopJson";
-import { mergeDesktopApiProviders, syncCliConfig, resolveProviderRequestAuth, resolveRuntime, resolveRuntimeForSession } from "./desktop";
+import { isSessionModelAvailable, mergeDesktopApiProviders, syncCliConfig, resolveProviderRequestAuth, resolveRuntime, resolveRuntimeForSession } from "./desktop";
 import { ZCodeClient } from "./zcodeClient";
+import { ZCodeViewProvider } from "./extension";
+import type { ExtensionContext } from "vscode";
 
 const os = require("os") as typeof import("os");
 const writableFs = require("fs") as typeof import("fs");
@@ -693,8 +695,13 @@ for (const failure of ["no-entitlement", "expired", "pending", "other-account", 
     const resolved = await resolveRuntime({ appVersion: "3.17.2" });
     assert.equal(resolved.ok, false);
     assert.equal(resolved.accountPlanUnavailable, true);
+    assert.equal(resolved.planUnavailable, ["no-entitlement", "expired", "pending"].includes(failure));
+    assert.deepEqual(resolved.picker.map(({ providerId, access }) => [providerId, access]), [["paid", "api-key"]]);
     assert.equal(api.requests.some(request => request.path.includes("api_keys") || request.path.includes("subscription/list")), false);
     if (failure === "other-account" || failure === "no-jwt") assert.equal(api.requests.length, 0);
+    const model = {providerId: "builtin:bigmodel-start-plan", modelId: "GLM-5.3-Flash"};
+    assert.equal(await resolveRuntimeForSession(model, "3.17.2"), resolved.planUnavailable ? false : null);
+
   });
 }
 
@@ -863,7 +870,7 @@ test("Start Plan request headers use the current desktop login and stop after si
     [[true, "TEST-ROTATED-JWT"], [false, undefined]]);
 });
 
-test("missing selection with no entitlements fails even when personal key exchange succeeds", async t => {
+test("missing selection with no personal entitlement and no Start credential requires login", async t => {
   const dir = fixture(t);
   fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-OAUTH" }));
   fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: "bigmodel" }));
@@ -876,7 +883,119 @@ test("missing selection with no entitlements fails even when personal key exchan
   const resolved = await resolveRuntime();
   assert.equal(resolved.ok, false);
   assert.equal(resolved.accountPlanUnavailable, true);
+  assert.equal(resolved.planUnavailable, false, "missing Start credentials cannot confirm Start entitlement");
 });
+
+for (const selection of ["desktop selection", "old CLI default"] as const) {
+  test(`an expired account with a ${selection} offers only models backed by API keys`, async t => {
+    const dir = fixture(t);
+    const personal = "account:bigmodel-individual-coding-plan";
+    fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+      "oauth:active_provider": "bigmodel", "oauth:bigmodel:access_token": "TEST-OAUTH", zcodejwttoken: "TEST-JWT",
+    }));
+    fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({
+      providerFamilyDomain: "bigmodel",
+      ...(selection === "desktop selection" ? { providerFamilyConnectionSelections: { bigmodel: { kind: "individual-coding-plan" } } } : {}),
+    }));
+    const builtin = path.join(dir, "runtime/provider/test/zcode-builtin.json");
+    fs.mkdirSync(path.dirname(builtin), { recursive: true });
+    fs.writeFileSync(builtin, JSON.stringify({ config: { providerConfigRules: { providerRules: [
+      { providerId: personal, providerName: "BigModel Individual Coding Plan",
+        config: { builtinModelIds: ["GLM-5.3", "GLM-5.3-Flash"] } },
+    ] } } }));
+    const cli = path.join(path.dirname(dir), "cli/config.json");
+    fs.mkdirSync(path.dirname(cli), { recursive: true });
+    fs.writeFileSync(cli, JSON.stringify({ model: `${personal}/GLM-5.3` }));
+    fs.writeFileSync(path.join(dir, "provider_config.json"), JSON.stringify({ config: { providerConfigRules: { providerRules: [
+      { providerId: "deepseek", providerName: "DeepSeek", config: {
+        access: { type: "api-key", apiKey: "TEST-DEEPSEEK" },
+        api: { type: "openai-chat-completions", baseUrl: "https://deepseek.example.test" },
+        modelOrder: ["deepseek-flash", "deepseek-v4-pro"],
+      } },
+      { providerId: "another", providerName: "Another", config: {
+        access: { type: "api-key", apiKey: "TEST-ANOTHER" },
+        api: { type: "anthropic-messages", baseUrl: "https://another.example.test" },
+        modelOrder: ["another-model"],
+      } },
+    ] } } }));
+    const api = mockPlanQuotaApi(t);
+    api.respond((requestPath, payload) => ({
+      payload: requestPath === "/api/biz/subscription/list" ? { code: 200, data: [] }
+        : requestPath.includes("billing/balance") ? { code: 0, data: {
+          server_time: 2000000000, plans: [{ plan_id: "zcode-v3-start-plan", status: "active", ends_at: 1900000000 }], balances: [],
+        } } : payload,
+    }));
+    const appVersion = "3.18.2";
+    const result = await resolveRuntime({ appVersion });
+    assert.equal(result.ok, false);
+    assert.equal(result.planUnavailable, true);
+    assert.ok(api.requests.some(request => request.path.includes("billing/balance")));
+    assert.deepEqual(result.picker.map(({ providerId, modelId, access }) => [providerId, modelId, access]), [
+      ["deepseek", "deepseek-flash", "api-key"], ["deepseek", "deepseek-v4-pro", "api-key"], ["another", "another-model", "api-key"],
+    ]);
+    assert.doesNotMatch(JSON.stringify(result.picker), /TEST-(?:DEEPSEEK|ANOTHER)/);
+
+    // Keep the window open with the login from before expiry. Neither a
+    // stale menu selection nor New Chat may reach the corresponding RPC.
+    const current = { providerId: "deepseek", modelId: "deepseek-flash" };
+    const calls: string[] = [];
+    const posted: Array<{type: string; planUnavailable?: boolean; picker?: unknown[]}> = [];
+    const provider = new ZCodeViewProvider({ subscriptions: [], workspaceState: {get() {}},
+      globalState: {get() {}} } as unknown as ExtensionContext);
+    const client = {
+      currentSessionId: "sess_existing", isGenerating: () => false, confirmedModel: () => current,
+      prepareViewChange: async () => {}, endViewChange() {}, setModel: async () => { calls.push("switch"); },
+      newSession: async () => { calls.push("create"); },
+    };
+    Object.assign(provider, { client, desktopAppVersion: appVersion, currentModel: current,
+      runtime: { providerId: personal, modelId: "GLM-5.3", source: "desktop-personal-oauth" },
+      post: (msg: typeof posted[number]) => posted.push(msg), pushModels: async () => {}, pushSessionState: async () => {} });
+    await (provider as unknown as {selectModel(id: string, model: string): Promise<void>}).selectModel(personal, "GLM-5.3");
+    await provider.newSession();
+    assert.equal(calls.length, 0);
+    assert.equal(posted.some(msg => msg.type === "view_reset"), false);
+    const setup = posted.find(msg => msg.type === "setup");
+    assert.equal(setup?.planUnavailable, true);
+    assert.deepEqual(setup?.picker, result.picker);
+
+
+    api.requests.length = 0;
+    const picked = await resolveRuntime({
+      appVersion, strictPreferredProvider: true, preferredProviderId: "deepseek", preferredModelId: "deepseek-v4-pro",
+    });
+    assert.equal(picked.runtime?.modelId, "deepseek-v4-pro");
+    assert.equal(picked.runtime?.apiKey, "TEST-DEEPSEEK");
+    assert.equal(api.requests.length, 0);
+
+    // After explicit recovery, subsequent chats must validate that same key;
+    // removing it must not silently choose the other metered provider.
+    const recoveryModel = { providerId: "deepseek", modelId: "deepseek-v4-pro" };
+    Object.assign(provider, { recoveryModel, runtime: picked.runtime });
+    Object.assign(client, { setDefaultRuntime() {}, currentSessionId: null,
+      newSession: async (defaults: {model?: unknown}, required: unknown) => {
+        assert.deepEqual(defaults.model, recoveryModel);
+        assert.deepEqual(required, recoveryModel);
+        calls.push("create with chosen key");
+      } });
+    await provider.newSession();
+    const providerFile = path.join(dir, "provider_config.json");
+    const originalProviders = fs.readFileSync(providerFile);
+    fs.writeFileSync(providerFile, JSON.stringify({config:{providerConfigRules:{providerRules:[]}}}));
+    await provider.newSession();
+    assert.deepEqual(calls, ["create with chosen key"]);
+    assert.equal(posted.filter(msg => msg.type === "setup").length, 2);
+
+    fs.writeFileSync(providerFile, originalProviders);
+    Object.assign(provider, { recoveryModel });
+    Object.assign(client, { currentSessionId: "NEW", dispose() { calls.push("dispose"); },
+      newSession: async () => { throw new Error("Backend rejected the recovered model"); } });
+    posted.length = 0;
+    await provider.newSession();
+    assert.equal(calls.at(-1), "dispose");
+    assert.equal(posted.some(msg => msg.type === "session_ready"), false);
+    assert.deepEqual(posted.find(msg => msg.type === "setup")?.picker, result.picker);
+  });
+}
 
 for (const family of ["bigmodel", "zai"] as const) {
   for (const selection of [undefined, "start-plan", "individual-coding-plan"] as const) {
@@ -936,13 +1055,115 @@ for (const family of ["bigmodel", "zai"] as const) {
       const savedPersonal = await resolveRuntime({ appVersion: "3.17.2",
         preferredProviderId: `builtin:${family}-coding-plan`, preferredModelId: "GLM-5.3" });
       assert.equal(savedPersonal.runtime?.providerId, `builtin:${family}-start-plan`, "stale new-session personal defaults must not hide Start Plan");
-      assert.equal(await resolveRuntimeForSession({ providerId: `builtin:${family}-coding-plan`, modelId: "GLM-5.3" }, "3.17.2"), null,
-        "resuming a personal Coding Plan session must not silently substitute Start Plan");
+      assert.equal(await resolveRuntimeForSession({ providerId: `builtin:${family}-coding-plan`, modelId: "GLM-5.3" }, "3.17.2"), false,
+        "confirmed absence of a personal plan must block that model without substituting Start Plan");
       const restored = await resolveRuntimeForSession({ providerId: `account:${family}-start-plan`, modelId: "GLM-5.3-Flash" }, "3.17.2");
       assert.ok(restored, "lowercase balance capability must allow restoring a saved canonical model");
       assert.equal(restored.modelId, "GLM-5.3-Flash");
-      assert.equal(await resolveRuntimeForSession({ providerId: `account:${family}-start-plan`, modelId: "GLM-5.3" }, "3.17.2"), null,
-        "an existing session must not silently substitute a model absent from Start entitlements");
+      assert.equal(await resolveRuntimeForSession({ providerId: `account:${family}-start-plan`, modelId: "GLM-5.3" }, "3.17.2"), false,
+        "a model absent from the confirmed Start entitlement list must be unavailable");
+
+      api.respond((p, payload) => p.includes("billing/balance") ? { status: 503, payload: {} }
+        : { payload: p.includes("subscription/list") ? { code: 200, data: [] } : payload });
+      for (const preferredProviderId of [undefined, `builtin:${family}-coding-plan`]) {
+        const retry = await resolveRuntime({ appVersion: "3.17.2", preferredProviderId });
+        assert.equal(retry.ok, false);
+        assert.equal(retry.planUnavailable, false);
+        assert.equal(retry.failedStartPlanFamily, family);
+      }
+
+      const calls: string[] = [];
+      const provider = new ZCodeViewProvider({ subscriptions: [], globalState: {get() {}},
+        workspaceState: {get() {}} } as unknown as ExtensionContext);
+      Object.assign(provider, { runtime: resolved.runtime, desktopAppVersion: "3.17.2", pushSessionState: async () => {},
+        client: { prepareViewChange: async () => {}, endViewChange() {}, setDefaultRuntime(runtime: unknown) {
+          assert.equal(runtime, resolved.runtime);
+        }, newSession: async () => { calls.push("create"); } },
+        post: (msg: {type: string}) => { if (msg.type === "setup") calls.push("setup"); } });
+      await provider.newSession();
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+        "oauth:active_provider": family, [`oauth:${family}:access_token`]: "TEST-OAUTH", zcodejwttoken: "OTHER-START-JWT",
+      }));
+      await provider.newSession();
+      assert.deepEqual(calls, ["create", "setup"], "only the previously verified Start login may continue after 503");
+    });
+  }
+  for (const scenario of ["balance offline", "model replaced", "replacement rejected"] as const) {
+    test(`${family} new Start chat through first send: ${scenario}`, async t => {
+      const dir = fixture(t);
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+        "oauth:active_provider": family, zcodejwttoken: "TEST-START-JWT",
+      }));
+      fs.writeFileSync(path.join(dir, "setting.json"), JSON.stringify({ providerFamilyDomain: family,
+        providerFamilyConnectionSelections: { [family]: { kind: "start-plan" } },
+      }));
+      const api = mockPlanQuotaApi(t);
+      const original = { providerId: `account:${family}-start-plan`, modelId: "GLM-5.3-Flash" };
+      const replacement = { ...original, modelId: "GLM-5.3" };
+      let entitledModel = original.modelId;
+      let offline = false;
+      api.respond((p, payload) => {
+        if (!p.includes("billing/balance")) return { payload };
+        if (offline) return { status: 503, payload: {} };
+        return { payload: { code: 0, data: {
+          plans: [{ user_plan_id: "start", plan_id: "zcode-v3-start-plan", status: "active" }],
+          balances: [{ user_plan_id: "start", capabilities: ["model:" + entitledModel.toLowerCase()] }],
+        } } };
+      });
+      const appVersion = "3.17.2";
+      const initial = await resolveRuntime({ appVersion });
+      assert.ok(initial.runtime);
+      offline = scenario === "balance offline";
+      if (!offline) entitledModel = replacement.modelId;
+      let current = offline ? { providerId: `account:${family}-individual-coding-plan`, modelId: "GLM-5.3" } : original;
+      const snapshot = () => ({ session: { sessionId: "NEW" }, settings: {
+        model: { current, available: [{ ref: original }] },
+      } });
+      const switches: typeof original[] = [];
+      const sends: typeof original[] = [];
+      const client = new ZCodeClient({ binaryPath: "/unused", workspacePath: "/test", runtime: initial.runtime,
+        resolveSessionRuntime: m => resolveRuntimeForSession(m, appVersion), isSessionModelAvailable, onEvent() {} });
+      t.after(() => client.dispose());
+      Object.assign(client, {
+        subscribeConversation: async () => {}, startPlanQuota() {}, refreshSkillCatalog() {}, refreshSubagentCatalog() {},
+        sendRequest: async (method: string, params: {type?: string; payload?: {provider: string; model: string}}) => {
+          if (method === "session/create") return { session: { sessionId: "NEW" } };
+          if (method === "session/subscribe") return { snapshot: snapshot() };
+          if (method === "session/read") return snapshot();
+          if (method === "v4/command" && params.type === "switchModelConfig") {
+            const target = { providerId: params.payload!.provider, modelId: params.payload!.model };
+            switches.push(target);
+            if (scenario === "replacement rejected") throw new Error("Model unavailable in workspace");
+            current = target;
+            return { status: "accepted" };
+          }
+          if (method === "session/send" || (method === "v4/command" && params.type === "sendText")) sends.push(current);
+          return {};
+        },
+      });
+      const view = new ZCodeViewProvider({ subscriptions: [], globalState: {get() {}},
+        workspaceState: {get() {}} } as unknown as ExtensionContext);
+      let offeredModels: string[] | undefined;
+      Object.assign(view, { client, runtime: initial.runtime, desktopAppVersion: appVersion,
+        newSessionDefaults: () => ({ model: original }), rememberSession() {}, pushSessionState: async () => {},
+        post(msg: {type: string; needsSelection?: boolean; available?: {modelId: string}[]}) {
+          if (msg.type === "models" && msg.needsSelection) offeredModels = msg.available?.map(m => m.modelId);
+        } });
+      const expected = offline ? original : replacement;
+      if (scenario === "replacement rejected") {
+        await assert.rejects(view.newSession());
+        await assert.rejects(client.sendMessage("test"));
+        await assert.rejects(client.insertQueuedMessage("queued"));
+        assert.deepEqual(sends, []);
+        assert.deepEqual(offeredModels, [replacement.modelId]);
+      } else {
+        await view.newSession();
+        await client.sendMessage("test");
+        assert.deepEqual(client.confirmedModel(), expected);
+        assert.deepEqual(sends, [expected]);
+      }
+      assert.ok(switches.length > 0);
+      for (const target of switches) assert.deepEqual(target, expected);
     });
   }
   test(`${family} Start Plan uses the ZCode JWT balance buckets`, async t => {
@@ -1287,6 +1508,23 @@ for (const data of [
 }
 
 
+for (const family of ["bigmodel", "zai"] as const) test(`${family} request-time legacy login exchanges only when the stored key was rejected`, async t => {
+  const dir = fixture(t);
+  const providerId = `account:${family}-individual-coding-plan`;
+  const stored = "TEST-STORED-LEGACY-KEY";
+  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+    [`oauth:${family}:access_token`]: "TEST-OAUTH",
+    [`account-provider:coding-plan:${providerId}:account:old:api-key`]: stored,
+  }));
+  const { requests } = mockPlanQuotaApi(t);
+  assert.equal((await resolveProviderRequestAuth(providerId, "3.14.4"))?.apiKey, stored);
+  assert.equal(requests.length, 0);
+  const fingerprint = crypto.createHash("sha256").update(stored).digest("hex");
+  assert.equal((await resolveProviderRequestAuth(providerId, "3.14.4", fingerprint))?.apiKey,
+    "TEST-PERSONAL-KEY-ID.TEST-ONLY-SECRET");
+  assert.equal(requests.filter(request => request.path.endsWith("/api_keys")).length, 1);
+});
+
 for (const version of ["3.14.4", "3.15.1", "3.16.2"]) {
   test(`runtime and request-time login select the correct authentication for desktop ${version}`, async t => {
     const dir = fixture(t);
@@ -1471,7 +1709,7 @@ for (const stale of [false, true]) {
   for (const [type, kind] of [["openai-chat-completions", "openai-compatible"], ["anthropic-messages", "anthropic"], ["openai-responses", "openai"]]) {
     test(`chat uses current ${type} credentials and endpoint with ${stale ? "stale" : "no"} legacy config`, async t => {
       const dir = fixture(t);
-      const providerId = "new-provider";
+      const providerId = stale ? "example-coding-plan" : "example-start-plan";
       const legacy: Record<string, V2Provider> = stale ? { [providerId]: {
         kind: "openai-compatible", options: { apiKey: "TEST-OLD-KEY", baseURL: "https://old.example.test/v1" },
         models: { "old-model": {} },

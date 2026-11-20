@@ -30,6 +30,7 @@ import {
   localLoginCanOverlapSpawn,
   readPickerResolution,
   registeredStartPlanProvider,
+  isAccountPlanProvider,
   isSessionModelAvailable,
   resolveRuntime,
   resolveRuntimeForSession,
@@ -38,7 +39,7 @@ import {
   type ResolveResult,
 } from "./desktop";
 import { disposeLog, getLog, logDebug, logError, logInfo, logWarn, readRedactedLog } from "./log";
-import { parseWebviewMessage } from "./webviewMessages";
+import { MAX_MESSAGE_TEXT, parseWebviewMessage } from "./webviewMessages";
 import { desktopPluginForSkill, withDesktopPluginSkillPrompts } from "./desktopPluginSkillPrompts";
 import {
   MATH_FONT_VERSION, MATH_FONTS_SHA256, formulaFontMode, installMathFontPack,
@@ -52,7 +53,7 @@ import { materializeGitDiff, type StructuredPatch } from "./conversation";
 import { DiffDocuments } from "./diffDocuments";
 import { sameWorkspacePath, preferredWorkspacePath } from "./workspacePath";
 import { normalizeNewSessionDefaults, type NewSessionDefaults, type SessionModelChoice } from "./newSessionDefaults";
-import { desktopLoginCredentialIssue, readConfiguredProviderApiKey, readV2Config, readV2Settings, setDesktopCredentialBinary, v2Dir } from "./credentials";
+import { desktopLoginCredentialIssue, readConfiguredProviderApiKey, readStartPlanAuth, readV2Config, readV2Settings, setDesktopCredentialBinary, v2Dir } from "./credentials";
 import { BUILTIN_QUOTA_ADAPTERS, buildQuotaAdapterRegistry, fetchQuotaAdapter, quotaSecretStorageKey, type QuotaAdapterConfig } from "./quotaAdapters";
 import {
   loadTaskFlags,
@@ -64,6 +65,8 @@ import {
   setTaskArchived,
   setTaskDeleted,
   upsertDesktopTask,
+  indexListedDesktopTasks,
+  type DesktopTask,
   listSessionQuestions,
   nativeSqliteAvailable,
   disposeSqliteSnapshots,
@@ -412,6 +415,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private viewMessageListener?: vscode.Disposable;
   private viewDisposeListener?: vscode.Disposable;
   private starting: Promise<void> | null = null;
+  private disposed = false;
   private mathFontTask?: Promise<void>;
   private mathFontPhase: "idle" | "downloading" | "failed" = "idle";
   private mathFontCssCache?: { key: string; css: string };
@@ -426,9 +430,15 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private readSessionQuestions: (sessionId: string) => SessionQuestion[] = listSessionQuestions;
   private runtime: ResolvedRuntime | null = null;
   private startPlanModelProvider?: string;
+  private recoveringAccountPlan = false;
+  private recoveryModel?: SessionModelChoice;
 
   private setResolvedRuntime(runtime: ResolvedRuntime): void {
     this.runtime = runtime;
+    if (isAccountPlanProvider(runtime.providerId)) {
+      this.recoveringAccountPlan = false;
+      this.recoveryModel = undefined;
+    }
     this.startPlanModelProvider = registeredStartPlanProvider(this.appServerPath, runtime.providerId);
   }
   private sessions: SessionSummary[] = [];
@@ -496,6 +506,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private switchTicket = 0;
+  private failedViewChange?: { type: "session_error"; viewGen: number; message: string; failedSwitchTo?: string; failedCreate?: boolean };
+  private currentViewReset?: { type: "view_reset"; viewGen: number; clear?: true; targetSessionId?: string };
 
   private viewScope(): () => boolean {
     const client = this.client;
@@ -638,7 +650,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private newSessionDefaults(): NewSessionDefaults {
-    return normalizeNewSessionDefaults(this.context.globalState?.get<unknown>(NEW_SESSION_DEFAULTS_KEY));
+    const defaults = normalizeNewSessionDefaults(this.context.globalState?.get<unknown>(NEW_SESSION_DEFAULTS_KEY));
+    if (defaults.model && this.recoveringAccountPlan && isAccountPlanProvider(defaults.model.providerId)) {
+      delete defaults.model;
+    }
+    return defaults;
   }
 
   private pushNewSessionDefaults(): void {
@@ -895,6 +911,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         void operation.then(commandId => {
           this.post({ type: "queue_admitted", commandId, sessionId });
         }).catch(e => {
+          if (e instanceof SendStatusUnknownError) {
+            this.post({ type: "send_unconfirmed", commandId: msg.queueItemId, sessionId,
+              message: userFacingError(e), running: e.running, insertion: true });
+            return;
+          }
           logError("insert message failed", e);
           if (msg.planMode && !planModeApplied && client && client === this.client && sessionId === client.currentSessionId) {
             this.post({ type: "session_controls", ...client.confirmedControls() });
@@ -1095,9 +1116,17 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         if (this.starting) await this.starting;
         if (!this.client) await this.startZCode();
         else if (this.pushedEpoch !== this.webviewEpoch) {
-          await this.pushSessionState({ forceHistory: true });
-          this.client?.refreshSkillCatalog();
-          this.client?.refreshSubagentCatalog();
+          const reset = this.currentViewReset;
+          const failure = this.failedViewChange?.viewGen === this.switchTicket ? this.failedViewChange : undefined;
+          if (reset?.viewGen === this.switchTicket && (this.client.viewChanging || failure)) {
+            // Restore the handoff, including any failure already delivered to the old page.
+            this.post(reset);
+            if (failure) this.post(failure);
+          } else {
+            await this.pushSessionState({ forceHistory: true });
+            this.client?.refreshSkillCatalog();
+            this.client?.refreshSubagentCatalog();
+          }
         }
         this.pushEditorContext();
         this.contextViewReady = true;
@@ -1196,7 +1225,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
             this.sendTiming.mark(timingId, "promptPreparedMs");
             const sentSessionId = sessionId ?? client.currentSessionId ?? "";
             const hadPriorUserMessage = this.sessionsWithUserMessages.has(sentSessionId);
-            await client.sendMessage(prompt, readImageAttachments(msg.attachments));
+            await client.sendMessage(prompt, readImageAttachments(msg.attachments), msg.commandId);
             this.sendTiming.admitted(timingId);
             this.flushSwitchBanner(sentSessionId, hadPriorUserMessage);
             if (sentSessionId) this.sessionsWithUserMessages.add(sentSessionId);
@@ -1276,11 +1305,14 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           });
         }
         break;
-      case "selectModel":
-        if (msg.providerId && msg.modelId) {
-          await this.selectModel(msg.providerId, msg.modelId, !!msg.restart);
-        }
+      case "selectModel": {
+        if (!msg.providerId || !msg.modelId) break;
+        const client = this.client;
+        if (!msg.restart && (!client || !msg.sessionId
+          || msg.sessionId !== client.currentSessionId || msg.viewGen !== this.switchTicket)) break;
+        await this.selectModel(msg.providerId, msg.modelId, !!msg.restart);
         break;
+      }
       case "retry":
         await this.startZCode({ force: true });
         break;
@@ -1312,7 +1344,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
               planModeApplied = true;
             }
             const prompt = buildPrompt(msg.text || "", prepareFileContext(msg.chips ?? [], this.workspacePath, vscode.workspace.textDocuments ?? []));
-            await activeClient.sendMessage(prompt, attachments);
+            await activeClient.sendMessage(prompt, attachments, msg.commandId);
             if (msg.commandId) this.post({ type: "send_admitted", commandId: msg.commandId, sessionId });
             if (activeClient === this.client && activeClient.currentSessionId === sessionId && ticket === this.switchTicket) this.indexCurrentSession();
           });
@@ -1546,23 +1578,32 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   async newSession(): Promise<void> {
-    if (!this.client) {
-      await this.startZCode({ createNew: true });
+    const waitingForStartup = !!this.starting;
+    // A user action must still run after the shared startup promise settles.
+    while (this.starting) await this.starting.catch(() => undefined);
+    if (this.disposed) return;
+    if (!this.client || (waitingForStartup && !this.client.sessionAttached)) {
+      await this.startZCode({ createNew: true, resetClient: !!this.client });
       return;
     }
     const client = this.client;
     const ticket = ++this.switchTicket;
     await client.prepareViewChange();
+    let recoveryLogin: ResolveResult | undefined;
+    let creating = false;
     try {
       const defaults = this.newSessionDefaults();
       const modelOverride = defaults.model
         ? ""
         : vscode.workspace.getConfiguration("zcode").get<string>("model") || "";
+      const recoveryModel = !defaults.model && !modelOverride && this.recoveringAccountPlan ? this.recoveryModel : undefined;
+      if (recoveryModel) defaults.model = recoveryModel;
       const resolved = await resolveRuntime({
         appVersion: this.desktopAppVersion,
         modelOverride,
         preferredProviderId: defaults.model?.providerId,
         preferredModelId: defaults.model?.modelId,
+        strictPreferredProvider: !!recoveryModel,
       });
       if (ticket !== this.switchTicket || client !== this.client) return;
       this.picker = resolved.picker;
@@ -1573,24 +1614,61 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         this.setResolvedRuntime(resolved.runtime);
         client.setDefaultRuntime(resolved.runtime);
         syncCliConfig(resolved.runtime, readV2Config(), false);
+      } else if (resolved.planUnavailable || this.recoveringAccountPlan) {
+        // Never create a chat with a previously denied plan. Keep the current
+        // conversation in place until the user chooses a recovery action.
+        this.showLoginSetup(resolved, ticket);
+        return;
+      } else if (resolved.failedStartPlanFamily) {
+        // An inconclusive balance response can reuse only this account's
+        // already verified Start runtime, never a stale personal or paid key.
+        const previous = this.runtime;
+        const family = resolved.failedStartPlanFamily;
+        const auth = previous && startPlanId(previous.providerId) === family + "-start-plan"
+          ? await readStartPlanAuth(family) : null;
+        if (ticket !== this.switchTicket || client !== this.client) return;
+        if (!auth || !previous || auth.apiKey !== previous.apiKey || previous !== this.runtime) {
+          this.showLoginSetup(resolved, ticket);
+          return;
+        }
+        client.setDefaultRuntime(previous);
       } else if (!this.runtime) {
         vscode.window.showErrorMessage(
           resolved.reason || t("无法复用当前 ZCode 桌面端登录。")
         );
-        this.post({ type: "setup", reason: resolved.reason, hint: resolved.hint, picker: resolved.picker });
+        this.showLoginSetup(resolved);
         return;
       }
-      this.post({ type: "view_reset", clear: true, viewGen: ticket });
-      await client.newSession(defaults);
+      this.currentViewReset = { type: "view_reset", clear: true, viewGen: ticket };
+      this.post(this.currentViewReset);
+      creating = true;
+      if (recoveryModel) recoveryLogin = resolved;
+      await client.newSession(defaults, recoveryModel, ticket);
+      recoveryLogin = undefined;
       if (ticket !== this.switchTicket || client !== this.client) return;
       if (client.currentSessionId) this.rememberSession(client.currentSessionId);
-      await this.pushSessionState();
+      await this.pushSessionState({ kind: "created" });
     } catch (e) {
       if (ticket === this.switchTicket && client === this.client) {
-        if (client.currentSessionId) this.post({type:"session_ready",sessionId:client.currentSessionId,kind:"created",title:client.currentTitle || t("新会话"),viewGen:ticket});
-        this.post({ type: "stream_release" });
+        if (recoveryLogin) {
+          logError("New session with selected API key failed", e);
+          this.disposeClient();
+          this.showLoginSetup({ ...recoveryLogin, reason: userFacingError(e), hint: undefined }, ticket);
+          return;
+        }
+        const sessionId = client.currentSessionId;
+        if (creating && sessionId) {
+          this.post({ type: "session_ready", sessionId, kind: "created", title: client.currentTitle || t("新会话"), viewGen: ticket });
+          this.post({ type: "stream_release" });
+        }
         client.endViewChange();
-        this.post({ type: "session_error", message: userFacingError(e) });
+        const failure = { type: "session_error" as const, viewGen: ticket, message: userFacingError(e), failedCreate: creating && !sessionId };
+        if (failure.failedCreate) this.failedViewChange = failure;
+        this.post(creating ? failure : { type: "session_error", message: failure.message });
+        if (client.currentSessionId && !client.sessionAttached && this.runtime && START_PLAN_PROVIDER.test(this.runtime.providerId)) {
+          this.currentModel = undefined;
+          this.post({ type: "models", needsSelection: true, available: this.modelChoices() });
+        }
         logError("New session initialization failed", e);
       }
       throw e;
@@ -1734,6 +1812,9 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         if (snapshot.length > 1024 * 1024) { vscode.window.showInformationMessage(t("未保存的文件过大，请选中需要引用的内容。")); return; }
         chip.snapshot = snapshot;
       }
+    } else if ((chip.selectedText?.length ?? 0) > MAX_MESSAGE_TEXT) {
+      vscode.window.showInformationMessage(t("文件引用过长或无效，请缩小选区或移除该引用。"));
+      return;
     }
     await this.insertContextChips([chip]);
   }
@@ -1879,6 +1960,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   async quickSelectModel(): Promise<void> {
+    if (this.client?.viewChanging) return;
     const items = this.modelChoices();
     if (items.length === 0) {
       this.showStartupError(t("暂时没有可用的模型。"), "retry");
@@ -1920,14 +2002,18 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     let configured = this.picker;
     const runtime = this.runtime;
     const family = /^(?:account|builtin):(bigmodel|zai)-start-plan$/.exec(runtime?.providerId ?? "")?.[1];
-    if (runtime && family) {
+    if (this.recoveringAccountPlan || (!runtime && this.starting)) {
+      // Both desktop templates and the backend catalog can retain a plan
+      // after the account can no longer use it.
+      configured = configured.filter(model => !isAccountPlanProvider(model.providerId));
+      live = live.filter(model => !isAccountPlanProvider(model.providerId));
+    } else if (runtime && family) {
       const accountId = `account:${family}-start-plan`;
       const isStart = (id: string) => id === `builtin:${family}-start-plan` || id === accountId;
       const isPersonal = (id: string) => id === `builtin:${family}-coding-plan` || id === `account:${family}-individual-coding-plan`;
       const modelIds = Object.keys(runtime.models);
       const verifiedIds = new Set(modelIds.map(id => id.toLowerCase()));
-      const registeredProvider = this.startPlanModelProvider ?? (live.some(model =>
-        model.providerId === accountId && verifiedIds.has(model.modelId.toLowerCase())) ? accountId : undefined);
+      const registeredProvider = this.startPlanModelProvider ?? (live.some(model => model.providerId === accountId) ? accountId : undefined);
       const providerId = registeredProvider ?? runtime.providerId;
       configured = configured.filter(model => !isStart(model.providerId) && !isPersonal(model.providerId));
       live = live.filter(model => !isPersonal(model.providerId)
@@ -1940,11 +2026,6 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         configured.push({ providerId, modelId: liveId ?? modelId, providerName: runtime.providerName,
           kind: runtime.kind, label: modelId, hasKey: true });
       }
-    } else if (!runtime && this.starting) {
-      const unverifiedPlan = (model: { providerId: string }) =>
-        /^(?:account|builtin):(?:bigmodel|zai)-(?:individual-|team-)?(?:coding|start)-plan$/.test(model.providerId);
-      configured = configured.filter(model => !unverifiedPlan(model));
-      live = live.filter(model => !unverifiedPlan(model));
     }
     return mergeAvailablePickerModels(
       configured,
@@ -1981,8 +2062,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   async restart(reason: string): Promise<void> {
     logInfo("Restarting ZCode", reason);
     this.pushDesktopPlugins();
-    this.disposeClient();
-    await this.startZCode({ force: true });
+    await this.startZCode({ force: true, resetClient: true });
   }
 
   private async openWorkspacePathSettings(): Promise<void> {
@@ -2001,23 +2081,31 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     await this.restart("Workspace path changed");
   }
 
-  private sessionIsArchived(sessionId: string): boolean {
+  private sessionIsArchived(sessionId: string, flags = loadTaskFlags(this.workspacePath)): boolean {
     const archiveTimes = loadSessionArchiveTimes([sessionId]);
     const archived = archiveTimes.has(sessionId) ? archiveTimes.get(sessionId)
       : this.sessions.find(session => session.sessionId === sessionId)?.archivedAt;
-    return !!archived || (!!this.workspacePath && loadTaskFlags(this.workspacePath).archived.includes(sessionId));
+    return !!archived || flags.archived.includes(sessionId);
   }
 
   private async switchSession(sessionId: string): Promise<void> {
-    if (this.sessionIsArchived(sessionId)) {
+    const waitingForStartup = !!this.starting;
+    while (this.starting) await this.starting.catch(() => undefined);
+    if (this.disposed) return;
+    const flags = loadTaskFlags(this.workspacePath);
+    if (flags.deleted.includes(sessionId)) {
+      this.post({ type: "toast", text: t("会话已删除") });
+      return;
+    }
+    if (this.sessionIsArchived(sessionId, flags)) {
       this.post({ type: "toast", text: t("请先取消归档再打开") });
       return;
     }
-    if (!this.client) {
-      await this.startZCode({ resumeSessionId: sessionId });
+    if (!this.client || (waitingForStartup && !this.client.sessionAttached)) {
+      await this.startZCode({ resumeSessionId: sessionId, resetClient: !!this.client });
       return;
     }
-    if (this.client.currentSessionId === sessionId && this.client.sessionAttached) return;
+    if (this.client.currentSessionId === sessionId && this.client.sessionAttached && !this.client.viewChanging) return;
     const client = this.client;
     const timing = new StartupTiming("switch", true);
     this.timing = timing;
@@ -2026,10 +2114,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     try {
       await client.prepareViewChange();
       if (ticket !== this.switchTicket || client !== this.client) return;
-      this.post({ type: "view_reset", viewGen: ticket });
+      this.currentViewReset = { type: "view_reset", targetSessionId: sessionId, viewGen: ticket };
+      this.post(this.currentViewReset);
       this.currentModel = undefined;
       try {
-        const history = await client.switchSession(sessionId);
+        const history = await client.switchSession(sessionId, ticket);
         if (ticket !== this.switchTicket || client !== this.client) return;
         this.rememberSession(sessionId);
         this.post({
@@ -2048,7 +2137,15 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         await this.pushModels();
         if (ticket === this.switchTicket && client === this.client) await client.emitSessionControls();
       } catch (e) {
-        if (ticket === this.switchTicket) this.post({ type: "stream_release" });
+        if (ticket !== this.switchTicket || client !== this.client) return;
+        logError("Session switch failed", e);
+        // The switch increments the view generation, so the original webview
+        // request handler can no longer report this failure in its own scope.
+        if (client.sessionAttached) this.post({ type: "stream_release" });
+        const failure = { type: "session_error" as const, message: userFacingError(e), viewGen: ticket,
+          ...(!client.sessionAttached ? { failedSwitchTo: sessionId } : {}) };
+        if (failure.failedSwitchTo) this.failedViewChange = failure;
+        this.post(failure);
         throw e;
       } finally {
         if (ticket === this.switchTicket && client === this.client) client.endViewChange();
@@ -2059,6 +2156,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private modelSelectionQueue?: { tail: Promise<void>; isCurrent: () => boolean };
+  private modelSelection?: { result: Promise<boolean>; isCurrent: () => boolean };
 
   private inModelOrder<T>(run: () => Promise<T>): Promise<T> {
     const previous = this.modelSelectionQueue;
@@ -2072,18 +2170,28 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     return operation;
   }
 
-  private selectModel(providerId: string, modelId: string, restart = false): Promise<void> {
+  private async selectModel(providerId: string, modelId: string, restart = false): Promise<void> {
+    if (!restart && this.client?.viewChanging) return;
     const isCurrent = this.viewScope();
-    return this.inModelOrder(async () => {
-      if (isCurrent()) await this.selectModelNow(providerId, modelId, restart);
-    });
+    const result = this.inModelOrder(async () => isCurrent() && this.selectModelNow(providerId, modelId, restart));
+    const selection = { isCurrent, result };
+    this.modelSelection = selection;
+    try {
+      await result;
+    } finally {
+      if (this.modelSelection === selection) this.modelSelection = undefined;
+    }
   }
 
   /** Keep the model stable from applying a queued selection through admitting its message. */
   private withSendModel<T>(client: ZCodeClient, send: () => Promise<T>): Promise<T> {
     const isCurrent = this.viewScope();
+    // Only sends already waiting on this selection inherit its result.
+    const selection = this.modelSelection?.isCurrent() ? this.modelSelection.result : undefined;
     return this.inModelOrder(async () => {
+      const selected = selection ? await selection : true;
       if (!isCurrent()) throw new Error(t("会话已切换，请在当前会话重新发送。"));
+      if (!selected) throw new Error(t("切换模型失败，消息未发送。请确认模型后重试。"));
       if (this.pendingModelFor(client.currentSessionId)) {
         const applied = await this.applyPendingModel(client);
         if (!isCurrent()) throw new Error(t("会话已切换，请在当前会话重新发送。"));
@@ -2097,33 +2205,39 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     providerId: string,
     modelId: string,
     restart = false
-  ): Promise<void> {
+  ): Promise<boolean> {
     const selectionIsCurrent = this.viewScope();
     await this.refreshStartPlanCatalog(providerId);
-    if (!selectionIsCurrent()) return;
+    if (!selectionIsCurrent()) return false;
     const model = this.startPlanSelection({ providerId, modelId });
     providerId = model.providerId;
     modelId = model.modelId;
-    if (this.disabledModelKeys.has(`${providerId}\0${modelId}`)) {
+    const recoverWithKey = restart || (!this.client && this.recoveringAccountPlan
+      && this.picker.some(choice => choice.access === "api-key" && samePickerModel(choice, model)));
+    if (!recoverWithKey && this.disabledModelKeys.has(`${providerId}\0${modelId}`)) {
       await this.pushModels();
-      if (!selectionIsCurrent()) return;
+      if (!selectionIsCurrent()) return false;
       vscode.window.showWarningMessage(t("该模型已在 ZCode 桌面端禁用，请先启用后再选择。"));
-      return;
+      return false;
     }
-    if (this.modelUnavailable({ providerId, modelId })) {
+    if (!recoverWithKey && this.modelUnavailable({ providerId, modelId })) {
       await this.pushModels();
-      if (!selectionIsCurrent()) return;
+      if (!selectionIsCurrent()) return false;
       vscode.window.showWarningMessage(t("该模型已不可用，请刷新模型列表后重新选择。"));
       void this.refreshDesktopModels();
-      return;
+      return false;
     }
-    if (restart || !this.client) {
+    if (recoverWithKey || !this.client) {
       await this.startZCode({
         force: true,
+        // The recovery picker opens a chat with the chosen model without
+        // resuming a conversation still bound to the unavailable plan.
+        createNew: recoverWithKey,
+        strictPreferredProvider: recoverWithKey,
         preferredProviderId: providerId,
         preferredModelId: modelId,
       });
-      return;
+      return true;
     }
 
     const client = this.client;
@@ -2133,26 +2247,26 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     if (sessionId && client.isGenerating()) {
       this.pendingModel = { sessionId, providerId, modelId };
       this.postModelChoices(model);
-      return;
+      return true;
     }
     if (this.pendingModel?.sessionId === sessionId) this.pendingModel = null;
     const previous = this.currentModel;
     try {
       const runtime = await this.resolveSessionModelRuntime({ providerId, modelId });
-      if (!isCurrent()) return;
+      if (!isCurrent()) return false;
       const isStartPlan = START_PLAN_PROVIDER.test(providerId);
       if (isStartPlan) ({ providerId, modelId } = this.startPlanSelection({ providerId, modelId }));
       if (runtime === false || (isStartPlan && this.modelUnavailable({ providerId, modelId }))) {
         vscode.window.showWarningMessage(t("该模型已不可用，请刷新模型列表后重新选择。"));
         await this.pushModels();
-        return;
+        return false;
       }
       if (runtime) {
         client.setSessionRuntime(runtime);
         syncCliConfig(runtime, readV2Config(), false);
       }
       await client.setModel(providerId, modelId);
-      if (!isCurrent()) return;
+      if (!isCurrent()) return false;
       this.currentModel = { providerId, modelId };
       this.rememberSessionModel(client.currentSessionId, this.currentModel);
       this.indexCurrentSession();
@@ -2160,16 +2274,18 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (isCurrent() && (previous?.providerId !== providerId || previous?.modelId !== modelId)) {
         this.noteSwitchBanner(previous, this.currentModel);
       }
+      return true;
     } catch (e) {
-      if (!isCurrent()) return;
+      if (!isCurrent()) return false;
       logError("setModel failed", e);
       this.currentModel = client.confirmedModel();
       const rejected = isModelRegistryRejection(e);
       if (rejected) this.markLiveCatalogStale();
       await this.pushModels(true);
-      if (!isCurrent()) return;
+      if (!isCurrent()) return false;
       if (rejected) vscode.window.showWarningMessage(t("该模型已不可用，请刷新模型列表后重新选择。"));
       else vscode.window.showErrorMessage(t("切换模型失败：{0}", { 0: userFacingError(e) }));
+      return false;
     }
   }
 
@@ -2200,6 +2316,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
    */
   private modelUnavailable(model: { providerId: string; modelId: string }): boolean {
     if (this.disabledModelKeys.has(`${model.providerId}\0${model.modelId}`)) return true;
+    if (this.recoveringAccountPlan && isAccountPlanProvider(model.providerId)) return true;
     const isStartPlan = START_PLAN_PROVIDER.test(model.providerId);
     if (isStartPlan ? this.liveCatalogState() !== "fresh" : !this.providerInventoryAuthoritative) return false;
     return !this.modelChoices().some(choice => samePickerModel(model, choice));
@@ -2339,20 +2456,30 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
   private async startZCode(opts?: {
     force?: boolean;
+    resetClient?: boolean;
     createNew?: boolean;
     resumeSessionId?: string;
     preferredProviderId?: string;
     preferredModelId?: string;
+    strictPreferredProvider?: boolean;
   }): Promise<void> {
-    if (this.starting) {
-      await this.starting;
-      if (!opts?.force) return;
+    while (this.starting) {
+      if (!opts?.force) return this.starting;
+      // More than one restart may be waiting on the same launch. Check the
+      // current launch again before taking ownership of the slot.
+      await this.starting.catch(() => undefined);
     }
-    this.starting = this.startZCodeInner(opts);
+    if (this.disposed) return;
+    const startup = Promise.resolve().then(() => {
+      if (this.disposed) return;
+      if (opts?.resetClient) this.disposeClient();
+      return this.startZCodeInner(opts);
+    });
+    this.starting = startup;
     try {
-      await this.starting;
+      await startup;
     } finally {
-      this.starting = null;
+      if (this.starting === startup) this.starting = null;
     }
   }
 
@@ -2362,6 +2489,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     resumeSessionId?: string;
     preferredProviderId?: string;
     preferredModelId?: string;
+    strictPreferredProvider?: boolean;
   }): Promise<void> {
     const timing = new StartupTiming("open", true);
     this.timing = timing;
@@ -2381,10 +2509,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       binaryPath = await locateAppServer(config.get<string>("binaryPath") || "", {
         preferred: this.context.globalState.get<string>(LAST_BINARY_KEY) || "",
       });
+      if (this.disposed) return;
       this.appServerPath = binaryPath;
       setDesktopCredentialBinary(binaryPath);
       timing.add("locateBinary", Date.now() - locateStarted);
     } catch (e) {
+      if (this.disposed) return;
       timing.add("locateBinary", Date.now() - locateStarted);
       const message = userFacingError(e);
       logError("Could not locate ZCode app-server", e);
@@ -2395,6 +2525,10 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     }
     const nodePath = config.get<string>("nodePath") || "";
     const defaults = this.newSessionDefaults();
+    if (opts?.createNew && opts.preferredProviderId && opts.preferredModelId) {
+      defaults.model = { providerId: opts.preferredProviderId, modelId: opts.preferredModelId };
+    }
+    const requiredModel = opts?.strictPreferredProvider ? defaults.model : undefined;
     const modelOverride = opts?.createNew && defaults.model ? "" : config.get<string>("model") || "";
     workspacePath = preferredWorkspacePath(workspacePath, readV2Settings()?.recentProjects);
     this.adoptWorkspace(workspacePath);
@@ -2403,6 +2537,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
 
     const loginStarted = Date.now();
     const desktopVersion = await resolveDesktopVersion(binaryPath);
+    if (this.disposed) return;
     this.desktopAppVersion = desktopVersion.appVersion;
     logInfo("Resolved ZCode desktop version", desktopVersion);
     recordDiagnosticEvent("desktop_version", desktopVersion);
@@ -2411,6 +2546,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       modelOverride,
       preferredProviderId: opts?.preferredProviderId ?? (opts?.createNew ? defaults.model?.providerId : undefined),
       preferredModelId: opts?.preferredModelId ?? (opts?.createNew ? defaults.model?.modelId : undefined),
+      strictPreferredProvider: opts?.strictPreferredProvider,
     };
     const overlapLogin = localLoginCanOverlapSpawn(loginRequest);
     if (overlapLogin) timing.note("loginOverlap", true);
@@ -2423,10 +2559,12 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         remembered: opts?.resumeSessionId || (opts?.createNew ? undefined : this.context.workspaceState.get<string>(LAST_SESSION_KEY)),
         createNew: opts?.createNew,
         newSessionDefaults: defaults,
+        requiredModel,
       });
       return;
     }
     let resolved = await loginPromise;
+    if (this.disposed) return;
     let loginNetwork = resolved.exchangedLogin === true;
     this.picker = resolved.picker;
     this.disabledModelKeys = new Set(resolved.disabledModelKeys ?? []);
@@ -2437,14 +2575,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     timing.note("loginNetwork", loginNetwork);
     if (!resolved.ok || !resolved.runtime) {
       this.clearStartupPhase();
-      this.post({
-        type: "setup",
-        reason: resolved.reason,
-        hint: resolved.hint,
-        picker: resolved.picker,
-      });
-      this.post({ type: "models", available: resolved.picker, needsSelection: true });
-      this.pushNewSessionDefaults();
+      this.showLoginSetup(resolved);
       return;
     }
 
@@ -2497,6 +2628,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         resumeSessionId: remembered,
         applyModel: !!opts?.createNew,
         newSessionDefaults: defaults,
+        requiredModel,
         chooseResume: (listed, rejected) => this.chooseStartupSession(listed, remembered, rejected),
       });
       if (this.client !== client) return;
@@ -2504,12 +2636,18 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (this.client.currentSessionId) {
         this.rememberSession(this.client.currentSessionId);
       }
+      if (requiredModel && this.recoveringAccountPlan && !isAccountPlanProvider(requiredModel.providerId)) this.recoveryModel = requiredModel;
       await this.pushSessionState({ startupList: client.takeStartupSessions() });
     } catch (e) {
       if (this.client !== client) return;
       const message = userFacingError(e);
       logError("ZCode startup failed", e);
       this.clearStartupPhase();
+      if (requiredModel) {
+        this.disposeClient();
+        this.showLoginSetup({ ...resolved, reason: message, hint: undefined });
+        return;
+      }
       this.showStartupError(message);
       this.post({ type: "session_error", message });
     }
@@ -2523,29 +2661,26 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     modelOverride?: string;
     preferredProviderId?: string;
     preferredModelId?: string;
+    strictPreferredProvider?: boolean;
   }): Promise<ResolveResult> {
     let resolved = await resolveRuntime(request);
     if (resolved.ok && resolved.runtime) return resolved;
     logWarn("Could not reuse desktop defaults", resolved.reason);
+    if (resolved.planUnavailable || request.strictPreferredProvider) return resolved;
     if (resolved.accountPlanUnavailable) {
       const settings = readV2Settings();
       const provider = request.preferredProviderId || request.modelOverride?.split("/")[0];
       const explicitFamily = /^(?:account|builtin):(bigmodel|zai)-(?:.*coding-plan|start-plan)$/.exec(provider ?? "")?.[1];
-      const family = provider ? explicitFamily : settings?.providerFamilyDomain;
+      const family = resolved.failedStartPlanFamily ?? (provider ? explicitFamily : settings?.providerFamilyDomain);
       if (family === "bigmodel" || family === "zai") {
-        const startPlan = provider ? START_PLAN_PROVIDER.test(provider)
-          : settings?.providerFamilyConnectionSelections?.[family]?.kind === "start-plan";
+        const startPlan = !!resolved.failedStartPlanFamily || (provider ? START_PLAN_PROVIDER.test(provider)
+          : settings?.providerFamilyConnectionSelections?.[family]?.kind === "start-plan");
         const issue = await desktopLoginCredentialIssue(family, startPlan);
         if (issue) return { ...resolved, reason: issue, hint: undefined };
       }
       return resolved;
     }
-    const fallbackPick = resolved.picker.find(
-      (p) =>
-        p.hasKey &&
-        !p.providerId.includes("coding-plan") &&
-        !p.providerId.includes("start-plan")
-    );
+    const fallbackPick = resolved.picker.find(p => p.hasKey && p.access === "api-key");
     if (!fallbackPick) return resolved;
     const fallback = await resolveRuntime({
       appVersion: request.appVersion,
@@ -2561,6 +2696,24 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
     return { ...fallback, exchangedLogin: resolved.exchangedLogin || fallback.exchangedLogin };
   }
 
+  private showLoginSetup(resolved: ResolveResult, retainedViewGen?: number): void {
+    this.recoveryModel = undefined;
+    if (resolved.accountPlanUnavailable) this.recoveringAccountPlan = true;
+    const picker = resolved.picker.filter(model =>
+      model.access === "api-key" && model.hasKey && !model.disabledReason && model.modelId !== "(default)"
+    );
+    this.post({
+      type: "setup",
+      reason: resolved.reason,
+      hint: resolved.hint,
+      planUnavailable: resolved.planUnavailable,
+      ...(retainedViewGen !== undefined ? { viewGen: retainedViewGen } : {}),
+      picker,
+    });
+    this.post({ type: "models", available: picker });
+    this.pushNewSessionDefaults();
+  }
+
   /** Spawn the app-server while the desktop plan key is still being exchanged. */
   private async startWhileLoginRuns(
     timing: StartupTiming,
@@ -2573,6 +2726,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       remembered?: string;
       createNew?: boolean;
       newSessionDefaults?: NewSessionDefaults;
+      requiredModel?: SessionModelChoice;
     }
   ): Promise<void> {
     this.beginStartupPhase(launch.remembered ? "restoring" : "starting");
@@ -2603,6 +2757,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       resumeSessionId: launch.remembered,
       applyModel: !!launch.createNew,
       newSessionDefaults: launch.newSessionDefaults,
+      requiredModel: launch.requiredModel,
       chooseResume: (listed, rejected) => this.chooseStartupSession(listed, launch.remembered, rejected),
     }).then(
       () => ({ status: "fulfilled" as const }),
@@ -2640,14 +2795,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       if (this.client !== client) return;
       this.clearStartupPhase();
       this.disposeClient();
-      this.post({
-        type: "setup",
-        reason: resolved?.reason,
-        hint: resolved?.hint,
-        picker: resolved?.picker ?? this.picker,
-      });
-      this.post({ type: "models", available: resolved?.picker ?? this.picker, needsSelection: true });
-      this.pushNewSessionDefaults();
+      this.showLoginSetup(resolved ?? { ok: false, picker: this.picker });
       return;
     }
     const started = await startup;
@@ -2702,14 +2850,15 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       }).then(undefined, error => logWarn("Recovery action failed", error));
   }
 
-  private async pushSessionState(opts?: { forceHistory?: boolean; startupList?: SessionSummary[] }): Promise<void> {
+  private async pushSessionState(opts?: { forceHistory?: boolean; startupList?: SessionSummary[]; kind?: "created" }): Promise<void> {
     const client = this.client;
     const sessionId = client?.currentSessionId;
     const ticket = this.switchTicket;
     if (!client || !sessionId) return;
     const isCurrent = () => client === this.client && sessionId === client.currentSessionId && ticket === this.switchTicket;
     this.clearStartupPhase();
-    this.post({ type: "session_ready", sessionId, title: client.currentTitle || "新会话", viewGen: ticket });
+    this.post({ type: "session_ready", sessionId, title: client.currentTitle || "新会话", viewGen: ticket,
+      slashCommands: client.currentSlashCommands, ...(opts?.kind ? { kind: opts.kind } : {}) });
     this.paintTitle(client.currentTitle);
     if (opts?.forceHistory || !client.historyDelivered(sessionId)) {
       const history = await client.loadHistory();
@@ -2788,19 +2937,19 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         notice: "ready",
         hasMore: this.sessionListHasMore,
       });
-      let indexed = 0;
+      const tasks: DesktopTask[] = [];
       for (const s of listed) {
         const ws = this.workspacePath || s.workspacePath || "";
         if (!ws || deleted.has(s.sessionId)) continue;
-        upsertDesktopTask({
+        tasks.push({
           workspacePath: ws,
           sessionId: s.sessionId,
           title: s.title,
           model: s.model
             ? `${s.model.providerId}/${s.model.modelId}`
-            : this.runtime
-              ? `${this.runtime.providerId}/${this.runtime.modelId}`
-              : undefined,
+            : undefined,
+          status: s.status === "waiting" || s.status === "paused" ? "running"
+            : s.status === "running" || s.status === "completed" || s.status === "error" ? s.status : undefined,
           createdAt: s.createdAt,
           updatedAt: s.updatedAt,
           archived: archived.has(s.sessionId) || !!s.archivedAt,
@@ -2809,8 +2958,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
               ? client.currentMode()
               : undefined,
         });
-        indexed++;
       }
+      const indexed = await indexListedDesktopTasks(tasks, currentRequest);
       // A server list may be paginated. Never delete desktop tasks absent from it.
       this.timing?.add("sessionListIndex", Date.now() - indexStarted);
       this.timing?.addCount("sessionListIndexCount", indexed);
@@ -2869,6 +3018,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async renameSession(sessionId: string, suggested?: string, actionRequestId?: string): Promise<void> {
+    const workspacePath = this.workspacePath;
     const current =
       suggested ||
       this.sessions.find((s) => s.sessionId === sessionId)?.title ||
@@ -2882,18 +3032,20 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
       placeHolder: t("输入新的会话名称"),
     });
     if (value == null) return;
+    if (!sameWorkspacePath(workspacePath, this.workspacePath)) {
+      this.post({ type: "toast", text: t("工作区已切换，请在原工作区重试。") });
+      return;
+    }
     if (value.trim() && actionRequestId) this.post({ type: "session_action_started", sessionId, actionRequestId, action: "rename" });
     await this.applyRename(sessionId, value);
   }
 
   private async deleteSession(sessionId: string): Promise<void> {
     await this.runSessionOperation(() => t("删除会话"), async saved => {
-      if (!this.workspacePath) return;
-      const flags = loadTaskFlags(this.workspacePath);
+      const workspacePath = this.workspacePath;
+      if (!workspacePath) return;
       const session = this.sessions.find((s) => s.sessionId === sessionId);
-      const archived =
-        !!session?.archivedAt || flags.archived.includes(sessionId);
-      if (!archived) {
+      if (!this.sessionIsArchived(sessionId)) {
         this.post({ type: "toast", text: t("请先归档再删除") });
         return;
       }
@@ -2905,7 +3057,11 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
         deleteLabel
       );
       if (choice !== deleteLabel) return;
-      setTaskDeleted(this.workspacePath, sessionId);
+      if (!sameWorkspacePath(workspacePath, this.workspacePath)) {
+        this.post({ type: "toast", text: t("工作区已切换，请在原工作区重试。") });
+        return;
+      }
+      setTaskDeleted(workspacePath, sessionId);
       saved();
       const client = this.client;
       const ticket = this.switchTicket;
@@ -2927,7 +3083,17 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   private async archiveSession(sessionId: string, archived: boolean): Promise<void> {
     await this.runSessionOperation(() => t(archived ? "归档会话" : "恢复会话"), async saved => {
       if (!this.workspacePath) return;
-      setTaskArchived(this.workspacePath, sessionId, archived);
+      const current = this.client;
+      const live = archived && current?.attachedNewSessionId === sessionId && !this.sessionsWithUserMessages.has(sessionId);
+      const controls = live ? current.confirmedControls() : undefined;
+      const model = live ? current.confirmedModel() : undefined;
+      setTaskArchived(this.workspacePath, sessionId, archived, controls && {
+        title: current?.currentTitle || t("新会话"),
+        model: model && `${model.providerId}/${model.modelId}`,
+        mode: controls.mode,
+        baseMode: controls.baseMode || "build",
+        planEnabled: !!controls.planEnabled,
+      });
       saved();
       const client = this.client;
       const ticket = this.switchTicket;
@@ -3085,13 +3251,16 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
           sessionId: string;
           title?: string;
           kind?: string;
+          viewGen?: number;
           slashCommands?: Array<{ name: string; description: string; inputHint: string }>;
         };
+        if (data.viewGen !== undefined && data.viewGen !== this.switchTicket) break;
         this.post({
           type: "session_ready",
           sessionId: data.sessionId,
           title: data.title || "新会话",
           kind: data.kind,
+          viewGen: data.viewGen,
           slashCommands: data.slashCommands ?? [],
         });
         this.paintTitle(data.title);
@@ -3324,6 +3493,8 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private disposeClient(): void {
+    this.currentViewReset = undefined;
+    this.failedViewChange = undefined;
     this.sendTiming.clear();
     if (this.runningPoll) {
       clearInterval(this.runningPoll);
@@ -3335,6 +3506,7 @@ export class ZCodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.fileSearchCancellation?.cancel();this.fileSearchCancellation?.dispose();
     this.releaseViewListeners();
     this.clearStartupPhase();

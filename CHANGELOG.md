@@ -1,5 +1,55 @@
 # 更新日志 / Changelog
 
+## 2.2.7 — 2026-11-20
+
+### 中文
+- 后台任务完成触发后续回复时，两段回复按时间分别显示，各自保留思考过程、用时、复制按钮和回复时间。
+- 编辑并重发最后一条提问时，会话刷新会保留上一条提问的原文，已发送的编辑不会重新出现在输入框。
+- 展开思考过程中的终端或查阅工具组时，最新一条命令或查阅记录会自动进入视野。
+- 编辑排队消息时，后台刷新队列或会话记录会保留输入焦点和选区。
+- 在桌面端切换套餐或团队项目后，扩展会重新读取选择；自定义 API Key 提供商名称中的套餐字样不再干扰认证。
+- 刷新会话列表时保留历史会话自己的模型和状态；桌面端正在写索引时，扩展不会逐条阻塞等待。归档或恢复已不存在的会话会提示失败。
+- 切换会话失败时显示原因并保留草稿，可重新选择原会话。目标已归档或删除时，标题和发送目标仍属于原对话。
+- 新建会话失败后可继续编辑草稿，重试成功后即可发送。返回原对话时会恢复它自己的草稿。
+- 连续切换会话时，等待期间输入的草稿会留在对应的对话里。重载窗口后，草稿中选好的 `/goal` 等命令也会保留。
+- 切换会话途中可以点回原对话，重载面板会继续等待切换完成。重载后，`/` 菜单也会恢复会话命令。
+- 手动阅读提问或回复时，思考过程自动折叠后会保留阅读位置。会话同步时保留思考区的滚动位置和已经选中的正文，后台刷新会话列表时保留正在查看的位置。
+- 会话加载完成后才可切换模型，避免把模型改到另一条对话。
+- 修复本机还没有 ZCode 会话记录时，首条消息可能因缺少会话记录而发送失败的问题。
+- 切换模型失败时，等待切换完成的消息会回到草稿，可确认模型后再发送。
+- 如果其他窗口在删除确认期间恢复了会话，扩展会保留该会话。
+- 编辑历史消息时，添加超限或格式无效的图片会显示具体原因。
+- 微调 VS Code 辅助侧栏的 ZCode 图标，让小尺寸下的轮廓更清晰。
+- 发送或排队后尚未收到回执时，即使连接中断也会保留原消息。新版协议可在会话记录确认接收后自动清除未确认提示。
+- 修复多次重启请求可能同时启动多个 ZCode 后端的问题。启动期间点击新建会话，连接就绪后会执行新建操作。
+- 文件或会话引用达到数量上限，或文件选区过大时，提示调整并保留输入内容。
+- 修复旧版桌面端的个人 Coding Plan 密钥被拒绝后，无法尝试重新换证的问题。
+- 当前套餐不可用时，隐藏不可用的套餐模型。若已配置 API Key，可从提示页直接选用对应模型开始新会话。
+
+### English
+- Follow-up replies triggered by background task completion keep their own work timeline, copy button, and reply timestamp.
+- Resending an edited question keeps the previous question intact when history refreshes, and keeps a successful edit out of the composer draft.
+- Expanding a terminal or file exploration group brings its latest entry into view.
+- Keep keyboard focus and the selection in a queued message while the queue or transcript refreshes.
+- Reload the desktop selection after plan or team project changes, and recognize API-key providers whose IDs contain plan names.
+- Keep each conversation’s own model and status when refreshing the list, and avoid blocking on each row while the desktop index is busy. Report missing sessions on archive or restore.
+- Show the reason for a failed session switch, preserve drafts, and let you reopen the original chat. Choosing an archived or deleted chat keeps the original title and send target.
+- Keep the new chat draft editable if creation fails and enable sending when the retry succeeds. Reopening the original chat restores its own draft.
+- Keep text typed during rapid chat switches with its intended conversation, and preserve slash commands such as `/goal` in drafts across window reloads.
+- Let users return to the original chat during a switch. Keep the loading state for unfinished switches and restore slash command suggestions when the panel reloads.
+- Keep the question or reply in place when the thinking section collapses. Preserve the reading position inside the thinking section and selected reply text during a transcript refresh, and keep the session list in place during background updates.
+- Enable model switching once the selected chat loads, so the choice applies to the intended chat.
+- Fix a first-message failure when the local ZCode session database has no existing conversations.
+- Return any message waiting on a failed model switch to the draft so users can confirm the model before trying again.
+- Keep a chat if another window restores it while deletion is awaiting confirmation.
+- Show attachment errors when adding an oversized or invalid image to a previous message.
+- Refine the ZCode icon in the VS Code Secondary Side Bar for a cleaner outline at small sizes.
+- Keep the original message if its send or queue acknowledgement is missing, including after a disconnect. On the newer protocol, clear the warning when the conversation confirms receipt.
+- Prevent overlapping restart requests from launching multiple ZCode backends at once. Honor new chat requests made during startup once the connection is ready.
+- Preserve the draft and show a warning when there are too many references or a file selection is too large.
+- Retry credential exchange when an older desktop version's stored personal Coding Plan key is rejected.
+- Hide unavailable plan models when the current plan cannot be used. Start a new chat with a configured API-key model directly from the recovery screen.
+
 ## 2.2.6 — 2026-11-17
 
 ### 中文

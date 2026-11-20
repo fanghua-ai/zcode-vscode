@@ -61,36 +61,80 @@ await build({stdin:{contents:`
 import {ZCodeClient} from ${JSON.stringify(path.resolve(process.env.ZCODE_REVIEW_SOURCE || 'src/zcodeClient.ts'))};
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
-import {persistCliSession,loadSessionExecutionState} from ${JSON.stringify(path.resolve('src/taskIndex.ts'))};
+import {ZCodeViewProvider} from ${JSON.stringify(path.resolve('src/extension.ts'))};
+import {persistCliSession,loadSessionExecutionState,setTaskArchived} from ${JSON.stringify(path.resolve('src/taskIndex.ts'))};
 import fs from 'node:fs';
 import {isSessionModelAvailable, resolveRuntimeForSession} from ${JSON.stringify(path.resolve('src/desktop.ts'))};
 import path from 'node:path';
 (async()=>{
-const events=[];let seededVersion=false;
+const baseline=process.env.TEST_BASELINE==='1';
+const events=[];let indexTitles=true;let seededBaseline=false;
 const makeClient=()=>new ZCodeClient({isSessionModelAvailable,resolveSessionRuntime:resolveRuntimeForSession,binaryPath:process.env.TEST_BINARY,workspacePath:process.env.TEST_WORKSPACE,compileCachePath:path.join(process.env.HOME,"compile-cache"),
  env:{ZCODE_PERSONAL_PROVIDER_CONFIG_FILE:process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,ZCODE_BUILTIN_PROVIDER_CONFIG_FILE:process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE:process.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE},
  runtime:{providerId:'builtin:bigmodel-coding-plan',providerName:'Missing legacy provider',modelId:'test',kind:'openai',baseURL:'http://127.0.0.1',apiKey:'TEST-ONLY',models:{},source:'custom-provider'},
- onEvent:event=>{events.push(event);if(event.type==='session_title'){
- if(!seededVersion){
- const db=new DatabaseSync(path.join(process.env.HOME,'.zcode/cli/db/db.sqlite'));
- db.exec('PRAGMA busy_timeout=5000');
- // Match the host: index the empty identity before applying post-create defaults.
- db.prepare('INSERT OR IGNORE INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES(?,?,?,?,?,?,?,?)').run('version-fixture','fixture-project','version-fixture',process.env.TEST_WORKSPACE,'Fixture','3.14.4',Date.now(),Date.now());db.close();seededVersion=true;
+ onEvent:event=>{events.push(event);if(event.type==='session_title'&&indexTitles){
+ if(baseline&&!seededBaseline){
+  const db=new DatabaseSync(path.join(process.env.HOME,'.zcode/cli/db/db.sqlite'));
+  try {
+   db.exec('PRAGMA busy_timeout=5000');
+   db.prepare('INSERT OR IGNORE INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES(?,?,?,?,?,?,?,?)')
+    .run('version-fixture','fixture-project','version-fixture',process.env.TEST_WORKSPACE,'Fixture','3.14.4',Date.now(),Date.now());
+  } finally {db.close();}
+  seededBaseline=true;
  }
  assert.ok(persistCliSession({sessionId:event.data.sessionId,workspacePath:process.env.TEST_WORKSPACE,title:event.data.title,mode:client.currentMode()}));
 
  }}});
 let client=makeClient();
 
-const baseline=process.env.TEST_BASELINE==='1';if(baseline){const create=client.newSession.bind(client);client.newSession=async()=>{await create();await client.setModel('fake','test');};}
+if(baseline){const create=client.newSession.bind(client);client.newSession=async()=>{await create();await client.setModel('fake','test');};}
 try {
  await client.start({createNew:true});if(baseline)await client.setModel('fake','test');
 
  if(!baseline){
+  const firstDb=new DatabaseSync(path.join(process.env.HOME,'.zcode/cli/db/db.sqlite'));
+  try {
+   const saved=firstDb.prepare('SELECT version FROM session WHERE id=?').get(client.currentSessionId);
+   assert.ok(saved?.version, 'the first chat needs its own stored CLI version');
+  } finally {firstDb.close();}
+  await client.sendMessage('REGRESSION_FIRST_CHAT');
+  const firstDeadline=Date.now()+15000;
+  const hasFirstReply=async()=>(await client.loadHistory()).items.some(item=>
+   item.role==='assistant'&&item.text.includes('[REGRESSION_FIRST_CHAT:2]')&&!item.running);
+  while(Date.now()<firstDeadline&&!await hasFirstReply())await new Promise(resolve=>setTimeout(resolve,100));
+  assert.ok(await hasFirstReply(),
+   'the first chat in a fresh CLI store did not finish its first reply');
+  console.log('Real backend: the first chat in a fresh CLI store sends and persists a reply.');
   const restart=async()=>{
    const id=client.currentSessionId;client.dispose();client=makeClient();
    await client.start({resumeSessionId:id});assert.equal(client.currentSessionId,id);
   };
+  // Exercise the interval before an empty chat reaches the desktop index.
+  indexTitles=false;
+  await client.newSession({mode:'yolo'});await client.setMode('plan');
+  const emptyId=client.currentSessionId, workspace=process.env.TEST_WORKSPACE;
+  const controls=client.confirmedControls();
+  assert.equal(client.attachedNewSessionId,emptyId);
+  const db=new DatabaseSync(path.join(process.env.HOME,'.zcode/cli/db/db.sqlite'));
+  try {
+   assert.equal(db.prepare('SELECT id FROM session WHERE id=?').get(emptyId),undefined);
+   setTaskArchived(workspace,emptyId,true,{title:client.currentTitle,...controls});
+   assert.ok(db.prepare('SELECT time_archived FROM session WHERE id=?').get(emptyId).time_archived);
+  } finally {db.close();}
+  client.dispose();client=makeClient();await client.start({createNew:true});
+  const view=new ZCodeViewProvider({subscriptions:[],workspaceState:{get:()=>undefined},globalState:{get:()=>undefined}});
+  view.workspacePath=workspace;view.client=client;
+  await view.refreshSessions(true);
+  assert.ok(view.sessions.some(s=>s.sessionId===emptyId&&s.archivedAt),'missing from archived tab after restart');
+  await view.archiveSession(emptyId,false);
+  await view.refreshSessions(false);
+  assert.ok(view.sessions.some(s=>s.sessionId===emptyId&&!s.archivedAt),'missing from active tab after restore');
+  await client.resumeSession(emptyId);
+  assert.equal(client.currentSessionId,emptyId);assert.equal(client.sessionAttached,true);
+  assert.equal(client.attachedNewSessionId,null);
+  assert.equal(client.currentMode(),'plan');assert.equal(client.confirmedControls().baseMode,'yolo');
+  indexTitles=true;
+  console.log('Real backend: an empty archived chat survives restart, lists as archived and restores with the original ID and permissions.');
   for(const mode of ['yolo','edit','plan']){
    await client.newSession({mode});assert.equal(client.currentMode(),mode);
    await restart();assert.equal(client.currentMode(),mode,'empty default lost after restart: '+mode);
@@ -121,7 +165,14 @@ try {
    assert.equal(client.currentMode(),requested,'accepted permission lost after switch/restart: '+requested);
   }
   console.log('Real backend: late permission upgrade/downgrade acknowledgements persist the source without changing destination controls.');
+  const source=client.currentSessionId;
   await client.newSession();
+  const destination=client.currentSessionId;
+  const beforeSwitches=events.length;
+  await Promise.all([client.switchSession(source,41),client.switchSession(destination,42)]);
+  const readyEvents=events.slice(beforeSwitches).filter(event=>event.type==='session_ready');
+  assert.deepEqual(readyEvents.map(event=>[event.data.sessionId,event.data.viewGen]),[[source,41],[destination,42]]);
+  console.log('Real backend: overlapping switches retain the original request generation on each ready event.');
  }
  const first=client.currentSessionId;assert.ok(first);
  for(let round=0;round<2;round++){
@@ -280,7 +331,7 @@ try {
  console.log('Real ZCode client: initial creation, first send, consecutive creation and second send passed.');
 }finally{client.dispose();}
 })().catch(error=>{console.error(error);process.exitCode=1;});
-`,resolveDir:process.cwd(),sourcefile:'session-client.ts'},outfile:harness,bundle:true,platform:'node',format:'cjs',plugins:[{name:'isolated-vscode',setup(builder){builder.onResolve({filter:/^vscode$/},()=>({path:path.resolve('src/testSupport/vscode.ts')}));builder.onResolve({filter:/^\.\/log$/},()=>({path:'log',namespace:'mock'}));builder.onLoad({filter:/.*/,namespace:'mock'},()=>({contents:'export const logInfo=()=>{},logWarn=()=>{},logError=()=>{},logDebug=()=>{};'}));}}]});
+`,resolveDir:process.cwd(),sourcefile:'session-client.ts'},outfile:harness,bundle:true,platform:'node',format:'cjs',plugins:[{name:'isolated-vscode',setup(builder){builder.onResolve({filter:/^vscode$/},()=>({path:path.resolve('src/testSupport/vscode.ts')}));builder.onResolve({filter:/^\.\/log$/},()=>({path:'log',namespace:'mock'}));builder.onLoad({filter:/.*/,namespace:'mock'},()=>({contents:'export const logInfo=()=>{},logWarn=()=>{},logError=()=>{},logDebug=()=>{},getLog=()=>({show(){}}),disposeLog=()=>{},readRedactedLog=()=>"";'}));}}]});
 try {
  const child=spawn(process.execPath,[harness],{env:{PATH:process.env.PATH,HOME:root,XDG_CONFIG_HOME:path.join(root,'config'),XDG_DATA_HOME:path.join(root,'data'),XDG_CACHE_HOME:path.join(root,'cache'),LANG:'C.UTF-8',TEST_BINARY:binary,TEST_WORKSPACE:path.join(root,'workspace'),TEST_BASELINE:process.env.ZCODE_REVIEW_SOURCE?'1':'0',ZCODE_PERSONAL_PROVIDER_CONFIG_FILE:personal,ZCODE_BUILTIN_PROVIDER_CONFIG_FILE:bundled,ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE:bundled},stdio:'inherit'});
  const code=await new Promise((resolve,reject)=>{child.on('error',reject);child.on('exit',resolve)});

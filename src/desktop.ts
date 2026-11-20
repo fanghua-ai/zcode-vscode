@@ -21,7 +21,7 @@ import {
   readV2Config,
   readV2Settings,
   tryPlanOAuth,
-  readStartPlanAccess,
+  checkStartPlanAccess,
   readStartPlanAuth,
   hasPersonalCodingPlan,
   planAuthErrorDetails,
@@ -55,6 +55,7 @@ export interface PickerModel {
   modelId: string;
   label: string;
   hasKey: boolean;
+  access?: "api-key";
   disabledReason?: string;
 }
 
@@ -75,6 +76,10 @@ export interface ResolveResult {
   exchangedLogin?: boolean;
   /** Account-plan failure must not silently start a metered API provider. */
   accountPlanUnavailable?: boolean;
+  /** The selected plan was checked and the account does not currently have access. */
+  planUnavailable?: boolean;
+  /** Family of the Start Plan actually checked, including a fallback from a personal plan. */
+  failedStartPlanFamily?: PlanFamily;
 }
 
 interface TeamPlanRef {
@@ -357,7 +362,7 @@ export function buildAccountProviderSync(binaryPath: string, runtime?: ResolvedR
   const hash = crypto.createHash("sha256").update(path.resolve(active)).digest("hex");
   const basedOn = `zcode-builtin:${fileRev}:${hash}`;
   const family = runtime ? familyOfProvider(runtime.providerId) : null;
-  const current = runtime && family && isDesktopOauthProvider(runtime.providerId)
+  const current = runtime && family && isAccountPlanProvider(runtime.providerId)
     ? `account:${family}-${runtime.source === "desktop-team-oauth" ? "team-coding-plan" : kindOfProvider(runtime.providerId, "individual-coding-plan")}`
     : currentAccountProviderId();
   const providers: Record<string, unknown> = {};
@@ -365,7 +370,7 @@ export function buildAccountProviderSync(binaryPath: string, runtime?: ResolvedR
   for (const rule of loadBuiltinProviderRules(binaryPath)) {
     const active = !rule.hidden && rule.providerId === current;
     providers[rule.providerId] = {
-      builtinModelIds: active && runtime?.providerId.includes("start-plan") ? Object.keys(runtime.models) : rule.builtinModelIds,
+      builtinModelIds: active && runtime && isStartPlanProvider(runtime.providerId) ? Object.keys(runtime.models) : rule.builtinModelIds,
       access: { type: rule.accessType, entitled: active },
     };
     states[rule.providerId] = {
@@ -413,18 +418,22 @@ function parseModelOverride(
   return { providerId: s.slice(0, slash), modelId: s.slice(slash + 1) };
 }
 
-export function isDesktopOauthProvider(providerId: string): boolean {
-  return providerId.includes("coding-plan") || providerId.includes("start-plan");
+export function isAccountPlanProvider(providerId: string): boolean {
+  return /^(?:account|builtin):(?:bigmodel|zai)-(?:start|(?:(?:individual|team)-)?coding)-plan$/.test(providerId);
+}
+
+export function isStartPlanProvider(providerId: string): boolean {
+  return /^(?:account|builtin):(?:bigmodel|zai)-start-plan$/.test(providerId);
 }
 
 /** Fingerprint of the desktop provider-family selection (personal/team/apiKey). */
-export function desktopFamilyFingerprint(): string {
-  const settings = readV2Settings();
+export function desktopFamilyFingerprint(settings = readV2Settings()): string {
   const domain = settings?.providerFamilyDomain || "";
   const mode = (domain && settings?.modelProviderFamilyModes?.[domain]) || "";
   const selected =
     (domain && settings?.modelProviderFamilySelectedKeys?.[domain]) || "";
-  return `${domain}|${mode}|${selected}`;
+  const selection = settings?.providerFamilyConnectionSelections?.[domain];
+  return JSON.stringify([domain, mode, selected, selection?.kind, selection?.productId, selection?.organizationId, selection?.projectId]);
 }
 
 /**
@@ -501,13 +510,14 @@ export function sameDesktopLogin(
 ): boolean {
   if (!runtime.apiKey) return false;
   if (runtime.providerId === providerId) return true;
+  if (!isAccountPlanProvider(providerId)) return false;
   if (runtime.source !== "desktop-team-oauth" && runtime.source !== "desktop-personal-oauth") return false;
   const family = familyOfProvider(providerId);
   if (!family || family !== familyOfProvider(runtime.providerId)) return false;
-  if (providerId.includes("start-plan") || runtime.providerId.includes("start-plan")) {
+  if (providerId.includes("start-plan") || isStartPlanProvider(runtime.providerId)) {
     return runtime.source === "desktop-personal-oauth"
       && providerId.includes("start-plan")
-      && runtime.providerId.includes("start-plan");
+      && isStartPlanProvider(runtime.providerId);
   }
   if (runtime.source === "desktop-team-oauth") {
     return kindOfProvider(providerId, "individual-coding-plan") === "team-coding-plan";
@@ -528,7 +538,7 @@ export function localLoginCanOverlapSpawn(opts?: {
     || parseModelOverride(opts?.modelOverride ?? "")?.providerId
     || "";
   const family = explicit
-    ? (isDesktopOauthProvider(explicit) || explicit.startsWith("account:") ? familyOfProvider(explicit) : undefined)
+    ? (isAccountPlanProvider(explicit) || explicit.startsWith("account:") ? familyOfProvider(explicit) : undefined)
     : readPlanSelection(settings)?.family;
   if (explicit && !family) return false;
   return !!family && hasPlanOAuthToken(family, credentials);
@@ -591,7 +601,9 @@ export async function resolveProviderRequestAuth(
   if (usesLegacyPlanKeys(appVersion)) {
     const stored = readStoredPlanApiKey(providerId.startsWith("account:")
       ? providerId : `account:${family}-${kind}`);
-    if (stored) return { apiKey: stored };
+    if (stored && (!rejectedFingerprint || crypto.createHash("sha256").update(stored).digest("hex") !== rejectedFingerprint)) {
+      return { apiKey: stored };
+    }
   }
   return tryPlanOAuth(family, undefined, appVersion, rejectedFingerprint);
 }
@@ -653,7 +665,7 @@ export function registeredStartPlanProvider(binaryPath: string, providerId: stri
 }
 
 export function readConfiguredDefaultModel(runtime: ResolvedRuntime | null, binaryPath = resolveBinaryPath()): { providerId: string; modelId: string } | undefined {
-  if (runtime?.providerId.includes("start-plan")) {
+  if (runtime && isStartPlanProvider(runtime.providerId)) {
     return { providerId: registeredStartPlanProvider(binaryPath, runtime.providerId) ?? runtime.providerId, modelId: runtime.modelId };
   }
   const cli = readCliDefaultModel();
@@ -707,6 +719,7 @@ function addProviderModels(
       modelId,
       label: modelId,
       hasKey,
+      ...(!isAccountPlanProvider(providerId) ? { access: "api-key" as const } : {}),
       disabledReason: hasKey ? undefined : disabledReason,
     });
   }
@@ -974,6 +987,7 @@ export function buildPersonalShortcutPickerState(providerConfig: unknown, builti
         modelId,
         label: modelId,
         hasKey: true,
+        ...(!isAccountPlanProvider(providerId) ? { access: "api-key" as const } : {}),
       });
     }
   }
@@ -1181,7 +1195,7 @@ export async function resolveRuntime(opts?: {
     runtime: ResolvedRuntime,
     warning?: string
   ): ResolveResult => {
-    if (runtime.providerId.includes("start-plan")) {
+    if (isStartPlanProvider(runtime.providerId)) {
       for (let index = picker.length - 1; index >= 0; index--) {
         if (picker[index].providerId === runtime.providerId) picker.splice(index, 1);
       }
@@ -1200,17 +1214,20 @@ export async function resolveRuntime(opts?: {
     };
   };
 
-  const fail = (reason: string, hint: string): ResolveResult => ({
+  const unavailablePlans = new Set<string>();
+  const fail = (reason: string, hint: string, target?: Pick<PlanSelection, "family" | "kind">): ResolveResult => ({
     ok: false,
     reason: t(reason),
     hint: t(hint),
-    picker,
+    picker: picker.filter(model => !isAccountPlanProvider(model.providerId)),
     disabledModelKeys: [...disabledModelKeys],
     managedProviderIds: pickerResolution.managedProviderIds,
     providerInventoryAuthoritative: pickerResolution.providerInventoryAuthoritative,
     exchangedLogin,
-    accountPlanUnavailable: isPlanFamily(settings?.providerFamilyDomain)
-      && settings?.modelProviderFamilyModes?.[settings.providerFamilyDomain] !== "apiKey",
+    accountPlanUnavailable: !!target || (isPlanFamily(settings?.providerFamilyDomain)
+      && settings?.modelProviderFamilyModes?.[settings.providerFamilyDomain] !== "apiKey"),
+    planUnavailable: !!target && unavailablePlans.has(`${target.family}:${target.kind}`),
+    ...(target?.kind === "start-plan" ? { failedStartPlanFamily: target.family } : {}),
   });
 
   const tryStored = (
@@ -1219,7 +1236,7 @@ export async function resolveRuntime(opts?: {
     preferredModel?: string
   ): ResolvedRuntime | null => {
     if (!providerId) return null;
-    if (isDesktopOauthProvider(providerId)) return null;
+    if (isAccountPlanProvider(providerId)) return null;
     if (!isProviderInDesktopInventory(providerId)) return null;
     if (!isProviderRuntimeSelectable(providerId)) return null;
     const provider = providers[providerId];
@@ -1237,7 +1254,6 @@ export async function resolveRuntime(opts?: {
     );
   };
 
-  let personalPlanAbsent = false;
   const resolveOauth = async (
     family: PlanFamily,
     kind: PlanKind,
@@ -1245,18 +1261,32 @@ export async function resolveRuntime(opts?: {
     providerId: string,
     preferredModel?: string
   ): Promise<ResolvedRuntime | null> => {
-    if (kind === "individual-coding-plan") personalPlanAbsent = false;
+    const planKey = `${family}:${kind}`;
+    unavailablePlans.delete(planKey);
     if (kind === "start-plan") {
       try {
         exchangedLogin = true;
-        const access = await readStartPlanAccess(family, opts?.appVersion);
+        const access = await checkStartPlanAccess(family, opts?.appVersion);
+        if (access === "unavailable") {
+          unavailablePlans.add(planKey);
+          return null;
+        }
         if (!access) return null;
         const configured = providers[providerId] ?? fallbackPlanProvider(family, kind);
         const models = access.models.length ? Object.fromEntries(access.models.map(id => [id, configured.models?.[id] ?? {}]))
           : configured.models ?? {};
-        if (!Object.keys(models).length || (preferredModel && !Object.hasOwn(models, preferredModel))) return null;
+        const modelIds = Object.keys(models);
+        if (!modelIds.length) return null;
+        const selected = preferredModel && modelIds.find(id => id.toLowerCase() === preferredModel.toLowerCase());
+        if (preferredModel && !selected) {
+          if (!access.models.length) return null;
+          // A successful balance response supersedes a saved default. Strict
+          // callers must keep their model identity and receive a definite denial.
+          disabledModelKeys.add(`${opts?.preferredProviderId ?? providerId}\0${preferredModel}`);
+          if (opts?.strictPreferredProvider) return null;
+        }
         const provider = { ...configured, kind: "anthropic", options: { baseURL: productPlanBaseUrl(family, kind) }, models };
-        return toRuntime(providerId, provider, preferredModel || Object.keys(models)[0], access.auth.apiKey, "desktop-personal-oauth");
+        return toRuntime(providerId, provider, selected || modelIds[0], access.auth.apiKey, "desktop-personal-oauth");
       } catch (error) {
         logWarn("Start Plan access unavailable", planAuthErrorDetails(error));
         return null;
@@ -1270,7 +1300,8 @@ export async function resolveRuntime(opts?: {
       // Keep a resolved personal credential when the subscription service
       // cannot confirm entitlement. The model endpoint still enforces access.
       try {
-        personalPlanAbsent = (await hasPersonalCodingPlan(family, apiKey)) === false;
+        const personalPlanAbsent = (await hasPersonalCodingPlan(family, apiKey)) === false;
+        if (personalPlanAbsent) unavailablePlans.add(planKey);
         return !personalPlanAbsent;
       }
       catch (error) {
@@ -1314,8 +1345,20 @@ export async function resolveRuntime(opts?: {
     family: domain, kind: "individual-coding-plan" as const, providerId: builtinPlanProviderId(domain, "individual-coding-plan"),
   } : null);
 
+  const resolveSelectedPlan = async (selected: PlanSelection, preferredModel?: string, allowStartFallback = true) => {
+    const { family, kind, team, providerId } = selected;
+    const picked = await resolveOauth(family, kind, team, providerId, preferredModel);
+    if (picked || !allowStartFallback || kind !== "individual-coding-plan" || !unavailablePlans.has(`${family}:${kind}`)) {
+      return { picked, checked: selected };
+    }
+    // Personal entitlement is settled. Only the independent Start check can
+    // establish whether the account has any plan available for a new chat.
+    const start: PlanSelection = { family, kind: "start-plan", providerId: builtinPlanProviderId(family, "start-plan") };
+    return { picked: await resolveOauth(family, start.kind, undefined, start.providerId), checked: start };
+  };
+
   const isOauthCodingPlan = (providerId: string) =>
-    isDesktopOauthProvider(providerId) || providerId === team?.providerId;
+    isAccountPlanProvider(providerId) || providerId === team?.providerId;
 
   // Explicit pick from the UI or a saved new-session default. A model that the
   // desktop has disabled/removed is ignored for new sessions, so the normal
@@ -1346,16 +1389,7 @@ export async function resolveRuntime(opts?: {
           "Open the ZCode desktop app, make sure the team plan is selected, then Retry."
         );
       }
-      let picked = await resolveOauth(
-        target.family,
-        target.kind,
-        target.team,
-        target.providerId,
-        opts.preferredModelId
-      );
-      if (!picked && !opts.strictPreferredProvider && target.kind === "individual-coding-plan" && personalPlanAbsent) {
-        picked = await resolveOauth(target.family, "start-plan", undefined, builtinPlanProviderId(target.family, "start-plan"));
-      }
+      const { picked, checked } = await resolveSelectedPlan(target, opts.preferredModelId, !opts.strictPreferredProvider);
       if (picked) {
         logInfo("Using OAuth coding/team plan selected in VS Code", {
           providerId: picked.providerId,
@@ -1365,7 +1399,8 @@ export async function resolveRuntime(opts?: {
       }
       return fail(
         "Could not refresh the BigModel team / coding-plan login",
-        "Open the ZCode desktop app, make sure the team plan is selected, then Retry."
+        "Open the ZCode desktop app, make sure the team plan is selected, then Retry.",
+        checked
       );
     }
     const stored = tryStored(pid, "vscode-override", opts.preferredModelId);
@@ -1416,17 +1451,7 @@ export async function resolveRuntime(opts?: {
       if (!plan) return fail("Could not reuse the desktop plan login", "Open the ZCode desktop app and select an available plan, then Retry.");
       // Older desktop settings without a selection default to personal Coding
       // Plan, including accounts that also have a free Start Plan.
-      let picked = await resolveOauth(
-        plan.family,
-        plan.kind,
-        plan.team,
-        plan.providerId
-      );
-      // A stale personal default is not evidence of a Coding Plan subscription.
-      // Only the desktop's independent Start Plan entitlement can replace it.
-      if (!picked && plan.kind === "individual-coding-plan" && personalPlanAbsent) {
-        picked = await resolveOauth(plan.family, "start-plan", undefined, builtinPlanProviderId(plan.family, "start-plan"));
-      }
+      const { picked, checked } = await resolveSelectedPlan(plan);
       if (picked) {
         logInfo("Reusing ZCode desktop OAuth selection", {
           domain,
@@ -1440,7 +1465,8 @@ export async function resolveRuntime(opts?: {
         plan.kind === "team-coding-plan"
           ? "Could not reuse the team plan"
           : "Could not reuse the desktop plan login",
-        "Open the ZCode desktop app, stay signed in with the same account or team, then Retry. You can also switch to a custom provider from the model chip."
+        "Open the ZCode desktop app, stay signed in with the same account or team, then Retry. You can also switch to a custom provider from the model chip.",
+        checked
       );
     }
   }
@@ -1484,6 +1510,9 @@ export async function resolveRuntimeForSession(model: {
     strictPreferredProvider: true,
     appVersion,
   });
+  // A verified entitlement denial is as definitive as a disabled registry
+  // entry. Reserve null for checks that could not establish availability.
+  if (resolved.planUnavailable) return false;
   const isAccountOrBuiltin = model.providerId.startsWith("account:") || model.providerId.startsWith("builtin:");
   const configuredProvider = readV2Config()?.provider?.[model.providerId];
   const providerDisabled = configuredProvider?.enabled === false
@@ -1508,7 +1537,7 @@ export async function resolveRuntimeForSession(model: {
   ) return null;
   if (resolved.providerInventoryAuthoritative && resolved.managedProviderIds?.includes(model.providerId)) return null;
   if (/^builtin:(bigmodel|zai)$/.test(model.providerId)) return false;
-  if (isDesktopOauthProvider(model.providerId)) return null;
+  if (isAccountPlanProvider(model.providerId)) return null;
   return runtimeFromStoredProvider(model.providerId, model.modelId);
 }
 

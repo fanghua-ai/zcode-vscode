@@ -239,7 +239,7 @@ function wrapNative(db: {
   };
 }
 
-function openNativeSqlite(dbPath: string, readOnly = false): SqliteApi {
+function openNativeSqlite(dbPath: string, readOnly = false, timeout = 5000): SqliteApi {
   let DatabaseSync: new (
     filename: string, options?: { timeout?: number; readOnly?: boolean }
   ) => Parameters<typeof wrapNative>[0];
@@ -249,9 +249,9 @@ function openNativeSqlite(dbPath: string, readOnly = false): SqliteApi {
   } catch (e) {
     throw new LocalizedError("当前 VS Code 运行环境不支持原生 SQLite，请更新 VS Code 后重试。", {}, { cause: e });
   }
-  const db = new DatabaseSync(dbPath, { timeout: 5000, readOnly });
+  const db = new DatabaseSync(dbPath, { timeout, readOnly });
   try {
-    db.exec("PRAGMA busy_timeout=5000");
+    db.exec(`PRAGMA busy_timeout=${timeout}`);
     // A real read surfaces WAL/permission errors before business queries, while recovery can still run.
     db.prepare("SELECT name FROM sqlite_schema LIMIT 1").get();
     return wrapNative(db);
@@ -554,103 +554,147 @@ function slugify(value: string): string {
 export function upsertDesktopTask(task: DesktopTask): boolean {
   const dbPath = tasksIndexPath();
   if (!fs.existsSync(dbPath)) return false;
-  const now = Date.now();
-  const title = task.title || "新会话";
-  const model = task.model ?? null;
-  const status = task.status ?? "completed";
-  const savedSession = readSavedSession(task.sessionId);
-  const updatedAt = task.updatedAt ?? now;
-  const overridden = task.overrideTitle ? 1 : 0;
   try {
-    withWritableDb(dbPath, (db) => {
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        const scope = workspacePredicate(db, task.workspacePath);
-        const rows = db.all(
-          `SELECT workspace_key, workspace_path, created_at, mode, title, title_overridden, archived, deleted, pinned FROM tasks WHERE ${scope.sql} AND task_id=? ORDER BY updated_at DESC`,
-          [...scope.values, task.sessionId]
-        ) as Array<{ workspace_key: string; workspace_path?: string; created_at?: number; mode?: string; title: string; title_overridden: number; archived: number; deleted: number; pinned: number }>;
-        const existing = rows[0];
-        // Reuse the existing identity, including its Windows spelling. Creating an
-        // alias row would collide with the desktop's UNIQUE(host_id, task_id).
-        const workspaceKey = existing?.workspace_key || task.workspacePath;
-        const workspacePath = existing?.workspace_path || workspaceKey;
-        const createdAt = existing?.created_at || task.createdAt || savedSession?.time_created || now;
-        const renamed = rows.find(row => row.title_overridden);
-        const effectiveTitle = task.overrideTitle ? title : renamed?.title ?? title;
-        const mode = task.mode || existing?.mode || "build";
-        // `glm` is the desktop task-index agent id, not a model provider.
-        const meta = JSON.stringify({
-          taskId: task.sessionId,
-          title: effectiveTitle,
-          workspacePath,
-          createdAt,
-          updatedAt,
-          mode,
-          provider: "glm",
-          status,
-        });
-        db.run(
-          `
-          INSERT INTO tasks (
-            workspace_key, workspace_path, workspace_identity, task_id, title,
-            task_status, provider, mode, model, created_at, updated_at,
-            last_unread_at, pinned, archived, deleted, title_overridden,
-            meta_json, searchable_text
-          ) VALUES (?, ?, NULL, ?, ?, ?, 'glm', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, '')
-          ON CONFLICT(workspace_key, task_id) DO UPDATE SET
-            title=CASE
-              WHEN excluded.title_overridden=1 THEN excluded.title
-              WHEN tasks.title_overridden=1 THEN tasks.title
-              ELSE excluded.title
-            END,
-            title_overridden=MAX(tasks.title_overridden, excluded.title_overridden),
-            pinned=MAX(tasks.pinned, excluded.pinned),
-            archived=MAX(tasks.archived, excluded.archived),
-            deleted=MAX(tasks.deleted, excluded.deleted),
-            provider=COALESCE(NULLIF(tasks.provider,''), excluded.provider),
-            created_at=CASE WHEN COALESCE(tasks.created_at,0)=0 THEN excluded.created_at ELSE tasks.created_at END,
-            task_status=excluded.task_status,
-            mode=excluded.mode,
-            model=COALESCE(excluded.model, tasks.model),
-            updated_at=excluded.updated_at,
-            meta_json=excluded.meta_json
-          `,
-          [
-            workspaceKey,
-            workspacePath,
-            task.sessionId,
-            effectiveTitle,
-            status,
-            mode,
-            model,
-            createdAt,
-            updatedAt,
-            Math.max(0, ...rows.map(row => row.pinned)),
-            Math.max((savedSession && "time_archived" in savedSession
-              ? savedSession.time_archived : task.archived) ? 1 : 0, ...rows.map(row => row.archived)),
-            Math.max(0, ...rows.map(row => row.deleted)),
-            overridden || (renamed ? 1 : 0),
-            meta,
-          ]
-        );
-        syncDesktopProject(db, workspacePath, task.sessionId, scope.values);
-        if (task.overrideTitle) db.run(
-          `UPDATE tasks SET title=?, title_overridden=1 WHERE ${scope.sql} AND task_id=?`,
-          [title, ...scope.values, task.sessionId]
-        );
-        db.exec("COMMIT");
-      } catch (e) {
-        db.exec("ROLLBACK");
-        throw e;
-      }
-    });
+    const savedSession = readSavedSession(task.sessionId);
+    const db = openNativeSqlite(dbPath, false, task.overrideTitle ? 5000 : 0);
+    try { writeTaskTransaction(db, () => writeTask(db, task, savedSession)); } finally { db.close(); }
     logDebug("Indexed session for desktop", task.sessionId);
     return true;
   } catch (e) {
     logWarn("Failed to index session for ZCode desktop", e);
     return false;
   }
+}
+
+function writeTask(db: SqliteApi, task: DesktopTask, savedSession?: ReturnType<typeof readSavedSession>): void {
+  const now = Date.now();
+  const title = task.title || "新会话";
+  const model = task.model ?? null;
+  const updatedAt = task.updatedAt ?? now;
+  const overridden = task.overrideTitle ? 1 : 0;
+  const scope = workspacePredicate(db, task.workspacePath);
+  const rows = db.all(
+    `SELECT workspace_key, workspace_path, created_at, task_status, mode, title, title_overridden, deleted, pinned FROM tasks WHERE ${scope.sql} AND task_id=? ORDER BY updated_at DESC`,
+    [...scope.values, task.sessionId]
+  ) as Array<{ workspace_key: string; workspace_path?: string; created_at?: number; task_status?: string; mode?: string; title: string; title_overridden: number; deleted: number; pinned: number }>;
+  const existing = rows[0];
+  const status = task.status ?? existing?.task_status ?? "completed";
+  // Reuse the existing identity, including its Windows spelling. Creating an
+  // alias row would collide with the desktop's UNIQUE(host_id, task_id).
+  const workspaceKey = existing?.workspace_key || task.workspacePath;
+  const workspacePath = existing?.workspace_path || workspaceKey;
+  const createdAt = existing?.created_at || task.createdAt || savedSession?.time_created || now;
+  const renamed = rows.find(row => row.title_overridden);
+  const effectiveTitle = task.overrideTitle ? title : renamed?.title ?? title;
+  const mode = task.mode || existing?.mode || "build";
+  // `glm` is the desktop task-index agent id, not a model provider.
+  const meta = JSON.stringify({
+    taskId: task.sessionId,
+    title: effectiveTitle,
+    workspacePath,
+    createdAt,
+    updatedAt,
+    mode,
+    provider: "glm",
+    status,
+  });
+  // Initialize archive state on insert only. A list captured before a restore
+  // can be retried later, after another window has updated the existing row.
+  const archived = savedSession && "time_archived" in savedSession ? savedSession.time_archived : task.archived;
+  db.run(
+    `
+    INSERT INTO tasks (
+      workspace_key, workspace_path, workspace_identity, task_id, title,
+      task_status, provider, mode, model, created_at, updated_at,
+      last_unread_at, pinned, archived, deleted, title_overridden,
+      meta_json, searchable_text
+    ) VALUES (?, ?, NULL, ?, ?, ?, 'glm', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, '')
+    ON CONFLICT(workspace_key, task_id) DO UPDATE SET
+      title=CASE
+        WHEN excluded.title_overridden=1 THEN excluded.title
+        WHEN tasks.title_overridden=1 THEN tasks.title
+        ELSE excluded.title
+      END,
+      title_overridden=MAX(tasks.title_overridden, excluded.title_overridden),
+      pinned=MAX(tasks.pinned, excluded.pinned),
+      deleted=MAX(tasks.deleted, excluded.deleted),
+      provider=COALESCE(NULLIF(tasks.provider,''), excluded.provider),
+      created_at=CASE WHEN COALESCE(tasks.created_at,0)=0 THEN excluded.created_at ELSE tasks.created_at END,
+      task_status=excluded.task_status,
+      mode=excluded.mode,
+      model=COALESCE(excluded.model, tasks.model),
+      updated_at=excluded.updated_at,
+      meta_json=excluded.meta_json
+    `,
+    [
+      workspaceKey,
+      workspacePath,
+      task.sessionId,
+      effectiveTitle,
+      status,
+      mode,
+      model,
+      createdAt,
+      updatedAt,
+      Math.max(0, ...rows.map(row => row.pinned)),
+      archived ? 1 : 0,
+      Math.max(0, ...rows.map(row => row.deleted)),
+      overridden || (renamed ? 1 : 0),
+      meta,
+    ]
+  );
+  syncDesktopProject(db, workspacePath, task.sessionId, scope.values);
+  if (task.overrideTitle) db.run(
+    `UPDATE tasks SET title=?, title_overridden=1 WHERE ${scope.sql} AND task_id=?`,
+    [title, ...scope.values, task.sessionId]
+  );
+}
+
+function writeTaskTransaction(db: SqliteApi, write: () => void): void {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    write();
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+/** Best-effort list mirroring. Never wait synchronously for the desktop writer. */
+export async function indexListedDesktopTasks(tasks: DesktopTask[], current: () => boolean): Promise<number> {
+  const file = tasksIndexPath();
+  if (!tasks.length || !fs.existsSync(file)) return 0;
+  for (const delay of [0, 100, 400]) {
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    if (!current()) break;
+    try {
+      const db = openNativeSqlite(file, false, 0);
+      let indexed = 0;
+      try {
+        writeTaskTransaction(db, () => {
+          for (const task of tasks) {
+            db.exec("SAVEPOINT index_row");
+            try {
+              writeTask(db, task);
+              indexed++;
+            } catch (error) {
+              db.exec("ROLLBACK TO index_row");
+              // A stale row can conflict with another workspace identity.
+              if ((Number((error as { errcode?: number }).errcode) & 255) !== 19) throw error;
+              logWarn("Skipping conflicting desktop task", error);
+            }
+            db.exec("RELEASE index_row");
+          }
+        });
+      } finally { db.close(); }
+      return indexed;
+    } catch (error) {
+      const code = Number((error as { errcode?: number }).errcode) & 255;
+      if (code !== 5 && code !== 6) { logWarn("Could not index session list", error); break; }
+    }
+  }
+  return 0;
 }
 
 /** Persisted archive timestamps take precedence over a server's cached session list. */
@@ -732,11 +776,7 @@ export function persistEmptySessionMode(sessionId: string, mode: string, planEna
     try {
       if (db.get("SELECT id FROM session WHERE id=?", [sessionId])
         && !db.get("SELECT id FROM message WHERE session_id=? LIMIT 1", [sessionId])) {
-        const now = Date.now();
-        db.run(`INSERT INTO session_entry (id, session_id, type, time_created, time_updated, data)
-          VALUES (?, ?, 'runtime/execution_state', ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET data=excluded.data, time_updated=excluded.time_updated`,
-        [`${sessionId}:runtime-execution-state`, sessionId, now, now, JSON.stringify({ mode, planEnabled })]);
+        writeExecutionState(db, sessionId, mode, planEnabled);
       }
       db.exec("COMMIT");
     } catch (error) {
@@ -746,21 +786,37 @@ export function persistEmptySessionMode(sessionId: string, mode: string, planEna
   });
 }
 
+function writeExecutionState(db: SqliteApi, sessionId: string, mode: string, planEnabled: boolean): void {
+  const now = Date.now();
+  db.run(`INSERT INTO session_entry (id, session_id, type, time_created, time_updated, data)
+    VALUES (?, ?, 'runtime/execution_state', ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET data=excluded.data, time_updated=excluded.time_updated`,
+  [`${sessionId}:runtime-execution-state`, sessionId, now, now, JSON.stringify({ mode, planEnabled })]);
+}
+
 /**
  * app-server only writes ~/.zcode/cli/db/db.sqlite on the first prompt.
  * Indexing the desktop sidebar before that leaves a ghost task that cannot
  * be resumed after the plugin process exits. Persist the session row now.
  */
-export function persistCliSession(task: DesktopTask & { mode?: string }): boolean {
+export function cliSessionStoreEmpty(): boolean {
+  const file = sessionDbPath();
+  if (!fs.existsSync(file)) return false;
+  try {
+    return withDb(file, db => !db.get("SELECT 1 FROM session LIMIT 1"));
+  } catch {
+    return false;
+  }
+}
+
+export function persistCliSession(task: DesktopTask, initialVersion?: string): boolean {
   const dbPath = sessionDbPath();
   if (!fs.existsSync(dbPath) || !task.sessionId || !task.workspacePath) return false;
   const now = task.updatedAt ?? Date.now();
   const placeholders = new Set(["", "新会话", "New session", "Untitled session"]);
   const title = (task.title || "").trim() || "Untitled session";
   const directory = task.workspacePath;
-  const projectId = "proj_" + slugify(directory).slice(0, 80);
   const force = !!task.overrideTitle;
-  const permission = JSON.stringify({ mode: task.mode || "build" });
   let skippedVersion = false;
   try {
     withWritableDb(dbPath, (db) => {
@@ -790,37 +846,7 @@ export function persistCliSession(task: DesktopTask & { mode?: string }): boolea
         );
         return;
       }
-      const latest = db.get("select version from session order by time_updated desc limit 1") as
-        | { version?: string }
-        | null;
-      const version = latest?.version?.trim() || "";
-      if (!version) {
-        skippedVersion = true;
-        return;
-      }
-      db.run(
-        `
-        insert into session (
-          id, project_id, workspace_id, parent_id, trace_id, task_type, slug,
-          directory, path, title, title_source, title_message_id, version,
-          share_url, summary_additions, summary_deletions, summary_files, summary_diffs,
-          revert, permission, time_created, time_updated, time_title_updated,
-          time_compacting, time_archived
-        ) values (?, ?, NULL, NULL, NULL, 'interactive', ?, ?, ?, ?, 'first_input', NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL, NULL)
-        `,
-        [
-          task.sessionId,
-          projectId,
-          slugify(task.sessionId),
-          directory,
-          directory,
-          title,
-          version,
-          permission,
-          now,
-          now,
-        ]
-      );
+      skippedVersion = !insertCliSession(db, task, now, null, initialVersion);
     });
     if (skippedVersion) {
       logWarn("CLI session table has no version yet; skipped session row", task.sessionId);
@@ -835,45 +861,98 @@ export function persistCliSession(task: DesktopTask & { mode?: string }): boolea
   }
 }
 
+function insertCliSession(db: SqliteApi, task: DesktopTask, now: number, archivedAt: number | null = null, initialVersion?: string): boolean {
+  const latest = db.get("select version from session order by time_updated desc limit 1") as
+    | { version?: string }
+    | null;
+  const version = latest?.version?.trim() || initialVersion;
+  if (!version) return false;
+  db.run(
+    `
+    insert into session (
+      id, project_id, workspace_id, parent_id, trace_id, task_type, slug,
+      directory, path, title, title_source, title_message_id, version,
+      share_url, summary_additions, summary_deletions, summary_files, summary_diffs,
+      revert, permission, time_created, time_updated, time_title_updated,
+      time_compacting, time_archived
+    ) values (?, ?, NULL, NULL, NULL, 'interactive', ?, ?, ?, ?, 'first_input', NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL, ?)
+    `,
+    [
+      task.sessionId,
+      "proj_" + slugify(task.workspacePath).slice(0, 80),
+      slugify(task.sessionId),
+      task.workspacePath,
+      task.workspacePath,
+      (task.title || "").trim() || "Untitled session",
+      version,
+      JSON.stringify({ mode: task.mode || "build" }),
+      now,
+      now,
+      archivedAt,
+    ]
+  );
+  return true;
+}
+
 export function setTaskArchived(
   workspacePath: string,
   sessionId: string,
-  archived: boolean
+  archived: boolean,
+  newSession?: { title: string; model?: string; mode: string; baseMode: string; planEnabled: boolean }
 ): void {
   const now = Date.now();
-  let indexSaved = false;
   const indexPath = tasksIndexPath();
-  if (fs.existsSync(indexPath)) {
-    try {
-      withWritableDb(indexPath, (db) => {
-        const scope = workspacePredicate(db, workspacePath);
-        const result = db.run(
-          `UPDATE tasks SET archived=?, updated_at=? WHERE ${scope.sql} AND task_id=?`,
-          [archived ? 1 : 0, now, ...scope.values, sessionId]
-        );
-        indexSaved = Number((result as { changes: number | bigint }).changes) > 0;
-      });
-    } catch (e) {
-      logWarn("Failed to update desktop archive flag", e);
-      throw e;
-    }
-  }
-
   const cliPath = sessionDbPath();
-  if (fs.existsSync(cliPath)) {
-    try {
-      withWritableDb(cliPath, (db) => {
-        db.run("UPDATE session SET time_archived=?, time_updated=? WHERE id=?", [
-          archived ? now : null,
-          now,
-          sessionId,
-        ]);
-      });
-    } catch (e) {
-      logWarn("Failed to update session archive timestamp", e);
-      if (indexSaved) throw new SessionSyncError("会话归档状态已保存到桌面索引，但会话数据库同步失败。请重试相同操作。", {}, { cause: e });
-      throw e;
-    }
+  const liveTask = archived && newSession ? { ...newSession, workspacePath, sessionId, archived } : undefined;
+  let cliSaved = false;
+  const saveSession = (indexed?: boolean): DesktopTask | undefined => {
+    let task: DesktopTask | undefined = liveTask;
+    const missing = () => new SessionSyncError(liveTask || (indexed && archived)
+      ? "未找到已保存的会话记录。如果是新会话，请先发送一条消息再重试归档。"
+      : "未找到要归档或恢复的会话。");
+    if (!fs.existsSync(cliPath)) throw missing();
+    withWritableDb(cliPath, db => writeTaskTransaction(db, () => {
+      const result = db.run("UPDATE session SET time_archived=?, time_updated=? WHERE id=?",
+        [archived ? now : null, now, sessionId]) as { changes: number | bigint };
+      if (Number(result.changes)) {
+        if (indexed === false && !liveTask) {
+          // A delayed list may still carry the opposite flag. Anchor the new
+          // index row to the saved chat in this workspace.
+          const saved = db.get("SELECT * FROM session WHERE id=?", [sessionId]) as
+            { title?: string; directory?: string; time_created?: number };
+          if (saved.directory && sameWorkspacePath(saved.directory, workspacePath)) {
+            task = { workspacePath, sessionId, title: saved.title || "新会话", createdAt: saved.time_created, archived };
+          }
+        }
+        return;
+      }
+      if (liveTask && insertCliSession(db, { ...liveTask, mode: liveTask.baseMode }, now, now)) {
+        writeExecutionState(db, sessionId, liveTask.baseMode, liveTask.planEnabled);
+        return;
+      }
+      throw missing();
+    }));
+    cliSaved = true;
+    return task;
+  };
+  if (!fs.existsSync(indexPath)) {
+    saveSession();
+    return;
+  }
+  // Serialize the desktop flag with other windows and keep it uncommitted
+  // until the session itself is durable. A cached sidebar row alone proves nothing.
+  try {
+    withWritableDb(indexPath, db => writeTaskTransaction(db, () => {
+      const scope = workspacePredicate(db, workspacePath);
+      const result = db.run(`UPDATE tasks SET archived=?, updated_at=? WHERE ${scope.sql} AND task_id=?`,
+        [archived ? 1 : 0, now, ...scope.values, sessionId]) as { changes: number | bigint };
+      const indexed = Number(result.changes) > 0;
+      const task = saveSession(indexed);
+      if (!indexed && task) writeTask(db, task);
+    }));
+  } catch (error) {
+    if (cliSaved) throw new SessionSyncError("会话归档状态已保存，但桌面索引同步失败。请重试相同操作。", {}, { cause: error });
+    throw error;
   }
 }
 
@@ -927,23 +1006,21 @@ export function setTaskDeleted(workspacePath: string, sessionId: string): void {
   const now = Date.now();
   const indexPath = tasksIndexPath();
   if (!fs.existsSync(indexPath)) throw new LocalizedError("桌面会话索引不存在，无法删除会话。");
-  if (fs.existsSync(indexPath)) {
-    try {
-      let deleted = false;
-      withWritableDb(indexPath, (db) => {
-        const scope = workspacePredicate(db, workspacePath);
-        const result = db.run(
-          `UPDATE tasks SET deleted=1, archived=0, updated_at=? WHERE ${scope.sql} AND task_id=?`,
-          [now, ...scope.values, sessionId]
-        );
-        deleted = Number((result as { changes?: number | bigint } | null)?.changes ?? 0) > 0;
-      });
-      if (!deleted) throw new SessionSyncError("没有找到要删除的会话。");
-    } catch (e) {
-      logWarn("Failed to mark desktop task deleted", e);
-      throw e;
+  withWritableDb(indexPath, db => writeTaskTransaction(db, () => {
+    const scope = workspacePredicate(db, workspacePath);
+    const where = `${scope.sql} AND task_id=?`;
+    const keys = [...scope.values, sessionId];
+    const flags = db.get(`SELECT MAX(archived) AS archived, MAX(deleted) AS deleted FROM tasks WHERE ${where}`, keys) as
+      { archived: number | null; deleted: number | null };
+    if (flags.deleted === null) throw new SessionSyncError("没有找到要删除的会话。");
+    if (flags.deleted) throw new SessionSyncError("会话已删除");
+    // Archive and restore take the same index write lock. A confirmation
+    // from an older list cannot delete a session another window just restored.
+    if (!flags.archived && !loadSessionArchiveTimes([sessionId]).get(sessionId)) {
+      throw new SessionSyncError("请先归档再删除");
     }
-  }
+    db.run(`UPDATE tasks SET deleted=1, archived=0, updated_at=? WHERE ${where}`, [now, ...keys]);
+  }));
 }
 
 export function loadTaskFlags(workspacePath: string): {

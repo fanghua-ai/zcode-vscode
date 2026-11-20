@@ -5,6 +5,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { promisify } from "util";
+import { withRuntimeCompileCache } from "./runtimeCache";
 
 const execFileAsync = promisify(execFile);
 
@@ -179,6 +180,19 @@ export function appServerLaunch(input: {
     args: [...prefix, input.binaryPath, "app-server"],
     electronAsNode: true,
   };
+}
+
+export async function readCliVersion(options: { binaryPath: string; nodePath?: string; compileCachePath?: string }): Promise<string | undefined> {
+  const launch = appServerLaunch({ ...options, execPath: process.execPath });
+  const env = withRuntimeCompileCache(process.env, options.compileCachePath);
+  const { stdout } = await execFileAsync(launch.command, [...launch.args.slice(0, -1), "--version"], {
+    windowsHide: true,
+    timeout: 15_000,
+    maxBuffer: 64 * 1024,
+    env: launch.electronAsNode ? { ...env, ELECTRON_RUN_AS_NODE: "1" } : env,
+  });
+  const version = stdout.trim();
+  return /^\d+\.\d+\.\d+(?:[-+][\w.+-]+)?$/.test(version) ? version : undefined;
 }
 
 export function startupExitMessage(input: {

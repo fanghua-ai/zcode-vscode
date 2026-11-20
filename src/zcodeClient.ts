@@ -9,7 +9,7 @@ import { ChildProcess, spawn } from "child_process";
 import * as fs from "fs";
 import * as readline from "readline";
 import { sameWorkspacePath } from "./workspacePath";
-import { listWorkspacePathVariants, sessionsFinishedSince, loadSubagentMessages, persistEmptySessionMode, loadSessionExecutionState, saveSessionRestoreIntent } from "./taskIndex";
+import { cliSessionStoreEmpty, persistCliSession, listWorkspacePathVariants, sessionsFinishedSince, loadSubagentMessages, persistEmptySessionMode, loadSessionExecutionState, saveSessionRestoreIntent } from "./taskIndex";
 import { logDebug, logError, logInfo, logWarn } from "./log";
 import { redactSecrets } from "./redact";
 import {
@@ -17,7 +17,8 @@ import {
   ResolveResult,
   appServerEnv,
   buildAccountProviderSync,
-  isDesktopOauthProvider,
+  isAccountPlanProvider,
+  isStartPlanProvider,
   modelContextWindow,
   readPlanSelection,
   readConfiguredDefaultModel,
@@ -30,7 +31,7 @@ import {
 import { fetchPlanQuota, invalidatePlanAuth, type PlanQuotaLimit, type QuotaLine, type PlanAuth } from "./credentials";
 import { desktopVersion, modelFailureDetails, recordDiagnosticEvent } from "./diagnostics";
 import { DESKTOP_PLUGIN_OVERLAY_ENV } from "./desktopPluginOverlay";
-import { appServerLaunch, startupExitMessage } from "./serverPath";
+import { appServerLaunch, readCliVersion, startupExitMessage } from "./serverPath";
 import { StartupTiming } from "./startupTiming";
 import { FileChange, parseFileChange } from "./toolFiles";
 import {
@@ -46,8 +47,13 @@ import {
   type GoalState,
 } from "./conversation";
 import { parseGoalCommand, type GoalCommand } from "./goalCommand";
-import { sameSessionModel, type NewSessionDefaults } from "./newSessionDefaults";
+import { sameSessionModel, type NewSessionDefaults, type SessionModelChoice } from "./newSessionDefaults";
 import { localSubagents, mergeSubagentCatalog } from "./subagentCatalog";
+
+function matchesStartPlanModel(runtime: ResolvedRuntime, model: SessionModelChoice): boolean {
+  return sameDesktopLogin(runtime, model.providerId)
+    && Object.keys(runtime.models).some(id => id.toLowerCase() === model.modelId.toLowerCase());
+}
 
 export interface ZCodeRequest {
   id: string | number;
@@ -151,6 +157,7 @@ export type HistoryStep =
     };
 
 export interface HistoryItem {
+  backgroundTurnStart?: true;
   turnId?: string;
   rowId?: number;
   logEpoch?: string;
@@ -385,9 +392,10 @@ interface Pending {
   timer?: NodeJS.Timeout;
   method?: string;
   timing?: StartupTiming;
+  unknownSendStatus?: () => SendStatusUnknownError;
 }
 
-/** The legacy send request may still execute after its acknowledgement times out. */
+/** The request left this client, but the backend's decision was not received. */
 export class SendStatusUnknownError extends LocalizedError {
   constructor(readonly running = false) {
     super("发送状态未确认，请先查看当前对话。");
@@ -426,8 +434,8 @@ export class ZCodeClient {
   private sessionId: string | null = null;
   /** False while resume/create has selected an id the server has not activated. */
   private sessionReadable = true;
-  /** False until that activation and its conversation subscription both finish. */
-  private sessionSynced = false;
+  /** Set after activation and the conversation subscription both finish. */
+  private sessionAttachment?: "created" | "resumed";
   /** Counts resume RPCs that the server may still be executing. */
   private resumeRequests = 0;
   /** Resume ids whose client deadline passed; the server keeps running them. */
@@ -742,7 +750,7 @@ export class ZCodeClient {
       this.sessionRuntime = { ...this.defaultRuntime, modelId: model.modelId };
       return;
     }
-    if (isDesktopOauthProvider(model.providerId)) {
+    if (isAccountPlanProvider(model.providerId)) {
       this.sessionRuntime = null;
       logWarn("No current desktop login for this session's coding-plan model", model);
       return;
@@ -761,10 +769,22 @@ export class ZCodeClient {
     return this.lastTitle;
   }
 
+  get currentSlashCommands(): ReadonlyArray<(typeof this.slashCommands)[number]> {
+    return this.slashCommands;
+  }
+
+  get viewChanging(): boolean {
+    return !this.acceptLive;
+  }
+
   get sessionAttached(): boolean {
     // A resumed session can be read before its conversation subscription
     // finishes. Retry stays available until both steps succeed.
-    return !!this.sessionId && this.sessionReadable && this.sessionSynced;
+    return !!this.sessionId && this.sessionReadable && !!this.sessionAttachment;
+  }
+
+  get attachedNewSessionId(): string | null {
+    return this.sessionAttachment === "created" && this.sessionReadable && this.proc && childIsRunning(this.proc) ? this.sessionId : null;
   }
 
   /** Preload that hides desktop viewer plugins, or undefined when it cannot apply. */
@@ -790,6 +810,7 @@ export class ZCodeClient {
     createNew?: boolean;
     applyModel?: boolean;
     newSessionDefaults?: NewSessionDefaults;
+    requiredModel?: SessionModelChoice;
     chooseResume?: (
       listed: SessionSummary[],
       rejected: ReadonlySet<string>
@@ -899,7 +920,7 @@ export class ZCodeClient {
     const accountSync = this.syncAccountProviders();
     if (opts?.createNew) {
       await accountSync;
-      await this.createSession(true, opts.newSessionDefaults);
+      await this.createSession(true, opts.newSessionDefaults, opts.requiredModel);
       return;
     }
     try {
@@ -985,7 +1006,7 @@ export class ZCodeClient {
   private failPending(error: Error): void {
     for (const [, pending] of this.pending) {
       if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(error);
+      pending.reject(pending.unknownSendStatus?.() ?? error);
     }
     this.pending.clear();
     this.clearLateResumes();
@@ -1161,13 +1182,17 @@ export class ZCodeClient {
     };
   }
 
-  private async createSession(applyModel: boolean, newSessionDefaults?: NewSessionDefaults): Promise<void> {
+  private async createSession(
+    applyModel: boolean,
+    newSessionDefaults?: NewSessionDefaults,
+    requiredModel?: SessionModelChoice,
+    viewGen?: number
+  ): Promise<void> {
     // The desktop login may still be exchanging while the process starts. A new
     // session must be configured from that login, not from a missing default.
     await this.awaitStartupLogin();
     if (this.disposed) return;
     this.releaseStopWait();
-    this.runtimeNeedsRevalidation = true;
     this.sessionGeneration++;
     this.denyInferredInteractions("Session changed");
     for (const state of this.subagentDetails.values()) if (state.publishTimer) clearTimeout(state.publishTimer);
@@ -1181,7 +1206,7 @@ export class ZCodeClient {
     this.stopping = false;
     this.sessionId = null;
     this.sessionReadable = false;
-    this.sessionSynced = false;
+    this.sessionAttachment = undefined;
     this.lastContext = null;
     this.modelWindow = null;
     this.setSessionModel(null);
@@ -1192,7 +1217,10 @@ export class ZCodeClient {
     this.liveModelReady = false;
 
     const createdRuntime = this.defaultRuntime;
-    this.startSessionRuntime = createdRuntime?.providerId.includes("start-plan") ? createdRuntime : null;
+    this.startSessionRuntime = createdRuntime && isStartPlanProvider(createdRuntime.providerId) ? createdRuntime : null;
+    // The caller just resolved Start access (or verified the same desktop JWT
+    // during an outage). Keep this decision through the new session attachment.
+    this.runtimeNeedsRevalidation = !this.startSessionRuntime;
     this.setSessionModel(createdRuntime ? { providerId: createdRuntime.providerId, modelId: createdRuntime.modelId } : null);
     this.sessionRuntime = createdRuntime;
     const created = await this.sendRequest("session/create", {
@@ -1207,15 +1235,28 @@ export class ZCodeClient {
 
     this.sessionReadable = true;
     const stillThisSession = this.sessionScope();
-    await this.afterSessionAttached("created", applyModel, createdRuntime, undefined, newSessionDefaults);
-    if (stillThisSession()) this.sessionSynced = true;
+    if (cliSessionStoreEmpty()) {
+      // v4 commands need a saved parent row even before the first prompt.
+      // A fresh store has no older row from which to copy the CLI version.
+      const version = await readCliVersion(this.opts).catch(error => {
+        logWarn("Could not read the CLI version for the first session", error);
+        return undefined;
+      });
+      if (!stillThisSession()) return;
+      if (version) persistCliSession({
+        sessionId: this.sessionId, workspacePath: this.opts.workspacePath, title: this.lastTitle,
+        mode: newSessionDefaults?.mode ?? "build",
+      }, version);
+    }
+    await this.afterSessionAttached("created", applyModel, createdRuntime, { viewGen, newSessionDefaults, requiredModel });
+    if (stillThisSession()) this.sessionAttachment = "created";
   }
 
   async resumeSession(sessionId: string, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
-    return this.serializeSessionChange(() => this.resumeSessionInner(sessionId, known, timeoutMs));
+    return this.serializeSessionChange(() => this.resumeSessionInner(sessionId, undefined, known, timeoutMs));
   }
 
-  private async resumeSessionInner(sessionId: string, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
+  private async resumeSessionInner(sessionId: string, viewGen?: number, known?: SessionSummary, timeoutMs = 30000): Promise<void> {
     await this.modeChanges.get(sessionId)?.catch(() => {});
     const changingSession = this.sessionId !== sessionId;
     if (changingSession) this.startSessionRuntime = null;
@@ -1240,7 +1281,7 @@ export class ZCodeClient {
     }
     this.sessionId = sessionId;
     this.sessionReadable = false;
-    this.sessionSynced = false;
+    this.sessionAttachment = undefined;
     this.seenRowIds.clear();
     this.seenToolCallIds.clear();
     this.lastTitle = "";
@@ -1302,10 +1343,10 @@ export class ZCodeClient {
       resumedSnapshot = undefined;
     });
     if (!stillThisResume()) return;
-    await this.afterSessionAttached("resumed", false, null, resumedSnapshot as SessionSnapshot | undefined);
+    await this.afterSessionAttached("resumed", false, null, { viewGen, resumedSnapshot: resumedSnapshot as SessionSnapshot | undefined });
     // Subscription failure throws above. Readable stays true, but this session
     // is not attached until the conversation catch-up succeeds.
-    if (stillThisResume()) this.sessionSynced = true;
+    if (stillThisResume()) this.sessionAttachment = "resumed";
     if (!this.liveModelReady || !this.lastTitle) await this.adoptResumedModel();
   }
 
@@ -1348,16 +1389,16 @@ export class ZCodeClient {
     return !!owner && owner === this.sessionId;
   }
 
-  async newSession(defaults?: NewSessionDefaults): Promise<void> {
-    return this.serializeSessionChange(() => this.createSession(true, defaults));
+  async newSession(defaults?: NewSessionDefaults, requiredModel?: SessionModelChoice, viewGen?: number): Promise<void> {
+    return this.serializeSessionChange(() => this.createSession(true, defaults, requiredModel, viewGen));
   }
 
-  async switchSession(sessionId: string): Promise<{
+  async switchSession(sessionId: string, viewGen?: number): Promise<{
     items: HistoryItem[];
     truncated: boolean;
   }> {
     return this.serializeSessionChange(async () => {
-      await this.resumeSessionInner(sessionId);
+      await this.resumeSessionInner(sessionId, viewGen);
       return this.loadHistory();
     });
   }
@@ -1366,8 +1407,12 @@ export class ZCodeClient {
     kind: "created" | "resumed",
     applyModel: boolean,
     createdRuntime: ResolvedRuntime | null = null,
-    resumedSnapshot?: SessionSnapshot,
-    newSessionDefaults?: NewSessionDefaults
+    { viewGen, resumedSnapshot, newSessionDefaults, requiredModel }: {
+      viewGen?: number;
+      resumedSnapshot?: SessionSnapshot;
+      newSessionDefaults?: NewSessionDefaults;
+      requiredModel?: SessionModelChoice;
+    } = {}
   ): Promise<void> {
     if (!this.sessionId) return;
     this.lastContext = null;
@@ -1426,13 +1471,13 @@ export class ZCodeClient {
           sub?.snapshot?.settings?.model?.current ||
           sub?.session?.model
       );
-      const startPlanRuntime = requestedRuntime?.providerId.includes("start-plan") ? requestedRuntime : null;
+      const startPlanRuntime = requestedRuntime && isStartPlanProvider(requestedRuntime.providerId) ? requestedRuntime : null;
       const matchesStart = !startPlanRuntime || (reportedModel &&
-        sameDesktopLogin(startPlanRuntime, reportedModel.providerId) && Object.hasOwn(startPlanRuntime.models, reportedModel.modelId));
-      if (reportedModel && requestedRuntime && !startPlanRuntime) {
+        matchesStartPlanModel(startPlanRuntime, reportedModel));
+      if (!requiredModel && reportedModel && requestedRuntime && !startPlanRuntime) {
         preferredModel = this.newSessionModelPreference(requestedRuntime, reportedModel, attachedSnapshot);
       }
-      if (reportedModel && matchesStart && !preferredModel) {
+      if (reportedModel && matchesStart && !preferredModel && (!requiredModel || sameSessionModel(requiredModel, reportedModel))) {
         await this.alignAndEmitModel(reportedModel);
         if (!isCurrent()) return;
         this.liveModelReady = true;
@@ -1445,7 +1490,13 @@ export class ZCodeClient {
       type: "session_title", data: { title: this.lastTitle || "新会话", sessionId: this.sessionId },
     });
     try {
-      if (preferredModel && reportedModel) {
+      if (requiredModel && !this.liveModelReady) {
+        // Recovery was an explicit provider choice. Confirm it even when
+        // the initial catalog is incomplete before making the chat usable.
+        announceTitle();
+        await this.setModel(requiredModel.providerId, requiredModel.modelId);
+        if (!isCurrent()) return;
+      } else if (preferredModel && reportedModel) {
         // The backend may report its built-in default before loading the
         // workspace registry. Index the new identity before selecting a model.
         announceTitle();
@@ -1459,7 +1510,7 @@ export class ZCodeClient {
           if (!isCurrent()) return;
           this.liveModelReady = true;
         }
-      } else if (kind === "created" && !requestedRuntime?.providerId.includes("start-plan") && !this.liveModelReady && attachedSnapshot?.settings?.model?.available?.length === 0) {
+      } else if (kind === "created" && !(requestedRuntime && isStartPlanProvider(requestedRuntime.providerId)) && !this.liveModelReady && attachedSnapshot?.settings?.model?.available?.length === 0) {
         // Announce the created identity first: the host persists its workspace
         // metadata on session_ready. Configuring a shell before that can make
         // even valid providers appear absent from the workspace registry.
@@ -1470,7 +1521,7 @@ export class ZCodeClient {
         const registered = available.find(model => !model.disabledReason &&
           model.providerId === requestedRuntime.providerId && model.modelId === requestedRuntime.modelId);
         if (registered) await this.setModel(registered.providerId, registered.modelId);
-        else await this.ensureSessionModel(attachedSnapshot, requestedRuntime.providerId.includes("start-plan") ? requestedRuntime : undefined);
+        else await this.ensureSessionModel(attachedSnapshot, isStartPlanProvider(requestedRuntime.providerId) ? requestedRuntime : undefined);
       } else await this.ensureSessionModel(attachedSnapshot);
     } catch (e) {
       logWarn("Could not apply model to session", e);
@@ -1503,7 +1554,7 @@ export class ZCodeClient {
     this.activeTiming?.mark("sessionAttachedMs");
     this.opts.onEvent({
       type: "session_ready",
-      data: { sessionId: this.sessionId, kind, title: this.lastTitle, slashCommands: this.slashCommands },
+      data: { sessionId: this.sessionId, kind, title: this.lastTitle, slashCommands: this.slashCommands, viewGen },
     });
     if (!hasNewDefaults) {
       if (!preferredModel) announceTitle();
@@ -1538,11 +1589,11 @@ export class ZCodeClient {
     if (requested) return requested;
     // A cold snapshot can contain only the built-in account placeholder,
     // even when the workspace accepts a configured API model after indexing.
-    if (runtime.source.endsWith("-oauth") || (available.length && !isDesktopOauthProvider(reported.providerId))) return;
-    const configured = !isDesktopOauthProvider(runtime.providerId) && Object.hasOwn(runtime.models, runtime.modelId)
+    if (runtime.source.endsWith("-oauth") || (available.length && !isAccountPlanProvider(reported.providerId))) return;
+    const configured = !isAccountPlanProvider(runtime.providerId) && Object.hasOwn(runtime.models, runtime.modelId)
       ? { providerId: runtime.providerId, modelId: runtime.modelId }
       : (this.opts.readDefaultModel ?? (() => readConfiguredDefaultModel(runtime, this.opts.binaryPath)))();
-    if (configured && !isDesktopOauthProvider(configured.providerId) && !sameSessionModel(configured, reported) &&
+    if (configured && !isAccountPlanProvider(configured.providerId) && !sameSessionModel(configured, reported) &&
         !available.some(model => model.disabledReason && sameSessionModel(model, configured))) {
       return configured;
     }
@@ -1558,7 +1609,8 @@ export class ZCodeClient {
         // that are selectable from the desktop/configured provider catalog.
         // Treat the saved choice like a manual model selection and let the
         // backend command decide whether it is actually usable.
-        const runtime = await this.opts.resolveSessionRuntime?.(defaults.model);
+        const runtime = this.startSessionRuntime && !matchesStartPlanModel(this.startSessionRuntime, defaults.model)
+          ? false : await this.opts.resolveSessionRuntime?.(defaults.model);
         if (!isCurrent()) return;
         if (runtime === false) {
           requestedModelApplied = false;
@@ -2315,8 +2367,9 @@ export class ZCodeClient {
     // The completion header can arrive after its reasoning and answer rows.
     // Redraw then so a work fold does not stay on its generic label.
     const turnHeaderChanged = replica.rows.some(row => {
-      if (row.kind !== "turnHeader" || row.state === "running" || row.state === "prewarming") return false;
+      if (row.kind !== "turnHeader") return false;
       const old = previous.find(item => item.rowId === row.rowId);
+      if (row.state === "running" || row.state === "prewarming") return row.origin === "backgroundResult" && !old;
       return !old || old.state !== row.state || old.startedAt !== row.startedAt
         || old.endedAt !== row.endedAt || old.activeMs !== row.activeMs;
     });
@@ -2437,7 +2490,9 @@ export class ZCodeClient {
       const timing = { ...identity, createdAt: row.createdAt ?? header?.startedAt, endedAt: header?.endedAt, workDurationMs };
       const id = (row.kind === "userInput" ? row.entityId : undefined) ?? `projection:${row.rowId}`;
       this.historyRowIds.set(id, row.rowId);
-      if (row.kind === "userInput") {
+      if (row.kind === "turnHeader" && row.origin === "backgroundResult") {
+        items.push({ id, ...timing, role: "assistant", text: "", tools: [], running, backgroundTurnStart: true });
+      } else if (row.kind === "userInput") {
         // Harness reminders ride the transcript as user rows; only real user
         // input renders as a bubble. Otherwise the injected row becomes the
         // last question, and the real question loses its edit pen.
@@ -2856,14 +2911,14 @@ export class ZCodeClient {
       if (!this.viewVisible || !isCurrent() || !isModelCurrent() || request !== this.quotaRequest) return;
     }
     let plan = this.opts.readQuotaPlan ? this.opts.readQuotaPlan() : readPlanSelection();
-    if (model?.providerId.includes("start-plan")) {
+    if (model && isStartPlanProvider(model.providerId)) {
       const family = model.providerId.includes("bigmodel") ? "bigmodel" : model.providerId.includes("zai") ? "zai" : null;
       plan = family ? { family, kind: "start-plan", providerId: model.providerId } : null;
-    } else if (model?.providerId.includes("individual-coding-plan") ||
+    } else if (model && isAccountPlanProvider(model.providerId) && model.providerId.includes("individual-coding-plan") ||
         (!plan && model?.providerId.endsWith("-coding-plan") && this.reusableRuntime(model)?.source === "desktop-personal-oauth")) {
       const family = model.providerId.includes("bigmodel") ? "bigmodel" : model.providerId.includes("zai") ? "zai" : null;
       plan = family ? { family, kind: "individual-coding-plan", providerId: model.providerId } : null;
-    } else if (model?.providerId.includes("team-coding-plan") &&
+    } else if (model && isAccountPlanProvider(model.providerId) && model.providerId.includes("team-coding-plan") &&
         (plan?.kind !== "team-coding-plan" || !model.providerId.includes(plan.family))) {
       plan = null;
     }
@@ -2915,7 +2970,8 @@ export class ZCodeClient {
     }
   }
 
-  private async ensureSessionModel(attachedSnapshot?: SessionSnapshot, startRuntime = this.startSessionRuntime ?? undefined): Promise<void> {
+  private async ensureSessionModel(attachedSnapshot?: SessionSnapshot, verifiedStartRuntime?: ResolvedRuntime): Promise<void> {
+    const startRuntime = verifiedStartRuntime ?? this.startSessionRuntime;
     if (this.liveModelReady) return;
     const isCurrent = this.sessionScope();
     // The attach path has already subscribed and checked the resume revision.
@@ -2933,7 +2989,7 @@ export class ZCodeClient {
     }
     const current = extractModel(snapshot?.settings?.model?.current) || extractModel(snapshot?.session?.model);
     const matchesStart = (model: { providerId: string; modelId: string }) => !startRuntime ||
-      (sameDesktopLogin(startRuntime, model.providerId) && Object.hasOwn(startRuntime.models, model.modelId));
+      matchesStartPlanModel(startRuntime, model);
     if (current && matchesStart(current)) {
       await this.alignAndEmitModel(current);
       if (!isCurrent()) return;
@@ -2947,12 +3003,21 @@ export class ZCodeClient {
       ...catalog.available.filter((m) => !m.disabledReason),
       ...(Array.isArray(snapshot?.settings?.model?.available) ? [] : listStoredProviderModels()),
     ].filter(matchesStart);
+    // A partial workspace catalog may still list yesterday's models. Its
+    // provider ID is usable for asking the backend to confirm today's default.
+    if (!tries.length && startRuntime) {
+      const planRows = catalog.available.filter(row => sameDesktopLogin(startRuntime, row.providerId));
+      const registered = planRows.find(row => !row.disabledReason);
+      if (registered && !planRows.some(row => row.modelId.toLowerCase() === startRuntime.modelId.toLowerCase())) {
+        tries.push({ providerId: registered.providerId, modelId: startRuntime.modelId });
+      }
+    }
     // Cold sessions advertise an empty registry before the first send loads
     // their workspace profile. The backend resolves its configured default
     // after its identity is persisted; an empty shell is not evidence of an invalid model.
     if (!tries.length && Array.isArray(snapshot?.settings?.model?.available) && !snapshot.settings.model.available.length) {
       if (startRuntime) {
-        if (reusable) return this.ensureSessionModel(undefined, startRuntime);
+        if (reusable) return this.ensureSessionModel(undefined, verifiedStartRuntime);
         throw new LocalizedError("暂时没有可用的模型。");
       }
       if (reusable) return this.ensureSessionModel();
@@ -2964,7 +3029,8 @@ export class ZCodeClient {
       try {
         let runtime: ResolvedRuntime | null | false | undefined;
         try {
-          runtime = await this.opts.resolveSessionRuntime?.(m);
+          runtime = verifiedStartRuntime && this.reusableRuntime(m)?.apiKey === verifiedStartRuntime.apiKey
+            ? verifiedStartRuntime : await this.opts.resolveSessionRuntime?.(m);
         } catch (error) {
           logWarn("Could not validate default model against desktop inventory", m.providerId, m.modelId, error);
         }
@@ -2984,7 +3050,7 @@ export class ZCodeClient {
     if (isCurrent()) {
       // An empty workspace registry may populate only during the first model
       // operation. Refresh once before ruling out the attached candidates.
-      if (reusable) return this.ensureSessionModel(undefined, startRuntime);
+      if (reusable) return this.ensureSessionModel(undefined, verifiedStartRuntime);
       throw lastError ?? new LocalizedError("暂时没有可用的模型。");
     }
   }
@@ -3076,7 +3142,7 @@ export class ZCodeClient {
     }
     await this.alignAndEmitModel({ providerId, modelId });
     if (!isCurrent()) return;
-    if (!providerId.includes("start-plan")) this.startSessionRuntime = null;
+    if (!isStartPlanProvider(providerId)) this.startSessionRuntime = null;
     this.liveModelReady = true;
     // Thought levels depend on the model that was just selected. The subscribe
     // snapshot was taken before that, so the next controls read must hit the server.
@@ -3225,7 +3291,7 @@ export class ZCodeClient {
     return true;
   }
 
-  async sendMessage(content: string, attachments: ImageAttachment[] = []): Promise<void> {
+  async sendMessage(content: string, attachments: ImageAttachment[] = [], commandId?: string): Promise<void> {
     if (!this.sessionId) throw new LocalizedError("没有活动会话，请先启动 ZCode。");
     if (!this.acceptLive) throw new LocalizedError("正在切换会话，请稍后发送。");
     const sessionId = this.sessionId;
@@ -3235,12 +3301,15 @@ export class ZCodeClient {
       if (attachments.length) {
         if (sessionId !== this.sessionId) throw new LocalizedError("会话已切换，请在当前会话重新发送。");
         await this.ensureSessionModel();
-        await this.insertQueuedMessage(content,{immediate:true,attachments});
-      } else await this.sendMessageInner(sessionId, content);
+        await this.insertQueuedMessage(content, { immediate: true, attachments, commandId });
+      } else await this.sendMessageInner(sessionId, content, commandId);
     });
   }
 
   private async requireAvailableSessionModel(): Promise<void> {
+    if (this.startSessionRuntime && !this.liveModelReady) {
+      throw new LocalizedError("该模型已不可用，请刷新模型列表后重新选择。");
+    }
     if (this.sessionId && this.pendingSessionRestores.has(this.sessionId)) {
       throw new LocalizedError("会话权限尚未恢复完成，请重新连接或明确选择权限后重试。");
     }
@@ -3257,12 +3326,19 @@ export class ZCodeClient {
       assertCurrentModel();
       if (!available) throw new LocalizedError("该模型已不可用，请刷新模型列表后重新选择。");
     }
+    if (isStartPlanProvider(model.providerId) && this.opts.resolveSessionRuntime
+      && (!this.sessionRuntime || !matchesStartPlanModel(this.sessionRuntime, model))) {
+      const runtime = await this.opts.resolveSessionRuntime(model);
+      assertCurrentModel();
+      if (!runtime) throw new LocalizedError("该模型已不可用，请刷新模型列表后重新选择。");
+      this.sessionRuntime = runtime;
+    }
     if (!this.providersNeedingAuthRefresh.has(model.providerId)) return;
 
     const reconnect = "模型认证需要刷新，请确认桌面端的凭据有效，点击「重新读取登录」后重试。";
     // A registry refresh reloads configured providers. Desktop plans can also
     // require account sync or request-time auth, so use the reconnect path.
-    if (isDesktopOauthProvider(model.providerId)) throw new LocalizedError(reconnect);
+    if (isAccountPlanProvider(model.providerId)) throw new LocalizedError(reconnect);
     const runtime = await this.opts.resolveSessionRuntime?.(model);
     assertCurrentModel();
     if (runtime === false) throw new LocalizedError("该模型已不可用，请刷新模型列表后重新选择。");
@@ -3281,20 +3357,20 @@ export class ZCodeClient {
     this.providersNeedingAuthRefresh.delete(model.providerId);
   }
 
-  private async sendMessageInner(sessionId: string, content: string): Promise<void> {
+  private async sendMessageInner(sessionId: string, content: string, commandId?: string): Promise<void> {
     if (sessionId !== this.sessionId) throw new LocalizedError("会话已切换，请在当前会话重新发送。");
     await this.ensureSessionModel();
     this.releaseStopWait();
     const goal = parseGoalCommand(content);
     if (goal) {
-      await this.dispatchGoalCommand(sessionId, goal);
+      await this.dispatchGoalCommand(sessionId, goal, commandId);
       this.stopping = false;
       return;
     }
     // Use the same desktop command path as follow-ups and attachments. A
     // legacy session/send turn does not drive the v4 queue's auto-drain.
     if (this.replica?.topic === `conversation/${sessionId}` && this.replica.seq !== null) {
-      await this.insertQueuedMessage(content, { immediate: true });
+      await this.insertQueuedMessage(content, { immediate: true, commandId });
       this.stopping = false;
       return;
     }
@@ -4018,19 +4094,23 @@ export class ZCodeClient {
     }
     return new Promise((resolve, reject) => {
       const id = this.msgId++;
+      const command = params as { type?: string; sessionId?: string } | undefined;
+      const sendsMessage = method === "session/send" || (method === "v4/command" && command?.type === "sendText");
+      const owner = command?.sessionId;
+      const unknownSendStatus = sendsMessage ? () => new SendStatusUnknownError(
+        !owner || owner === this.sessionId ? this.turnActive() : this.runningSessionIds.has(owner)
+      ) : undefined;
       const timer =
         timeoutMs > 0
           ? setTimeout(() => {
               if (this.pending.has(id)) {
                 this.pending.delete(id);
                 if (method === "session/resume") this.noteLateResume(id);
-                reject(method === "session/send"
-                  ? new SendStatusUnknownError(this.turnActive())
-                  : new Error(`Request ${method} timed out after ${timeoutMs}ms`));
+                reject(unknownSendStatus?.() ?? new Error(`Request ${method} timed out after ${timeoutMs}ms`));
               }
             }, timeoutMs)
           : undefined;
-      this.pending.set(id, { resolve, reject, timer, method, timing: this.activeTiming });
+      this.pending.set(id, { resolve, reject, timer, method, timing: this.activeTiming, unknownSendStatus });
       const rejectWrite = (error: unknown) => {
         if (!this.pending.delete(id)) return;
         if (timer) clearTimeout(timer);
@@ -4568,11 +4648,7 @@ export class ZCodeClient {
     this.snapshotWait?.();
     this.sessionGeneration++;
     this.denyPendingInteractions("Client disposed");
-    for (const [, p] of this.pending) {
-      if (p.timer) clearTimeout(p.timer);
-      p.reject(new LocalizedError("ZCode 客户端已关闭"));
-    }
-    this.pending.clear();
+    this.failPending(new LocalizedError("ZCode 客户端已关闭"));
     this.turnAuth.clear();
     for (const state of this.subagentDetails.values()) if (state.publishTimer) clearTimeout(state.publishTimer);
     this.subagentDetails.clear();
@@ -4580,7 +4656,6 @@ export class ZCodeClient {
     this.subagentToolOwners.clear();
     this.subagentSessionOwners.clear();
     this.providersNeedingAuthRefresh.clear();
-    this.clearLateResumes();
     this.rl?.close();
     this.rl = null;
     this.errRl?.close();
