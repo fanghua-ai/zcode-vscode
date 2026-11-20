@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { type V2Provider, usesProjectTokens, usesLegacyPlanKeys, tryPlanOAuth, fetchPlanQuota, readStartPlanAccess, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey, pickOrgAndProject, planAuthErrorDetails } from "./credentials";
+import { type V2Provider, usesProjectTokens, usesLegacyPlanKeys, tryPlanOAuth, fetchPlanQuota, readStartPlanAuth, readStartPlanAccess, readConfiguredProviderApiKey, readCredentialsWithRetry, readStoredPlanApiKeyWithRetry, readV2ConfigWithRetry, resolveApiKey, pickOrgAndProject, planAuthErrorDetails } from "./credentials";
 import { readDesktopJsonWithRetry } from "./desktopJson";
 import { isSessionModelAvailable, mergeDesktopApiProviders, syncCliConfig, resolveProviderRequestAuth, resolveRuntime, resolveRuntimeForSession } from "./desktop";
 import { ZCodeClient } from "./zcodeClient";
@@ -1368,9 +1368,16 @@ test("a 401 prevents both runtime refresh paths from reinstalling a stored perso
   assert.equal(state.loginStale, false);
 });
 
-test("PAT refresh keeps a still-valid token through temporary outages only", async t => {
+for (const linked of [false, true]) test(`PAT refresh keeps a still-valid token through temporary outages only (linked=${linked})`, async t => {
   const dir = fixture(t);
-  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ "oauth:bigmodel:access_token": "TEST-LOGIN" }));
+  fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({
+    "oauth:bigmodel:access_token": "TEST-LOGIN",
+    ...(linked ? {
+      "oauth:active_provider": "bigmodel",
+      "oauth:bigmodel:user_info": JSON.stringify({id:"person",username:"test",displayName:"Test"}),
+      "oauth:linked_bigmodel": JSON.stringify({userId:"person",customerId:"customer",accessToken:"TEST-LINKED"}),
+    } : {}),
+  }));
   let issued = 0;
   let status = 200;
   const api = mockPlanQuotaApi(t, () => ({ code: 200, data: {
@@ -1585,6 +1592,44 @@ test("PAT creation uses the dedicated Coding Plan key and usage scene", async t 
     name: "zcode-team-api-key", keyType: 2, usageScene: 1,
   });
 });
+
+for (const active of ["bigmodel", "zai", "zai_cn"]) for (const teamPlan of [true, false]) {
+  test(`3.19 BigModel ${teamPlan ? "team" : "personal"} exchange uses the business credential linked to the active ${active} login`, async t => {
+    const dir = fixture(t);
+    const credentials = {
+      "oauth:active_provider": active,
+      [`oauth:${active}:access_token`]: "TEST-SESSION",
+      [`oauth:${active}:user_info`]: JSON.stringify(active === "bigmodel" ? { id: "person", username: "test", displayName: "Test" } : { user_id: "person" }),
+      "oauth:linked_bigmodel": JSON.stringify({ userId: "person", customerId: "customer", accessToken: "TEST-LINKED" }),
+    };
+    const write = () => fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify(credentials));
+    write();
+    const api = mockPlanQuotaApi(t);
+    const team = teamPlan ? { organizationId: "org-current", projectId: "project-current" } : undefined;
+    assert.ok(await tryPlanOAuth("bigmodel", team, "3.19.0"));
+    assert.equal(api.requests.find(r => r.path.endsWith("getCustomerInfo"))?.headers.Authorization, "TEST-LINKED");
+    credentials["oauth:linked_bigmodel"] = JSON.stringify({userId:"someone-else",customerId:"customer",accessToken:"TEST-FOREIGN"});
+    write();
+    await tryPlanOAuth("bigmodel", team, "3.19.0");
+    assert.ok(!api.requests.some(r => r.headers.Authorization?.includes("TEST-FOREIGN")));
+  });
+}
+
+for (const [active, linked, bigmodel, zai] of [
+  ["bigmodel", false, true, false], ["zai_cn", false, true, false],
+  ["zai", false, false, true], ["zai", true, true, true],
+] as const) {
+  test(`Start Plan JWT follows the desktop family for ${active} with linked account=${linked}`, async t => {
+    fs.writeFileSync(path.join(fixture(t), "credentials.json"), JSON.stringify({
+      "oauth:active_provider": active, [`oauth:${active}:access_token`]: "TEST-LOGIN",
+      [`oauth:${active}:user_info`]: JSON.stringify({user_id:"person"}), zcodejwttoken:"TEST-JWT",
+      ...(linked ? {"oauth:linked_bigmodel":JSON.stringify({userId:"person",customerId:"customer",accessToken:"TEST-BUSINESS"})} : {}),
+    }));
+    for (const [family, allowed] of [["bigmodel",bigmodel],["zai",zai]] as const) {
+      assert.equal((await readStartPlanAuth(family))?.apiKey, allowed ? "TEST-JWT" : undefined);
+    }
+  });
+}
 
 test("a team outside customerInfo cannot obtain a project token", async t => {
   const dir = fixture(t);

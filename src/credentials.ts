@@ -29,6 +29,33 @@ export const CRED_KEYS = {
   zcodeJwtToken: "zcodejwttoken",
 } as const;
 
+/** Desktop 3.19 stores the BigModel business login separately from the OAuth session. */
+function linkedBigModelToken(credentials: Record<string, string>): string | undefined {
+  const linked = credentials["oauth:linked_bigmodel"];
+  if (!linked) return;
+  const active = credentials[CRED_KEYS.activeProvider];
+  if (!["bigmodel", "zai", "zai_cn"].includes(active) || !credentials[`oauth:${active}:access_token`]?.trim()) return;
+  try {
+    const profile = JSON.parse(credentials[`oauth:${active}:user_info`]);
+    const account = JSON.parse(linked);
+    const normalized = typeof profile?.id === "string" && typeof profile.username === "string" && typeof profile.displayName === "string";
+    const userId = normalized ? profile.id : active !== "bigmodel" ? profile?.user_id : undefined;
+    if (typeof userId === "string" && userId.trim() && account?.userId === userId &&
+        typeof account.customerId === "string" && account.customerId.trim() &&
+        typeof account.accessToken === "string" && account.accessToken.trim()) return account.accessToken;
+  } catch { /* Ignore incomplete or obsolete linked credentials. */ }
+}
+
+function planBusinessToken(family: PlanFamily, credentials: Record<string, string>): string | undefined {
+  const active = credentials[CRED_KEYS.activeProvider];
+  if (family === "bigmodel") {
+    const linked = linkedBigModelToken(credentials);
+    if (linked) return linked;
+  }
+  if (active && active !== family) return;
+  return credentials[family === "bigmodel" ? CRED_KEYS.bigmodelAccessToken : CRED_KEYS.zaiAccessToken];
+}
+
 export type PlanFamily = "bigmodel" | "zai";
 
 const PLAN_HOST: Record<PlanFamily, string> = {
@@ -780,7 +807,7 @@ async function resolveLegacyPlanKey(family: PlanFamily, oauth: string, prefer?: 
     const apiKey = await resolveApiKey(family, authorization, prefer);
     const latest = await readCredentialsWithRetry();
     if (legacyPlanKeys.get(scope) !== current ||
-        latest[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] !== oauth) {
+        planBusinessToken(family, latest) !== oauth) {
       throw new Error("project_token_account_changed");
     }
     current.value = { apiKey };
@@ -855,7 +882,7 @@ async function resolveProjectToken(
     if (expiresAt <= Date.now()) throw new PlanAuthError("issue_project_token", "expired", tokenResponse);
     const latest = await readCredentialsWithRetry();
     if (planTokens.get(scope) !== current ||
-        latest[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] !== oauth) {
+        planBusinessToken(family, latest) !== oauth) {
       throw new Error("project_token_account_changed");
     }
     current.value = { apiKey: token.accessToken.trim(), apiKeyId, accountScope: scope };
@@ -869,7 +896,7 @@ async function resolveProjectToken(
         Date.now() >= current.expiresAt!) throw error;
     const latest = await readCredentialsWithRetry().catch(() => null);
     if (planTokens.get(scope) !== current ||
-        latest?.[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken] !== oauth) {
+        !latest || planBusinessToken(family, latest) !== oauth) {
       throw new Error("project_token_account_changed");
     }
     if (!current.value || Date.now() >= current.expiresAt!) throw error;
@@ -908,8 +935,7 @@ export async function tryPlanOAuth(
       logDebug("Using stored personal plan key for an unknown desktop version", { family });
       return { apiKey, activeProvider: loaded[CRED_KEYS.activeProvider] ?? family };
     };
-    const tokenKey = family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken;
-    const accessToken = creds[tokenKey];
+    const accessToken = planBusinessToken(family, creds);
     if (!accessToken?.trim().replace(/^Bearer\s+/i, "")) {
       logWarn("Desktop OAuth token is unavailable", { family });
       return storedPersonalAuth(creds);
@@ -930,7 +956,7 @@ export async function tryPlanOAuth(
         const details = { ...planAuthErrorDetails(error), family, team: !!prefer };
         if (!prefer) {
           const latest = await readCredentialsWithRetry();
-          if (latest[tokenKey] !== accessToken) throw new Error("project_token_account_changed");
+          if (planBusinessToken(family, latest) !== accessToken) throw new Error("project_token_account_changed");
           const stored = storedPersonalAuth(latest);
           if (stored) {
             logWarn("Project token unavailable for an unknown desktop version; using a stored personal key", details);
@@ -1070,13 +1096,15 @@ export async function readStartPlanAuth(family: PlanFamily): Promise<PlanAuth | 
     return null;
   }
   const active = credentials[CRED_KEYS.activeProvider]?.trim();
-  if (active && active !== family) {
+  const ownsSharedJwt = active === family || (family === "bigmodel" &&
+    (active === "zai_cn" || !!linkedBigModelToken(credentials)));
+  if (active && !ownsSharedJwt) {
     logDebug("Start Plan credential unavailable", { family, reason: "active_provider_mismatch" });
     return null;
   }
   // BigModel's shared JWT belongs to the active OAuth provider. A scoped
   // provider copy is the desktop's fallback when that ownership is unknown.
-  const shared = family === "zai" || active === family
+  const shared = family === "zai" || ownsSharedJwt
     ? credentials[CRED_KEYS.zcodeJwtToken]?.trim() : "";
   const scoped = shared ? null : readStoredPlanApiKey(`account:${family}-start-plan`, credentials);
   const jwt = (shared || scoped || "")
@@ -1304,6 +1332,6 @@ export function hasPlanOAuthToken(family: PlanFamily, creds?: Record<string, str
     }
   }
   if (!loaded) return false;
-  const token = loaded[family === "zai" ? CRED_KEYS.zaiAccessToken : CRED_KEYS.bigmodelAccessToken];
+  const token = planBusinessToken(family, loaded);
   return typeof token === "string" && token.trim().length > 0;
 }

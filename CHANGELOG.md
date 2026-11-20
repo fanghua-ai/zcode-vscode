@@ -1,5 +1,15 @@
 # 更新日志 / Changelog
 
+## 2.2.8 — 2026-11-20
+
+### 中文
+- 修复 ZCode 3.19 关联账号的 BigModel 个人和团队 Coding Plan 登录；国内登录及符合条件的关联账号也可正确读取 Start Plan。
+- 从 2.2.6 升级会包含下方 2.2.7 的全部改进。2.2.7 已从扩展市场撤回。
+
+### English
+- Fix BigModel individual and team Coding Plan sign-in for linked accounts in ZCode 3.19, and recognize Start Plan for domestic logins and eligible linked accounts.
+- Upgrading from 2.2.6 includes the improvements listed under 2.2.7, which was withdrawn from the Marketplace.
+
 ## 2.2.7 — 2026-11-20
 
 ### 中文
